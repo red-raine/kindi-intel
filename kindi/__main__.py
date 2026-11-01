@@ -50,6 +50,23 @@ def cmd_convert(cfg, a):
     return 0
 
 
+def cmd_intel_info(cfg, a):
+    from . import intel as _intel
+    prof = _intel.discover(log=log)
+    b, d, why = _intel.pick_backend(prof, log=log)
+    log("recommended: backend %s device %s (%s)" % (b, d or "-", why))
+    import json as _json
+    print(_json.dumps(prof, indent=2, default=str))
+    return 0
+
+
+def cmd_export_openvino(cfg, a):
+    from . import intel as _intel
+    _intel.export_ir(cfg["pack"], out_dir=a.out, log=log)
+    log("now run it: KINDI_DEVICE=openvino kindi serve")
+    return 0
+
+
 def cmd_fast_head(cfg, a):
     _setup_gpu_env(cfg)
     manifest_path=os.path.join(cfg["pack"],"kindi_pack.json")
@@ -144,6 +161,14 @@ def cmd_info(cfg, a):
     for k in sorted(C.DEFAULTS):
         v = cfg[k]
         print("  %-17s %s" % (k, "(set)" if k == "api_key" and v else v))
+    if os.environ.get("KINDI_DEVICE", "gpu").lower() in ("intel", "openvino", "auto"):
+        try:
+            from . import intel as _intel
+            prof = _intel.discover(log=lambda *x: None)
+            b, d, why = _intel.pick_backend(prof, log=None)
+            print("intel : backend %s device %s (%s)" % (b, d or "-", why))
+        except Exception as e:
+            print("intel : probe failed (%s)" % e)
     man = os.path.join(cfg["pack"], "kindi_pack.json")
     if os.path.exists(man):
         m = json.load(open(man))
@@ -196,6 +221,9 @@ def main(argv=None):
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
+    sub.add_parser("intel-info", dest="intel_info", help="Intel CPU/iGPU/NPU profile and the recommended backend")
+    s = sub.add_parser("export-openvino", dest="export_openvino", help="export the pack to an OpenVINO IR (CPU/iGPU/NPU)")
+    s.add_argument("--out", help="IR directory (default <pack>/ov_ir)")
     sub.add_parser("verify", help="check against llama.cpp's reference output")
     sub.add_parser("bench", help="measure speed")
     s = sub.add_parser("serve", help="run the OpenAI-compatible server")
@@ -222,7 +250,8 @@ def main(argv=None):
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
             "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
+            "models": cmd_models, "use": cmd_use, "intel-info": cmd_intel_info,
+            "export-openvino": cmd_export_openvino}[a.cmd.replace("-", "_") if hasattr(a.cmd, "replace") else a.cmd](cfg, a)
 
 
 if __name__ == "__main__":
