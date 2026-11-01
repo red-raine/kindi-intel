@@ -410,7 +410,31 @@ def export_ir(pack, out_dir=None, log=print, ctx=None):
     wt_dir = os.path.join(out_dir, "weights")
     os.makedirs(wt_dir, exist_ok=True)
     meta = {"dims": dims, "ctx": ctx, "hadamard_block": int(man.get("hadamard_block", 512)),
-            "head": man.get("head", "token_embd.weight"), "tensors": {}}
+            "head": man.get("head", "token_embd.weight"), "tensors": {}, "vecs": {}}
+    # f32.bin holds every non-ternary tensor (norm gammas, ssm gates/conv weights, rope tables are
+    # rebuilt by the graph); index.json maps names -> byte offsets. Copy each referenced slice into
+    # <out>/weights/<name>.f32 so ov_build.py can bake them as OV constants exactly like cpu.py does.
+    vi = json.load(open(os.path.join(pack, "index.json")))["tensors"] if \
+        os.path.isfile(os.path.join(pack, "index.json")) else {}
+    f32p = os.path.join(pack, "f32.bin")
+    if os.path.isfile(f32p):
+        fm = np.memmap(f32p, dtype=np.float32, mode="r")
+        for name, rec in vi.items():
+            if not name.endswith(".weight") and not name.endswith(".bias") and "_a" not in name:
+                continue
+            R, C = int(rec.get("rows", 0)), int(rec.get("ne0", 0))
+            if R <= 0 or C <= 0:
+                continue
+            off = int(rec["f32_off"]) // 4
+            v = np.ascontiguousarray(fm[off:off + R * C])
+            v.tofile(os.path.join(wt_dir, name + ".f32"))
+            meta["vecs"][name] = {"R": R, "C": C}
+        del fm
+    for w in sorted({dims["width"], dims["ffn"], dims["heads"] * dims["head_dim"],
+                     dims["gdn_inner"]}):
+        sp = os.path.join(pack, "signs_%d.f32" % w)
+        if os.path.isfile(sp):
+            shutil.copyfile(sp, os.path.join(out_dir, "signs_%d.f32" % w))
     for name, rec in bi.items():
         R, C = rec["rows"], rec["ne0"]
         ns = C // 4
