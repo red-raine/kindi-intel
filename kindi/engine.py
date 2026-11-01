@@ -118,7 +118,34 @@ class Engine(object):
                                                    prop["totalGlobalMem"] // 2 ** 20))
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
-        bc = np.fromfile(os.path.join(pack, "bcodes.bin"), dtype=np.uint8)
+        if os.environ.get("KINDI_DISK_P2P", "1") == "0":
+            bc = np.fromfile(os.path.join(pack, "bcodes.bin"), dtype=np.uint8)
+        else:
+            # disk streaming: read in chunks and hand each chunk's page cache back (POSIX_FADV_DONTNEED), so a
+            # 9 GB pack does not evict everything else - the same policy kindi/tp.py uses for its weight cache.
+            # The bytes land in one host array that repack() rewrites in place before the upload.
+            path = os.path.join(pack, "bcodes.bin")
+            size = os.path.getsize(path)
+            buf = np.empty(size, dtype=np.uint8)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                CH = max(1 << 22, int(os.environ.get("KINDI_STREAM_CHUNK_MB", "64")) << 20)
+                with os.fdopen(os.dup(fd), "rb") as f:
+                    o = 0
+                    while o < size:
+                        cnt = min(CH, size - o)
+                        b = f.read(cnt)
+                        if not b:
+                            break
+                        buf[o:o + len(b)] = np.frombuffer(b, dtype=np.uint8)
+                        try:
+                            os.posix_fadvise(fd, o, len(b), os.POSIX_FADV_DONTNEED)
+                        except (OSError, AttributeError):
+                            pass
+                        o += len(b)
+                bc = buf[:o]
+            finally:
+                os.close(fd)
         dp = np.fromfile(os.path.join(pack, "dpm.bin"), dtype=np.uint16)
         self.hsl = None
         self.hs_force = None
@@ -133,8 +160,22 @@ class Engine(object):
             clusters = {"assign": assign, "centroids": np.vstack([cent, np.zeros((1, cent.shape[1]), np.float32)])}
             bc, dp, self.hsl = layout.reorder_head(self.bi, bc, dp, clusters, self.head_name)
         dims = layout.repack(self.bi, bc, dp)
-        self.bc, self.dp = cp.asarray(bc), cp.asarray(dp)
-        del bc, dp
+        if os.environ.get("KINDI_DISK_P2P", "1") == "2":
+            # chunked upload through CuPy's pinned staging pool (bounded host staging instead of one huge
+            # pinned block; the async copies pipeline with the driver's DMA)
+            try:
+                self.bc = cp.empty(bc.shape, dtype=np.uint8)
+                CH = max(1 << 22, int(os.environ.get("KINDI_STREAM_CHUNK_MB", "64")) << 20)
+                for o in range(0, bc.size, CH):
+                    self.bc[o:o + CH].set(bc[o:o + CH])
+                self.dp = cp.asarray(dp)
+            except Exception as e:
+                log("kindi: streamed upload unavailable (%s)" % e)
+                self.bc, self.dp = cp.asarray(bc), cp.asarray(dp)
+            del bc, dp
+        else:
+            self.bc, self.dp = cp.asarray(bc), cp.asarray(dp)
+            del bc, dp
         self.w = {n: (self.bc[self.bi[n]["bc_off"]:], self.dp[self.bi[n]["dpm_off"] // 2:], np.int32(R), np.int32(C))
                   for n, (R, C) in dims.items()}
         self.fl = cp.asarray(np.fromfile(os.path.join(pack, "f32.bin"), dtype=np.float32))
@@ -407,8 +448,36 @@ class Engine(object):
 
 def make_engine(pack, ctx=4096, clusters=None, log=print):
     """Engine on one GPU, or the two-card tensor parallel engine (kindi.tp) when the weights do not fit one card and
-    two GPUs are present. KINDI_TP=1 / 0 forces the choice."""
-    if os.environ.get("KINDI_DEVICE", "gpu") == "cpu" or cp is None:
+    two GPUs are present. KINDI_TP=1 / 0 forces the choice.
+
+    Intel branch: KINDI_DEVICE=intel|openvino routes to kindi.intel (OpenVINO CPU/iGPU/NPU); an Intel-only host
+    (no CUDA/HIP device, no NVIDIA/AMD GPU) auto-selects it when OpenVINO is installed. The native Kindi CPU
+    engine stays the fallback everywhere (it needs no runtime beyond gcc)."""
+    dev = os.environ.get("KINDI_DEVICE", "gpu").lower()
+    if dev in ("intel", "openvino"):
+        from . import intel as _intel
+        from . import cputune
+        cputune.tune(log)
+        _, odev, why = _intel.pick_backend(log=log)
+        log("kindi: Intel backend (%s)" % why)
+        return _intel.Engine(pack, ctx=ctx, clusters=clusters, log=log, device=odev or None)
+    if dev == "auto" and cp is None:
+        # no CUDA/HIP at all: choose between OpenVINO (Intel iGPU/NPU/CPU) and the native CPU engine
+        try:
+            from . import intel as _intel
+            prof = _intel.discover(log=log)
+            backend, odev, why = _intel.pick_backend(prof, log=log)
+            if backend == "openvino" and odev in ("GPU", "NPU"):
+                from . import cputune
+                cputune.tune(log)
+                log("kindi: auto-selected the Intel backend (%s)" % why)
+                return _intel.Engine(pack, ctx=ctx, clusters=clusters, log=log, device=odev)
+        except Exception as e:                       # any probe problem: the CPU engine always works
+            log("kindi: Intel probe skipped (%s)" % e)
+        dev = "cpu"
+    if dev == "cpu" or cp is None:
+        from . import cputune
+        cputune.tune(log)
         from .cpu import Engine as CPUEngine
         if clusters is not None:
             log("the fast head is not available on the CPU: exact head")

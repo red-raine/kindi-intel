@@ -444,8 +444,9 @@ def _after_engine_error(K, e):
             r.eng.reset(); r.tokens = []; r.ckpt.clear()
         except Exception:
             pass
-    if getattr(K, "cp", None) is None or os.environ.get("KINDI_DEVICE", "gpu") == "cpu":
-        return                                   # the CPU engine has no GPU context to lose
+    dev = os.environ.get("KINDI_DEVICE", "gpu").lower()
+    if getattr(K, "cp", None) is None or dev in ("cpu", "intel", "openvino", "auto"):
+        return                                   # the CPU / OpenVINO engines have no CUDA context to lose
     broken = "IllegalAddress" in str(e) or "illegal memory access" in str(e)
     try:
         K.cp.cuda.runtime.deviceSynchronize()
@@ -479,7 +480,7 @@ def create_app(cfg, log=print):
     @app.get("/health")
     def health():
         free = total = 0
-        if K.cp is not None and os.environ.get("KINDI_DEVICE", "gpu") != "cpu":
+        if K.cp is not None and os.environ.get("KINDI_DEVICE", "gpu").lower() not in ("cpu", "intel", "openvino", "auto"):
             free, total = K.cp.cuda.runtime.memGetInfo()
         b = K.busy
         busy = None
