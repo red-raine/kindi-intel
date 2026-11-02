@@ -53,6 +53,8 @@ typedef struct {
   uint16_t *Kqs, *Vqs;                   /* [ctx][NHKV][HD/32] q8_0 block scales, fp16 */
   uint8_t *K4, *V4;                      /* [ctx][NHKV][HD/2] 4-bit signed codes, two a byte */
   uint16_t *K4s, *V4s;                   /* [ctx][NHKV] 4-bit scale, fp16 */
+  uint8_t *K2, *V2;                      /* [ctx][NHKV][HD/4] four 2-bit codes per byte, levels {-3,-1,1,3} */
+  uint16_t *K2s, *V2s;                   /* [ctx][NHKV] 2-bit scale, fp16 */
   /* FFN */
   Mat ffg, ffu, ffd;
 } Layer;
@@ -72,7 +74,7 @@ typedef struct {
   int* sel;
   void (*moe_fetch)(void*, int, int);
   void* moe_ctx;
-  int kvq;                               /* K/V cache format: 0 fp16, 1 ternary, 2 q8_0 (kc_kv_quant) */
+  int kvq;                               /* K/V cache format: 0 fp16, 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit (kc_kv_quant) */
   int kvq_k, kvq_v;                      /* the two sides separately (kc_kv_quant2): K and V need not match */
 } Model;
 
@@ -856,12 +858,62 @@ static float tern_pack(const float* v, uint8_t* out, int n){
     if(!(a > 0.f)) a = 1e-8f;
     if(settled) break;
   }
+  /* the codes that go with the scale returned, not the ones from the iteration before it */
+  for(int j = 0; j < n; ++j) c[j] = v[j] > 0.5f * a ? 1 : (v[j] < -0.5f * a ? -1 : 0);
   for(int j = 0; j < n; j += 4)
     out[j >> 2] = (uint8_t)((c[j] + 1) | ((c[j + 1] + 1) << 2) | ((c[j + 2] + 1) << 4) | ((c[j + 3] + 1) << 6));
   return a;
 }
 static void tern_unpack(const uint8_t* p, float sc, float* out, int n){
   for(int j = 0; j < n; ++j) out[j] = sc * KT[(p[j >> 2] >> (2 * (j & 3))) & 3];
+}
+/* 2-bit uniform: four levels {-3,-1,+1,+3}*a, four codes a byte, one scale per (position, head). Ternary spends the
+   same two bits on three levels and drives everything inside its dead zone to zero; on 372 real cache vectors the
+   4-level alphabet reconstructs 16% closer on K and 8% closer on V, so this is what "2 bits" should mean.
+
+   The scale is chosen on the objective, not by the path: the assignment map is piecewise constant in a, so iterating
+   from one start is bistable - a one-ulp difference in the input can settle in a different basin, and on a
+   position-0 head the two basins measured 0.63 and 0.79 relL2. Four starts (three fractions of amax and the mean) are
+   each iterated to a fixed point and the candidate with the lowest squared error wins; that costs ~10k compares per
+   cache write, against ~10^8 multiply-adds per token. */
+static const float LT[4] = {-3.0f, -1.0f, 1.0f, 3.0f};
+static float q2_pack(const float* v, uint8_t* out, int n){
+  int bc[512], c[512];
+  float am = 0.f, mn = 0.f;
+  for(int j = 0; j < n; ++j){ const float f = fabsf(v[j]); if(f > am) am = f; mn += f; }
+  const float starts[4] = {am / 6.0f, am / 9.0f, am / 12.0f, 0.5f * mn / (float)n};
+  float ba = 1e-8f, best = -1.f;
+  for(int s = 0; s < 4; ++s){
+    float a = starts[s] > 0.f ? starts[s] : 1e-8f;
+    for(int it = 0; it < 10; ++it){
+      float num = 0.f, den = 0.f;
+      const float b = 2.0f * a;            /* decisions at 0 and +-2a: the midpoints between the levels */
+      for(int j = 0; j < n; ++j){
+        const float x = v[j];
+        const int k = x >= b ? 3 : (x > 0.f ? 2 : (x > -b ? 1 : 0));
+        num += x * LT[k]; den += LT[k] * LT[k];
+      }
+      const float na = den > 0.f ? num / den : a;
+      if(!(na > 0.f)) break;
+      a = na;
+    }
+    /* the codes that go with the settled scale, and that scale's error */
+    const float b = 2.0f * a;
+    float sse = 0.f;
+    for(int j = 0; j < n; ++j){
+      const float x = v[j];
+      const int k = x >= b ? 3 : (x > 0.f ? 2 : (x > -b ? 1 : 0));
+      const float d = x - a * LT[k];
+      c[j] = k; sse += d * d;
+    }
+    if(best < 0.f || sse < best){ best = sse; ba = a; for(int j = 0; j < n; ++j) bc[j] = c[j]; }
+  }
+  for(int j = 0; j < n; j += 4)
+    out[j >> 2] = (uint8_t)(bc[j] | (bc[j + 1] << 2) | (bc[j + 2] << 4) | (bc[j + 3] << 6));
+  return ba;
+}
+static void q2_unpack(const uint8_t* p, float sc, float* out, int n){
+  for(int j = 0; j < n; ++j) out[j] = sc * LT[(p[j >> 2] >> (2 * (j & 3))) & 3];
 }
 static void q8_pack(const float* v, int8_t* out, uint16_t* sc, int n){
   for(int b = 0; b < n / 32; ++b){
@@ -931,10 +983,12 @@ static void attn_mid(Model* m, Layer* L, int pos){
       if(m->kvq_k == 1) L->Ks[ix] = f2h(tern_pack(dst, L->Kt + ix * (HD / 4), HD));
       else if(m->kvq_k == 2) q8_pack(dst, L->Kq + ix * HD, L->Kqs + ix * (HD / 32), HD);
       else if(m->kvq_k == 3) L->K4s[ix] = f2h(q4_pack(dst, L->K4 + ix * (HD / 2), HD));
+      else if(m->kvq_k == 4) L->K2s[ix] = f2h(q2_pack(dst, L->K2 + ix * (HD / 4), HD));
       else { uint16_t* K = L->Kc + ix * HD; for(int j = 0; j < HD; ++j) K[j] = f2h(dst[j]); }
       if(m->kvq_v == 1) L->Vs[ix] = f2h(tern_pack(vv, L->Vt + ix * (HD / 4), HD));
       else if(m->kvq_v == 2) q8_pack(vv, L->Vq + ix * HD, L->Vqs + ix * (HD / 32), HD);
       else if(m->kvq_v == 3) L->V4s[ix] = f2h(q4_pack(vv, L->V4 + ix * (HD / 2), HD));
+      else if(m->kvq_v == 4) L->V2s[ix] = f2h(q2_pack(vv, L->V2 + ix * (HD / 4), HD));
       else { uint16_t* V = L->Vc + ix * HD; for(int j = 0; j < HD; ++j) V[j] = f2h(vv[j]); }
     }
   }
@@ -947,6 +1001,7 @@ static void attn_mid(Model* m, Layer* L, int pos){
       if(m->kvq_k == 1) tern_unpack(L->Kt + ix * (HD / 4), h2f(L->Ks[ix]), kf, HD);
       else if(m->kvq_k == 2) q8_unpack(L->Kq + ix * HD, L->Kqs + ix * (HD / 32), kf, HD);
       else if(m->kvq_k == 3) q4_unpack(L->K4 + ix * (HD / 2), h2f(L->K4s[ix]), kf, HD);
+      else if(m->kvq_k == 4) q2_unpack(L->K2 + ix * (HD / 4), h2f(L->K2s[ix]), kf, HD);
       else { const uint16_t* K = L->Kc + ix * HD; for(int j = 0; j < HD; ++j) kf[j] = h2f(K[j]); }
       for(int g = 0; g < G; ++g){
         const float* q = m->qr + (size_t)(kv * G + g) * HD;
@@ -980,7 +1035,8 @@ static void attn_mid(Model* m, Layer* L, int pos){
         float vf[32];
         if(m->kvq_v == 1) tern_unpack(L->Vt + ix * (HD / 4) + (d0 >> 2), h2f(L->Vs[ix]), vf, 32);
         else if(m->kvq_v == 2) q8_unpack(L->Vq + ix * HD + d0, L->Vqs + ix * (HD / 32) + (d0 >> 5), vf, 32);
-        else q4_unpack(L->V4 + ix * (HD / 2) + (d0 >> 1), h2f(L->V4s[ix]), vf, 32);
+        else if(m->kvq_v == 3) q4_unpack(L->V4 + ix * (HD / 2) + (d0 >> 1), h2f(L->V4s[ix]), vf, 32);
+        else q2_unpack(L->V2 + ix * (HD / 4) + (d0 >> 2), h2f(L->V2s[ix]), vf, 32);
         for(int j = 0; j < 32; ++j) acc[j] += pt * vf[j];
       } else {
         const uint16_t* V = L->Vc + ix * HD + d0;
@@ -1265,17 +1321,18 @@ KCAPI void kc_ffn_probe(Model* m, int il, const float* in, float* out){
   }
 }
 
-/* select the K/V cache format: 0 fp16 (default), 1 ternary, 2 q8_0. The arrays are allocated by the host, so this
-   only records the choice and refuses a mode whose arrays were not handed over */
+/* select the K/V cache format: 0 fp16 (default), 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit four-level. The arrays are
+   allocated by the host, so this only records the choice and refuses a mode whose arrays were not handed over */
 static int kvq_ok(const Model* m, int mode){
   /* layer 0 is a GDN layer and holds no K/V cache, so look for the first layer that does */
   int il = 0;
   while(il < m->NL && !(m->L + il)->Kc) ++il;
-  if(mode < 0 || mode > 3 || il == m->NL) return 0;
+  if(mode < 0 || mode > 4 || il == m->NL) return 0;
   const Layer* A = m->L + il;
   if(mode == 1 && !A->Ks) return 0;
   if(mode == 2 && !A->Kqs) return 0;
   if(mode == 3 && !A->K4s) return 0;
+  if(mode == 4 && !A->K2s) return 0;
   return 1;
 }
 

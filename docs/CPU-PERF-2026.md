@@ -672,60 +672,75 @@ corpus, and it pays only on hardware this host is not. The batched GEMV is measu
 first. The VNNI path is the branch's reason to exist on 2024+ Intel, and SDE is how to build it correctly before any
 silicon is bought.
 
-## K/V-cache quantisation: q8_0 costs nothing, ternary costs the model
+## K/V-cache quantisation: q8_0 costs nothing, the 2-bit rungs cost the model
 
 The K/V cache is a storage format, not an arithmetic one, so `KINDI_CPU_KVQ` (in `kcpu.c`, off by default, prototype
 only) selects it per run and every path still materialises a head's 256 values into fp32 before the same dot products.
-`0` is fp16, `1` is ternary at 2 bits with one scale per (position, head) - four codes a byte, the scale fitted by
-least squares to the code it induces - and `2` is q8_0's 32-value int8 blocks with an fp16 scale of `amax/127`. Same 48
-prompts, 160 greedy tokens, 7,680 decisions. The fp16 arm reproduces the stored `wide_fp32` arm token for token, so
-the switch is inert at 0 and the other two arms are the only difference.
+`KINDI_CPU_KVQ_K` and `KINDI_CPU_KVQ_V` select it a side at a time. `0` is fp16; `1` is ternary at 2 bits with one
+scale per (position, head) - four codes a byte, the scale fitted by least squares to the code it induces; `2` is
+q8_0's 32-value int8 blocks with an fp16 scale of `amax/127`; `3` is 4-bit with one scale per head; `4` is 2 bits on
+four levels `{-3,-1,1,3}a` - ternary's layout with its unused fourth code put to work. Same 48 prompts, 160 greedy
+tokens, 7,680 decisions, and the fp16 arm reproduces the stored `wide_fp32` arm token for token, so the switch is
+inert at 0.
 
-| arm | prompts diverging | first divergence, median step | of those, above the p1 margin | step-0 token differs | margin eaten, median | KL at step 0, median / max | top-1 at step 0 |
-|---|---|---|---|---|---|---|---|
-| fp16 | - | - | - | - | - | 0 / 0 | 48/48 |
-| q8_0 (8.5 bits) | **6 of 48** | 107 | **0** | 0 | 0.005% | 0.00002 / 0.0002 | 48/48 |
-| ternary (2.06 bits) | **47 of 48** | 3 | **40** | 10 of 48 | 11.6% | 0.0988 / 0.5627 | 38/48 |
+| arm | K | V | bits/val | cache MiB | vs fp16 | prompts diverging | median KL at step 0 | max KL | top-1 at step 0 |
+|---|---|---|---|---|---|---|---|---|---|
+| fp16 | fp16 | fp16 | 16.00 | 12.00 | 1.00x | - | 0 | 0 | 48/48 |
+| q8 K, fp16 V | q8_0 | fp16 | 12.25 | 9.19 | 1.31x | 4 of 48 | 0.00000 | 0.0001 | 48/48 |
+| q8_0 | q8_0 | q8_0 | 8.50 | 6.38 | 1.88x | 6 of 48 | 0.00002 | 0.0002 | 48/48 |
+| ternary K, fp16 V | ternary | fp16 | 9.03 | 6.77 | 1.77x | 46 of 48 | 0.02136 | 0.2448 | 39/48 |
+| fp16 K, ternary V | fp16 | ternary | 9.03 | 6.77 | 1.77x | 48 of 48 | 0.07000 | 0.3646 | 40/48 |
+| q8 K, 4-bit V | q8_0 | 4-bit | 6.28 | 4.71 | 2.55x | 40 of 48 | 0.01389 | 0.1620 | 46/48 |
+| q8 K, ternary V | q8_0 | ternary | 5.28 | 3.96 | 3.03x | 48 of 48 | 0.07097 | 0.3722 | 39/48 |
+| q8 K, 2-bit V | q8_0 | 2-bit | 5.28 | 3.96 | 3.03x | 48 of 48 | 0.07439 | 0.4069 | 39/48 |
+| 2-bit K, q8 V | 2-bit | q8_0 | 5.28 | 3.96 | 3.03x | 47 of 48 | 0.02187 | 0.1935 | 38/48 |
+| 4-bit | 4-bit | 4-bit | 4.06 | 3.05 | 3.94x | 43 of 48 | 0.01988 | 0.1878 | 44/48 |
+| ternary | ternary | ternary | 2.06 | 1.55 | 7.77x | 48 of 48 | 0.09135 | 0.3528 | 36/48 |
+| 2-bit | 2-bit | 2-bit | 2.06 | 1.55 | 7.77x | 47 of 48 | 0.08116 | 0.4184 | 39/48 |
 
 KL is over the full 248,320-token vocabulary between the two step-0 distributions, the one point where every arm sees
-an identical context; the p1 margin is the corpus threshold from the int8 study (0.0509).
+an identical context. Bits per value include the per-head scale (16/256 = 0.0625) and average the two sides.
 
-**q8_0 is free.** Six prompts leave the fp16 stream, every one of them at a step where fp16's own lead was below its
-p1 margin, and the median margin eaten at the aligned steps is 0.005%. The step-0 distribution moves by 2e-5 nats and
-the argmax never changes. That is a better trade than int8 *activations* (13 of 48) because it touches six layers'
-cache instead of every GEMV in the model; the two arms' divergent sets overlap by only 2 prompts of 6 and 13, so they
-are mostly different near-ties.
+**q8_0 is free.** Six prompts leave the fp16 stream and every one of them at a step where fp16's own lead was below
+its p1 margin (0.0509); the median margin eaten at the aligned steps is 0.005%, the step-0 distribution moves by 2e-5
+nats, and the argmax never changes. That is a better trade than int8 *activations* (13 of 48) because it touches six
+layers' cache instead of every GEMV in the model.
 
-**Ternary is not a lower rung, it is a different model.** It moves the first generated token on 10 of 48 prompts,
-median divergence at step 3, and 40 of its 47 flips land on decisions fp16 had made confidently. The cause is in the
-cache itself: 60% of trits come out zero, the median head's `max|v|` is 3.3x the fitted scale, and the reconstruction
-error is 52% on K and 53% on V.
+**The values are the side that needs the bits.** Both one-sided arms exist at 2 bits and they are not close: K at 2
+bits with V in fp16 costs 0.0214, V at 2 bits with K in fp16 costs 0.0700, and 46 to 48 of 48 streams leave fp16
+either way. Moving the keys to q8_0 barely helps a K-side arm (2-bit K with q8 V: 0.0219), while V at 2 bits stays at
+0.071 to 0.074 however the keys are stored. Keys only decide the ordering of 1,024 positions; values decide what gets
+mixed.
 
-| format | bits/elt | cache MiB at ctx 1024 | vs fp16 | relL2, best per-group scale | relL2, shipped rule |
-|---|---|---|---|---|---|
-| fp16 | 16.00 | 12.00 | 1.00x | 0 | 0 |
-| q8_0, per 32 | 8.50 | 6.38 | 1.88x | 0.0065 | 0.0067 |
-| ternary, per head | 2.06 | 1.55 | 7.76x | **0.4853** | 0.518 (K) / 0.529 (V) |
-| ternary, per 32 | 2.50 | 1.88 | 6.40x | 0.4520 | - |
-| ternary, per 8 | 4.00 | 3.00 | 4.00x | 0.3743 | - |
-| ternary, per 4 | 6.00 | 4.50 | 2.67x | 0.3048 | - |
+**The 2-bit alphabet was wrong, and fixing it does not rescue 2 bits.** Ternary spends its two bits on three levels
+and drives 56% of codes to zero. Four levels at the same 2 bits reconstruct 16% closer on K and 8% closer on V
+(relL2 0.425 / 0.422 against 0.506 / 0.460, over 744 cache vectors taken from three prompts at every position), and
+that is exact: the shipped packer reproduces a NumPy four-level search code for code on 190,464 codes. End to end the
+median step-0 KL moves 0.0914 -> 0.0812 and the step-0 top-1 goes 36 -> 39 of 48, but a paired bootstrap over the 48
+prompts puts the mean difference at -0.014 with a [-0.036, +0.009] interval: it includes zero. On this harness the
+alphabet is not resolvable at the model level, and both 2-bit arms are still a different model (47-48 of 48 streams
+leave fp16, KL four thousand times q8_0's). The 2-bit deficit is the bit budget and not the codebook - 2 bits against
+4 bits is +0.066 [0.045, 0.088], which does exclude zero.
 
-**The alphabet is the floor, not the grouping or the scale rule.** The shipped Lloyd fit is within 7% of the best
-per-head scale found by a 40-point grid search, so the scale rule is not what is wrong; and shrinking the group from
-256 values to 32, 8 and 4 buys 0.485 -> 0.452 -> 0.374 -> 0.305 while the bitrate climbs 2.06 -> 6.00. Even four
-values sharing a scale leaves 30% error. Nothing at 2 to 6 bits per element is usable, and by the time the error is
-tolerable - q8_0's 0.65% - the format is 8.5 bits and 1.88x.
+**The four-level search has to be chosen on the objective.** The assignment map is piecewise constant in the scale,
+so iterating from one start is bistable: a one-ulp difference in the input can settle in a different basin, and one
+position-0 head measured 0.63 and 0.79 relL2 from the two basins. `q2_pack` therefore iterates four starts (three
+fractions of `amax` and the mean) and keeps the lowest error, ~10k compares per cache write against ~10^8
+multiply-adds per token.
 
-**Is it worth any of the memory?** At ctx 1024 the whole cache is 12 MiB against 529 MB of weights, so q8_0 saves
-5.6 MiB, 1.1% of the pack, and attention is 0.9% of a token, so nothing shows in throughput (the three arms took
-1311-1326 s for the same 7,680 tokens under identical contention). At ctx 8192 the same ratio is 96 MiB against 51
-MiB: a 45 MiB saving, 9% of the pack. **q8_0 K/V is a long-context memory knob, not a speed or quality one**, and it
-is the format to ship if context length ever becomes the binding constraint. Ternary saves another 39 MiB at 8k and
-is not a trade that exists at any context.
+**The smallest rung that is still the same model is 4 bits.** q8 K with 4-bit V is 6.28 bits and 2.55x; 4-bit on both
+sides is 4.06 bits and 3.93x at 0.0199 KL and 44 of 48 top-1. That is four to five times the KL of q8_0 in exchange
+for most of the memory, which is a real trade at long context and not a free one.
 
-Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh` runs the three arms, `kqkv_wide.py` is the sweep, `kqkv_summ.py` scores
-divergence and KL, `kvq_detail.py` the divergence-step distribution, `kvq_err.py` and `kvq_scale.py` compare the stored
-cache against fp16 and search the grouping and scale).
+**Is it worth any of the memory?** At ctx 1024 the whole cache is 12 MiB against 506 MB of weights, so q8_0 saves
+5.6 MiB, 1.1% of the pack, and attention is 0.9% of a token, so nothing shows in throughput. At ctx 8192 the cache is
+96 MiB against the same weights: 51 MiB at q8_0 (45 MiB saved, 9% of the pack), 24 MiB at 4-bit (72 MiB), 12 MiB at
+2 bits (84 MiB, 16%). **q8_0 K/V is a long-context memory knob, not a speed or quality one**; 4-bit is the smallest
+format that keeps the model, and the 2-bit rungs buy the last 12 MiB at the price of a different model.
+
+Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh`, `kqkv_asym.sh`, `kqkv_q4.sh`, `kqkv_q2.sh` run the arms, `kqkv_wide.py` is
+the sweep, `kvq_report.py` scores divergence, KL and cost, `kvq_detail.py` the divergence-step distribution,
+`q2_floor.py` the alphabet floors and `q2_check.py` the position-0 round trip).
 
 ## Evaluated and rejected (advice from outside this repo)
 
