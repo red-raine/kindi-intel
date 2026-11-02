@@ -83,6 +83,7 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_CPU_Q8` | `0` | the int8 activation prototype: every CPU GEMV through the int8 form. Not a production path; [CPU-PERF-2026.md](CPU-PERF-2026.md) has the measurements |
 | `KINDI_CPU_Q8G` | `128` | the activation group width of that prototype: `128`, `64`, `32`, `16`, `8`, `4` or `2` columns per scale |
 | `KINDI_CPU_Q8C` | `0` | `1` = a static per-channel input scale instead of the group form, applied to the ordinary fp32 GEMV. Needs a calibration pass (`Engine.q8_cal_begin/end`), so it does nothing until scales are loaded |
+| `KINDI_CPU_Q8GUARD` | `0` | a top-1/top-2 gap under this value sends the decision to an fp32 head recomputed from the same folded input; `Engine.guard_stats()` counts both. Measured on the 48-prompt sweep it does not reduce the divergence count - [CPU-PERF-2026.md](CPU-PERF-2026.md) says why |
 | `KINDI_CPU_KVQ` | `0` | the CPU K/V cache format, a storage-prototype: `0` = fp16, `1` = ternary at 2 bits with one scale per (position, head), `2` = q8_0 blocks of 32, `3` = 4-bit with a fitted per-head scale, `4` = 2 bits on four levels, `5` = 4 bits as two passes of that 4-level code. Not a production path; [CPU-PERF-2026.md](CPU-PERF-2026.md) has the measurements |
 | `KINDI_CPU_KVQ_K`, `KINDI_CPU_KVQ_V` | (the format) | the same choice a side at a time, so the keys can stay q8_0 while the values are 4-bit |
 | `KINDI_CKPT_VRAM` | `0` | `1` = checkpoints in card memory; the copy to the host waits until the server is idle (one card) |

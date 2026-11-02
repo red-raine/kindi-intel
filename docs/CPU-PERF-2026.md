@@ -697,6 +697,39 @@ ternary weights would put the step 256x lower - and a smaller group is neither. 
 `~/kt/perf/q8/` (`kq8_arms.sh` runs the group arms, `kq8_pc2.sh` calibrates and runs the per-channel one, `kq8_summ.py`
 scores an arm against fp32 and `kq8_drift.py` dumps the logits the drift column is computed from).
 
+### The margin guard: implemented, measured, and not enough
+
+The section above ends "int8 activations therefore need the margin guard". It is now implemented, and it does not
+work. `KINDI_CPU_Q8GUARD=<gap>` (in `kcpu.c`, off by default) turns a decision into a fallback when the int8 logits'
+own top-1/top-2 gap is under `<gap>`: the head is then recomputed with the production fp32 kernel from the same folded
+input and the decision taken from those logits. The head is the only place a decision can be re-derived cheaply -
+anywhere else the state the token came from is gone, so a fallback there would mean replaying the sequence - and
+`kc_guard_stats()` reports how many decisions were examined and how many fell back.
+
+| arm | fallbacks | prompts diverging | differing steps | flips above p1 |
+|---|---:|---:|---:|---:|
+| int8 per-128 (the arm above) | 0 | 13 of 48 | 1,136 | 1 |
+| **int8 + guard at 0.05** (the measured drift) | **77 of 7,680** | **14 of 48** | 1,219 | 1 |
+| int8 + guard on every decision | 7,680 of 7,680 | 14 of 48 | 1,219 | 1 |
+
+The guard is not neutral: it is **one prompt worse than doing nothing**, and the arm that falls back always produces a
+stream identical to the one that falls back on 1% of decisions. That second fact is the useful one - it is the ceiling
+of every head-only guard, and it says the fallback changes nothing that a near-tie did not already touch. The flips are
+not made at the head: at a decision whose fp32 margin is 0.006 to 0.016 the residual stream reaching the head is already
+int8-drifted, so an exact head working from a drifted input lands on the int8 answer, not the fp32 one. Making the last
+GEMV exact cannot recover a decision that was lost 24 layers earlier.
+
+The cost is not what stops it. Measured alone on 6 threads, one fallback is **+10.0 ms on an 87.4 ms int8 token** (head
+248,320 x 2,048, 508.6 M parameters, 27% of the model), so at the 1% trigger rate the guard costs 0.1 ms/token, about
+0.1%. With the guard off
+`kindi verify` is unchanged at both tiers (4/4 prompts, 160/160 tokens, `KINDI_CPU_TIER=q8` included), and the fp32 arm
+still reproduces the earlier sweep token for token.
+
+So the fix has to be at the state, not the decision: replay a token from an fp32 checkpoint of the recurrent state when
+its margin is small (cost set by how often the checkpoint is refreshed, not by how often the guard fires), keep the
+last few layers in fp32 so the head sees an undrifted stream, or move to 16-bit activations, whose step is 256x finer -
+the option the finer schemes above already point at.
+
 The prototype is **not** a performance result and must not be read as one: it runs at 157 ms per token against 36 ms for
 the fp32 path, 4.3x slower, because it uses `vpmulld` per column pair and scalar int8 indexing instead of the byte-parallel
 `vpshufb` + `vpdpbusd` form, and it still reads the row-blocked pair layout rather than a column-major int8 repack. Its

@@ -86,6 +86,7 @@ def _lib():
     lib.kc_get_tier.restype = ctypes.c_int
     lib.kc_kv_quant.argtypes = [ctypes.POINTER(Model), ctypes.c_int]
     lib.kc_kv_quant.restype = ctypes.c_int
+    lib.kc_guard_stats.argtypes = [ctypes.POINTER(ctypes.c_longlong), ctypes.POINTER(ctypes.c_longlong)]
     assert lib.kc_sizeof_model() == ctypes.sizeof(Model) and lib.kc_sizeof_layer() == ctypes.sizeof(Layer)
     return lib
 
@@ -436,6 +437,12 @@ class Engine(object):
         if pos >= self.ctx:
             raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
         return self.lib.kc_step(ctypes.byref(self.m), int(tok), int(pos), 1)
+
+    def guard_stats(self):
+        """(decisions examined, decisions that fell back to the fp32 head) under KINDI_CPU_Q8GUARD"""
+        seen, hits = ctypes.c_longlong(0), ctypes.c_longlong(0)
+        self.lib.kc_guard_stats(ctypes.byref(seen), ctypes.byref(hits))
+        return int(seen.value), int(hits.value)
 
     def step2(self, tok0, tok1, pos):
         """two tokens at pos and pos + 1 in one weight pass (kc_step2): the greedy token after each"""

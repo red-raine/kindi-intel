@@ -176,7 +176,31 @@ KCAPI int kc_tier_mask(void){
 }
 KCAPI void kc_set_tier(int t){ g_tier = t; }
 KCAPI int kc_get_tier(void){ return g_tier; }
+
+/* the small-margin guard (KINDI_CPU_Q8GUARD=<gap>): at a decision whose top-1/top-2 gap is under the measured logit
+   drift, the int8 argmax is a coin toss decided by quantisation noise, so the head is recomputed with the production
+   fp32 kernel from the same folded input and the decision taken from those logits instead. The head is the only place
+   a decision can be re-derived without replaying the state, but it is not a cheap GEMV: it is 508.6 M of the model's
+   1880 M parameters, and one fallback measured +10.0 ms on an 87.4 ms int8 token. So the guard is affordable at the 1%
+   trigger rate it actually fires at and not at a high one, and it does not recover the fp32 decisions either - see the
+   measurements in docs/CPU-PERF-2026.md. Off at 0 (the default); g_force_fp32 is the tier override the fallback uses. */
+static float g_guard_eps = -1.0f;            /* <0 = not read from the environment yet */
+static long long g_guard_seen, g_guard_hits;
+static int g_force_fp32;
+static float guard_eps(void){
+  if(g_guard_eps < 0.0f){
+    const char* e = getenv("KINDI_CPU_Q8GUARD");
+    g_guard_eps = e ? (float)atof(e) : 0.0f;
+    if(g_guard_eps < 0.0f) g_guard_eps = 0.0f;
+  }
+  return g_guard_eps;
+}
+/* decisions examined and decisions that fell back, so a sweep can report what the guard cost */
+KCAPI void kc_guard_stats(long long* seen, long long* hits){ *seen = g_guard_seen; *hits = g_guard_hits; }
+KCAPI void kc_guard_reset(void){ g_guard_seen = 0; g_guard_hits = 0; }
+
 static int tier(void){
+  if(g_force_fp32) return (kc_tier_mask() & KCT_AVX2) ? KCT_AVX2 : KCT_SCALAR;
   if(g_tier) return g_tier;
   { const char* e = getenv("KINDI_CPU_Q8");
     if(e && e[0] == '1' && (kc_tier_mask() & KCT_Q8)) return (g_tier = KCT_Q8); }
@@ -253,6 +277,8 @@ static void rows8(const Mat* A, float* y, const float* T, int b0, int b1){
      - KINDI_CPU_Q8C=1  a static per-channel input scale, calibrated once (kc_cal_begin..kc_cal_end) and then applied
        on the ordinary fp32 path: the input is rounded to its channel's grid and handed to the production GEMV, so the
        weight kernel is unchanged and only the activation precision is coarser than fp32.
+     - KINDI_CPU_Q8GUARD=<gap>  the small-margin guard: a decision whose top-1/top-2 gap is below <gap> is recomputed
+       with the fp32 head from the same folded input and decided there instead of on the int8 logits.
    The weight scale stays one per 128-column block in every scheme: it is part of the pack.
 
    The arithmetic it computes is exactly what vpdpbusd would compute from this same pack: the folded input is
@@ -1235,6 +1261,7 @@ static void embed(Model* m, int tok){
 /* one token; head != 0: also the output head (logits in m->logits); returns the greedy token or -1 */
 KCAPI int kc_step(Model* m, int tok, int pos, int head){
   int best = -1;
+  int redo = 0;              /* shared: the guard's verdict for this decision */
   dump_open();
   t_last = omp_get_wtime(); t_cur = 0;
   #pragma omp parallel
@@ -1249,6 +1276,25 @@ KCAPI int kc_step(Model* m, int tok, int pos, int head){
       TS(6);
       rmsfold(m, m->out_norm, 1);
       gemv1(m, &m->head, m->logits, m->xp, KCAL_HEAD);
+      if(tier() == KCT_Q8 && guard_eps() > 0.0f){
+        #pragma omp single
+        {
+          float v1 = m->logits[0], v2 = -3.4e38f;     /* top-1 and top-2 of the int8 logits */
+          for(int i = 1; i < m->head.R; ++i){
+            const float v = m->logits[i];
+            if(v > v1){ v2 = v1; v1 = v; } else if(v > v2) v2 = v;
+          }
+          ++g_guard_seen;
+          if((v1 - v2) < guard_eps()){ ++g_guard_hits; redo = 1; }
+        }
+        if(redo){
+          #pragma omp single
+          { g_force_fp32 = 1; }              /* implicit barrier: every thread sees it before its gemv entry */
+          gemv1(m, &m->head, m->logits, m->xp, KCAL_HEAD);      /* fp32 head, same folded input */
+          #pragma omp single
+          { g_force_fp32 = 0; }
+        }
+      }
       #pragma omp single
       {
         int bi = 0; float bv = m->logits[0];
