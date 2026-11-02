@@ -154,6 +154,52 @@ Done since this list was written: the kernel tiers (scalar / AVX2 / int8) with a
 build, the MoE FFN with a NumPy-validated reference, and expert paging - the last two measured above, the paging
 rejected on transfer cost.
 
+### Could `vpshufb` replace `vpermps`: the pre-broadcast table, measured
+
+`vpermps` is the one instruction in the batched GEMV that lands on port 5 for every weight word, so a byte-shuffle
+substitute looks attractive - same port, but if it were cheaper per lookup the bottleneck would move. It cannot be,
+for a reason visible in the ISA: `vpshufb` reaches only the sixteen bytes of its own 128-bit lane, so an 8-float table
+is applied a half at a time - two shuffles and a blend where `vpermps` needs one instruction.
+
+The first arm (`gab2_shuf.c`) broadcast each half into both lanes on every lookup, four `vbroadcasti128` per weight
+word across the two tables, and measured 0.62x. The obvious reading was that the broadcasts were the cost, so
+`gab2_shuf2.c` stores the halves *already duplicated* (32 bytes each, `{f0..f3,f0..f3}` and `{f4..f7,f4..f7}`), making
+a lookup two plain 32-byte loads at the price of a 64 KB pair table per token instead of 32 KB. Both arms are
+bit-exact against the two-pass reference at every size (`max|sep-shuf2| = 0.000e+00`), so this is purely a layout
+question.
+
+9 interleaved reps, 8 threads, medians, arm order rotated per rep:
+
+| working set | b2 (ms) | shuf, broadcast (ms) | **shuf2, pre-broadcast (ms)** | b2/shuf2 | ins/word, shuf2 vs b2 | port 5/word, shuf2 vs b2 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.59 MB | 0.076 | 0.127 | 0.124 | 0.61x | 3.43 / 1.39 | 0.92 / 0.39 |
+| 1.18 MB | 0.155 | 0.248 | 0.243 | 0.64x | 3.43 / 1.39 | 0.92 / 0.40 |
+| 2.36 MB | 0.191 | 0.450 | 0.438 | 0.44x | 3.43 / 1.39 | 0.92 / 0.39 |
+| 4.72 MB | 1.079 | 1.301 | 3.845 | 0.28x | 4.08 / 1.39 | 0.97 / 0.39 |
+| 9.44 MB | 1.174 | 3.083 | 2.343 | 0.50x | 3.76 / 1.43 | 0.98 / 0.39 |
+| 18.87 MB | 2.081 | 4.005 | 3.695 | 0.56x | 3.58 / 1.46 | 0.95 / 0.40 |
+| 37.75 MB | 3.793 | 7.743 | 12.765 | 0.30x | 3.51 / 1.45 | 0.94 / 0.40 |
+| 150.99 MB | 12.674 | 34.743 | 29.131 | 0.44x | 3.45 / 1.41 | 0.93 / 0.40 |
+| 432.00 MB | 36.580 | 75.639 | 77.166 | 0.47x | 3.43 / 1.40 | 0.93 / 0.39 |
+
+**No - and the layout was never the reason.** Median over the nine sizes is **0.49x** for the pre-broadcast form and
+0.48x for the broadcast form, and the best single size reaches 0.64x: at no size does either beat `vpermps`, in L2 or
+in DRAM. Removing the broadcasts changes the median by one percent, and the counters show why - **port 5 per weight
+word is 0.92-0.98 in both shuf arms against 0.39 for `b2`, unchanged by the layout change.** `vbroadcasti128` with a
+memory operand is a load uop, not a port-5 uop, so those four broadcasts were never occupying the resource the arm was
+trying to relieve. What remains is 2.4-2.9x the instructions (`two vpshufb` + `vpblendd` + the extract, against one
+`vpermps`), and on this kernel instruction count is throughput: the 2.5x instruction ratio and the 0.49x time ratio are
+the same fact stated two ways.
+
+Two sizes (4.72 MB, 37.75 MB) put the pre-broadcast arm far behind the broadcast one - 3.0x and 1.6x - which is what
+doubling the table per token can do when it stops fitting; those are also the rows with the widest rep spread here, so
+the honest summary is "never better, sometimes worse", not "equal".
+
+The only form that gets to one shuffle per eight floats puts **16-bit** entries in one lane, so eight pair sums fit in
+sixteen bytes and a `vcvtph2ps` widens them: two instructions and fp16 pair sums, which cannot pass the tier's
+bit-exact gate against the fp32 reference. For an *exact* fp32 pair-sum lookup, `vpermps` is the instruction, and that
+closes the byte-shuffle route for good.
+
 ## A structural limit worth recording
 
 With `vpermps` (8-lane) and 4-bit pair codes, **one lookup covers 8 rows × 2 columns = 16 weights, and that is the
