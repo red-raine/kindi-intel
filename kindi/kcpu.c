@@ -55,6 +55,8 @@ typedef struct {
   uint16_t *K4s, *V4s;                   /* [ctx][NHKV] 4-bit scale, fp16 */
   uint8_t *K2, *V2;                      /* [ctx][NHKV][HD/4] four 2-bit codes per byte, levels {-3,-1,1,3} */
   uint16_t *K2s, *V2s;                   /* [ctx][NHKV] 2-bit scale, fp16 */
+  uint8_t *K5, *V5;                      /* [ctx][NHKV][HD/2] two 4-bit codes per byte, the 4-level code twice */
+  uint16_t *K5s, *V5s;                   /* [ctx][NHKV] 4-bit-as-two-passes scale, fp16 */
   /* FFN */
   Mat ffg, ffu, ffd;
 } Layer;
@@ -74,7 +76,8 @@ typedef struct {
   int* sel;
   void (*moe_fetch)(void*, int, int);
   void* moe_ctx;
-  int kvq;                               /* K/V cache format: 0 fp16, 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit (kc_kv_quant) */
+  int kvq;                               /* K/V cache format: 0 fp16, 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit,
+                                            5 4 bits as two 4-level passes (kc_kv_quant) */
   int kvq_k, kvq_v;                      /* the two sides separately (kc_kv_quant2): K and V need not match */
 } Model;
 
@@ -929,21 +932,96 @@ static void q8_pack(const float* v, int8_t* out, uint16_t* sc, int n){
     }
   }
 }
-/* 4-bit uniform: two signed nibbles a byte, one scale per head. 8 levels is the point the BitNet papers call free
-   (4-bit KV is within a few tenths of a point of full precision), so it is the middle rung between q8_0 and the
-   ternary alphabet the 2-bit format uses. */
+/* 4-bit uniform: two signed nibbles a byte, one scale per head, 16 levels from -8 to 7. This is the rung the BitNet
+   papers call free, so the scale is worth fitting: amax/7 (what this shipped with) leaves 16% of the reconstruction
+   error on the table against the least-squares scale, because a packed head's maximum is a poor estimate of the step
+   the rest of the vector wants. Same four starts and same error test as q2_pack. */
 static float q4_pack(const float* v, uint8_t* out, int n){
-  float am = 0.f;
-  for(int j = 0; j < n; ++j){ const float f = fabsf(v[j]); if(f > am) am = f; }
-  const float a = am > 0.f ? am / 7.0f : 1e-8f;
-  const float ia = 1.0f / a;
-  for(int j = 0; j < n; j += 2){
-    int q0 = (int)lrintf(v[j] * ia), q1 = (int)lrintf(v[j + 1] * ia);
-    if(q0 > 7) q0 = 7; else if(q0 < -8) q0 = -8;
-    if(q1 > 7) q1 = 7; else if(q1 < -8) q1 = -8;
-    out[j >> 1] = (uint8_t)((q0 & 15) | ((q1 & 15) << 4));
+  int bc[512], c[512];
+  float am = 0.f, mn = 0.f;
+  for(int j = 0; j < n; ++j){ const float f = fabsf(v[j]); if(f > am) am = f; mn += f; }
+  const float starts[4] = {am / 7.0f, am / 9.0f, am / 12.0f, 0.5f * mn / (float)n};
+  float ba = 1e-8f, best = -1.f;
+  for(int s = 0; s < 4; ++s){
+    float a = starts[s] > 0.f ? starts[s] : 1e-8f;
+    for(int it = 0; it < 10; ++it){
+      float num = 0.f, den = 0.f;
+      const float ia = 1.0f / a;
+      for(int j = 0; j < n; ++j){
+        float q = nearbyintf(v[j] * ia);
+        if(q > 7.f) q = 7.f; else if(q < -8.f) q = -8.f;
+        num += v[j] * q; den += q * q;
+      }
+      const float na = den > 0.f ? num / den : a;
+      if(!(na > 0.f)) break;
+      a = na;
+    }
+    const float ia = 1.0f / a;
+    float sse = 0.f;
+    for(int j = 0; j < n; ++j){
+      float q = nearbyintf(v[j] * ia);
+      if(q > 7.f) q = 7.f; else if(q < -8.f) q = -8.f;
+      const int qi = (int)q;
+      const float d = v[j] - a * q;
+      c[j] = qi; sse += d * d;
+    }
+    if(best < 0.f || sse < best){ best = sse; ba = a; for(int j = 0; j < n; ++j) bc[j] = c[j]; }
   }
-  return a;
+  for(int j = 0; j < n; j += 2)
+    out[j >> 1] = (uint8_t)((bc[j] & 15) | ((bc[j + 1] & 15) << 4));
+  return ba;
+}
+/* 4 bits as two 4-level passes: v = a*(L[k1] + 0.25*L[k2]) with L = {-3,-1,1,3}, so the 2-bit alphabet is the codec
+   and the second pass is a residue on it. The 16 levels come out even (0.25a apart from -3.75a to 3.75a) and one of
+   the two codes can be read as a 4-entry table, but the level set is not what pays: the fitted scale is. Same start
+   set and error test as q2_pack, and the same buffer size as mode 3 - four bits a value either way. */
+static const uint8_t Q5C[16] = {          /* sorted level -8..7 -> packed code (k1 | k2 << 2) */
+  0, 4, 8, 12,        /* L1=-3: -3.75 -3.25 -2.75 -2.25 */
+  1, 5, 9, 13,        /* L1=-1: -1.75 -1.25 -0.75 -0.25 */
+  2, 6, 10, 14,       /* L1=+1: +0.25 +0.75 +1.25 +1.75 */
+  3, 7, 11, 15};      /* L1=+3: +2.25 +2.75 +3.25 +3.75 */
+static float q5_pack(const float* v, uint8_t* out, int n){
+  int bc[512], c[512];
+  float am = 0.f, mn = 0.f;
+  for(int j = 0; j < n; ++j){ const float f = fabsf(v[j]); if(f > am) am = f; mn += f; }
+  const float starts[4] = {am / 3.75f, am / 5.0f, am / 7.0f, 0.35f * mn / (float)n};
+  float ba = 1e-8f, best = -1.f;
+  for(int s = 0; s < 4; ++s){
+    float a = starts[s] > 0.f ? starts[s] : 1e-8f;
+    for(int it = 0; it < 10; ++it){
+      float num = 0.f, den = 0.f;
+      const float ia = 1.0f / a;
+      for(int j = 0; j < n; ++j){
+        int m = (int)lrintf(2.0f * v[j] * ia - 0.5f);       /* levels at (2m+1)/4 of a */
+        if(m > 7) m = 7; else if(m < -8) m = -8;
+        const float lv = 0.25f * (float)(2 * m + 1);
+        num += v[j] * lv; den += lv * lv;
+      }
+      const float na = den > 0.f ? num / den : a;
+      if(!(na > 0.f)) break;
+      a = na;
+    }
+    const float ia = 1.0f / a;
+    float sse = 0.f;
+    for(int j = 0; j < n; ++j){
+      int m = (int)lrintf(2.0f * v[j] * ia - 0.5f);
+      if(m > 7) m = 7; else if(m < -8) m = -8;
+      const float d = v[j] - a * 0.25f * (float)(2 * m + 1);
+      c[j] = m; sse += d * d;
+    }
+    if(best < 0.f || sse < best){ best = sse; ba = a; for(int j = 0; j < n; ++j) bc[j] = c[j]; }
+  }
+  for(int j = 0; j < n; j += 2)
+    out[j >> 1] = (uint8_t)(Q5C[bc[j] + 8] | (Q5C[bc[j + 1] + 8] << 4));
+  return ba;
+}
+static const float LT5[16] = {            /* indexed by the packed code, not by the sorted level */
+  -3.75f, -1.75f, 0.25f, 2.25f,
+  -3.25f, -1.25f, 0.75f, 2.75f,
+  -2.75f, -0.75f, 1.25f, 3.25f,
+  -2.25f, -0.25f, 1.75f, 3.75f};
+static void q5_unpack(const uint8_t* p, float sc, float* out, int n){
+  for(int j = 0; j < n; ++j) out[j] = sc * LT5[(p[j >> 1] >> (4 * (j & 1))) & 15];
 }
 static void q4_unpack(const uint8_t* p, float sc, float* out, int n){
   for(int j = 0; j < n; ++j){
@@ -984,11 +1062,13 @@ static void attn_mid(Model* m, Layer* L, int pos){
       else if(m->kvq_k == 2) q8_pack(dst, L->Kq + ix * HD, L->Kqs + ix * (HD / 32), HD);
       else if(m->kvq_k == 3) L->K4s[ix] = f2h(q4_pack(dst, L->K4 + ix * (HD / 2), HD));
       else if(m->kvq_k == 4) L->K2s[ix] = f2h(q2_pack(dst, L->K2 + ix * (HD / 4), HD));
+      else if(m->kvq_k == 5) L->K5s[ix] = f2h(q5_pack(dst, L->K5 + ix * (HD / 2), HD));
       else { uint16_t* K = L->Kc + ix * HD; for(int j = 0; j < HD; ++j) K[j] = f2h(dst[j]); }
       if(m->kvq_v == 1) L->Vs[ix] = f2h(tern_pack(vv, L->Vt + ix * (HD / 4), HD));
       else if(m->kvq_v == 2) q8_pack(vv, L->Vq + ix * HD, L->Vqs + ix * (HD / 32), HD);
       else if(m->kvq_v == 3) L->V4s[ix] = f2h(q4_pack(vv, L->V4 + ix * (HD / 2), HD));
       else if(m->kvq_v == 4) L->V2s[ix] = f2h(q2_pack(vv, L->V2 + ix * (HD / 4), HD));
+      else if(m->kvq_v == 5) L->V5s[ix] = f2h(q5_pack(vv, L->V5 + ix * (HD / 2), HD));
       else { uint16_t* V = L->Vc + ix * HD; for(int j = 0; j < HD; ++j) V[j] = f2h(vv[j]); }
     }
   }
@@ -1002,6 +1082,7 @@ static void attn_mid(Model* m, Layer* L, int pos){
       else if(m->kvq_k == 2) q8_unpack(L->Kq + ix * HD, L->Kqs + ix * (HD / 32), kf, HD);
       else if(m->kvq_k == 3) q4_unpack(L->K4 + ix * (HD / 2), h2f(L->K4s[ix]), kf, HD);
       else if(m->kvq_k == 4) q2_unpack(L->K2 + ix * (HD / 4), h2f(L->K2s[ix]), kf, HD);
+      else if(m->kvq_k == 5) q5_unpack(L->K5 + ix * (HD / 2), h2f(L->K5s[ix]), kf, HD);
       else { const uint16_t* K = L->Kc + ix * HD; for(int j = 0; j < HD; ++j) kf[j] = h2f(K[j]); }
       for(int g = 0; g < G; ++g){
         const float* q = m->qr + (size_t)(kv * G + g) * HD;
@@ -1036,7 +1117,8 @@ static void attn_mid(Model* m, Layer* L, int pos){
         if(m->kvq_v == 1) tern_unpack(L->Vt + ix * (HD / 4) + (d0 >> 2), h2f(L->Vs[ix]), vf, 32);
         else if(m->kvq_v == 2) q8_unpack(L->Vq + ix * HD + d0, L->Vqs + ix * (HD / 32) + (d0 >> 5), vf, 32);
         else if(m->kvq_v == 3) q4_unpack(L->V4 + ix * (HD / 2) + (d0 >> 1), h2f(L->V4s[ix]), vf, 32);
-        else q2_unpack(L->V2 + ix * (HD / 4) + (d0 >> 2), h2f(L->V2s[ix]), vf, 32);
+        else if(m->kvq_v == 4) q2_unpack(L->V2 + ix * (HD / 4) + (d0 >> 2), h2f(L->V2s[ix]), vf, 32);
+        else q5_unpack(L->V5 + ix * (HD / 2) + (d0 >> 1), h2f(L->V5s[ix]), vf, 32);
         for(int j = 0; j < 32; ++j) acc[j] += pt * vf[j];
       } else {
         const uint16_t* V = L->Vc + ix * HD + d0;
@@ -1321,18 +1403,20 @@ KCAPI void kc_ffn_probe(Model* m, int il, const float* in, float* out){
   }
 }
 
-/* select the K/V cache format: 0 fp16 (default), 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit four-level. The arrays are
-   allocated by the host, so this only records the choice and refuses a mode whose arrays were not handed over */
+/* select the K/V cache format: 0 fp16 (default), 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit four-level, 5 4 bits as two
+   4-level passes. The arrays are allocated by the host, so this only records the choice and refuses a mode whose
+   arrays were not handed over */
 static int kvq_ok(const Model* m, int mode){
   /* layer 0 is a GDN layer and holds no K/V cache, so look for the first layer that does */
   int il = 0;
   while(il < m->NL && !(m->L + il)->Kc) ++il;
-  if(mode < 0 || mode > 4 || il == m->NL) return 0;
+  if(mode < 0 || mode > 5 || il == m->NL) return 0;
   const Layer* A = m->L + il;
   if(mode == 1 && !A->Ks) return 0;
   if(mode == 2 && !A->Kqs) return 0;
   if(mode == 3 && !A->K4s) return 0;
   if(mode == 4 && !A->K2s) return 0;
+  if(mode == 5 && !A->K5s) return 0;
   return 1;
 }
 

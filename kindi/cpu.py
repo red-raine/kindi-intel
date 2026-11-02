@@ -49,6 +49,7 @@ class Layer(ctypes.Structure):
                 ("Kqs", PU16), ("Vqs", PU16),
                 ("K4", PU8), ("V4", PU8), ("K4s", PU16), ("V4s", PU16),
                 ("K2", PU8), ("V2", PU8), ("K2s", PU16), ("V2s", PU16),
+                ("K5", PU8), ("V5", PU8), ("K5s", PU16), ("V5s", PU16),
                 ("ffg", Mat), ("ffu", Mat), ("ffd", Mat)]
 
 
@@ -169,14 +170,14 @@ class Engine(object):
         Ls = (Layer * NL)()
         self.M, self.conv, self.Kc, self.Vc = [], [], [], []
         # K/V cache format: 0 fp16, 1 ternary at 2 bits with one scale per (position, head), 2 q8_0, 3 4-bit, 4 a
-        # 2-bit four-level code (levels {-3,-1,1,3}). KINDI_CPU_KVQ sets both sides; KINDI_CPU_KVQ_K and
-        # KINDI_CPU_KVQ_V override one side each, so K can be q8_0 while V is 4-bit. The arrays are held here so their
-        # lifetime is the engine's, exactly like the fp16 ones.
+        # 2-bit four-level code (levels {-3,-1,1,3}), 5 four bits as two 4-level passes. KINDI_CPU_KVQ sets both
+        # sides; KINDI_CPU_KVQ_K and KINDI_CPU_KVQ_V override one side each, so K can be q8_0 while V is 4-bit. The
+        # arrays are held here so their lifetime is the engine's, exactly like the fp16 ones.
         def kvq_of(name, dflt):
             v = int(os.environ.get(name) or dflt)
-            return v if v in (1, 2, 3, 4) else dflt
+            return v if v in (1, 2, 3, 4, 5) else dflt
         kvq = int(os.environ.get("KINDI_CPU_KVQ") or 0)
-        kvq = kvq if kvq in (1, 2, 3, 4) else 0
+        kvq = kvq if kvq in (1, 2, 3, 4, 5) else 0
         self.kvq_k = kvq_of("KINDI_CPU_KVQ_K", kvq)
         self.kvq_v = kvq_of("KINDI_CPU_KVQ_V", kvq)
         self.kvq = self.kvq_k                      # the K side, which is what callers and dumps quote
@@ -228,6 +229,12 @@ class Engine(object):
                     L.K2, L.V2 = _p(K2, PU8), _p(V2, PU8)
                     L.K2s, L.V2s = _p(K2s, PU16), _p(V2s, PU16)
                     self.kvq_bufs += [K2, V2, K2s, V2s]
+                if 5 in (self.kvq_k, self.kvq_v):                  # 4 bits as two 4-level passes, one scale a head
+                    K5, V5 = z(self.ctx * NHKV * (HD // 2), np.uint8), z(self.ctx * NHKV * (HD // 2), np.uint8)
+                    K5s, V5s = z(self.ctx * NHKV, np.uint16), z(self.ctx * NHKV, np.uint16)
+                    L.K5, L.V5 = _p(K5, PU8), _p(V5, PU8)
+                    L.K5s, L.V5s = _p(K5s, PU16), _p(V5s, PU16)
+                    self.kvq_bufs += [K5, V5, K5s, V5s]
                 if 2 in (self.kvq_k, self.kvq_v):                  # q8_0: 32 int8 + an fp16 scale per block
                     Kq, Vq = z(self.ctx * NHKV * HD, np.int8), z(self.ctx * NHKV * HD, np.int8)
                     Kqs, Vqs = z(self.ctx * NHKV * (HD // 32), np.uint16), z(self.ctx * NHKV * (HD // 32), np.uint16)

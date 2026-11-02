@@ -672,16 +672,16 @@ corpus, and it pays only on hardware this host is not. The batched GEMV is measu
 first. The VNNI path is the branch's reason to exist on 2024+ Intel, and SDE is how to build it correctly before any
 silicon is bought.
 
-## K/V-cache quantisation: q8_0 costs nothing, the 2-bit rungs cost the model
+## K/V-cache quantisation: q8_0 costs nothing, the small alphabets do not save the model
 
 The K/V cache is a storage format, not an arithmetic one, so `KINDI_CPU_KVQ` (in `kcpu.c`, off by default, prototype
 only) selects it per run and every path still materialises a head's 256 values into fp32 before the same dot products.
 `KINDI_CPU_KVQ_K` and `KINDI_CPU_KVQ_V` select it a side at a time. `0` is fp16; `1` is ternary at 2 bits with one
-scale per (position, head) - four codes a byte, the scale fitted by least squares to the code it induces; `2` is
-q8_0's 32-value int8 blocks with an fp16 scale of `amax/127`; `3` is 4-bit with one scale per head; `4` is 2 bits on
-four levels `{-3,-1,1,3}a` - ternary's layout with its unused fourth code put to work. Same 48 prompts, 160 greedy
-tokens, 7,680 decisions, and the fp16 arm reproduces the stored `wide_fp32` arm token for token, so the switch is
-inert at 0.
+scale per (position, head); `2` is q8_0's 32-value int8 blocks with an fp16 scale of `amax/127`; `3` is 4-bit, 16
+levels with a fitted per-head scale; `4` is 2 bits on four levels `{-3,-1,1,3}a`; `5` is 4 bits as two passes of that
+same 4-level code, levels `(2m+1)a/4` for m in -8..7. Modes 1, 3, 4 and 5 fit their scale by least squares to the code
+it induces, from four starts, and keep the lowest error. Same 48 prompts, 160 greedy tokens, 7,680 decisions, and the
+fp16 arm reproduces the stored `wide_fp32` arm token for token, so the switch is inert at 0.
 
 | arm | K | V | bits/val | cache MiB | vs fp16 | prompts diverging | median KL at step 0 | max KL | top-1 at step 0 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -690,11 +690,12 @@ inert at 0.
 | q8_0 | q8_0 | q8_0 | 8.50 | 6.38 | 1.88x | 6 of 48 | 0.00002 | 0.0002 | 48/48 |
 | ternary K, fp16 V | ternary | fp16 | 9.03 | 6.77 | 1.77x | 46 of 48 | 0.02136 | 0.2448 | 39/48 |
 | fp16 K, ternary V | fp16 | ternary | 9.03 | 6.77 | 1.77x | 48 of 48 | 0.07000 | 0.3646 | 40/48 |
-| q8 K, 4-bit V | q8_0 | 4-bit | 6.28 | 4.71 | 2.55x | 40 of 48 | 0.01389 | 0.1620 | 46/48 |
-| q8 K, ternary V | q8_0 | ternary | 5.28 | 3.96 | 3.03x | 48 of 48 | 0.07097 | 0.3722 | 39/48 |
+| q8 K, 4-bit V | q8_0 | 4-bit | 6.28 | 4.71 | 2.55x | 40 of 48 | **0.01308** | 0.0704 | 43/48 |
+| q8 K, 4-level x2 V | q8_0 | 4-level x2 | 6.28 | 4.71 | 2.55x | 42 of 48 | 0.01446 | 0.0689 | 44/48 |
 | q8 K, 2-bit V | q8_0 | 2-bit | 5.28 | 3.96 | 3.03x | 48 of 48 | 0.07439 | 0.4069 | 39/48 |
 | 2-bit K, q8 V | 2-bit | q8_0 | 5.28 | 3.96 | 3.03x | 47 of 48 | 0.02187 | 0.1935 | 38/48 |
-| 4-bit | 4-bit | 4-bit | 4.06 | 3.05 | 3.94x | 43 of 48 | 0.01988 | 0.1878 | 44/48 |
+| 4-bit | 4-bit | 4-bit | 4.06 | 3.05 | 3.94x | 43 of 48 | **0.01433** | 0.0890 | 43/48 |
+| 4-level x2 | 4-level x2 | 4-level x2 | 4.06 | 3.05 | 3.94x | 45 of 48 | 0.01896 | 0.0807 | 44/48 |
 | ternary | ternary | ternary | 2.06 | 1.55 | 7.77x | 48 of 48 | 0.09135 | 0.3528 | 36/48 |
 | 2-bit | 2-bit | 2-bit | 2.06 | 1.55 | 7.77x | 47 of 48 | 0.08116 | 0.4184 | 39/48 |
 
@@ -712,25 +713,35 @@ either way. Moving the keys to q8_0 barely helps a K-side arm (2-bit K with q8 V
 0.071 to 0.074 however the keys are stored. Keys only decide the ordering of 1,024 positions; values decide what gets
 mixed.
 
-**The 2-bit alphabet was wrong, and fixing it does not rescue 2 bits.** Ternary spends its two bits on three levels
-and drives 56% of codes to zero. Four levels at the same 2 bits reconstruct 16% closer on K and 8% closer on V
+**At 2 bits the alphabet was wrong, and fixing it does not rescue the rung.** Ternary spends its two bits on three
+levels and drives 56% of codes to zero. Four levels at the same 2 bits reconstruct 16% closer on K and 8% closer on V
 (relL2 0.425 / 0.422 against 0.506 / 0.460, over 744 cache vectors taken from three prompts at every position), and
 that is exact: the shipped packer reproduces a NumPy four-level search code for code on 190,464 codes. End to end the
 median step-0 KL moves 0.0914 -> 0.0812 and the step-0 top-1 goes 36 -> 39 of 48, but a paired bootstrap over the 48
-prompts puts the mean difference at -0.014 with a [-0.036, +0.009] interval: it includes zero. On this harness the
-alphabet is not resolvable at the model level, and both 2-bit arms are still a different model (47-48 of 48 streams
-leave fp16, KL four thousand times q8_0's). The 2-bit deficit is the bit budget and not the codebook - 2 bits against
-4 bits is +0.066 [0.045, 0.088], which does exclude zero.
+prompts puts the mean difference at -0.014 with a [-0.036, +0.009] interval: it includes zero. Both 2-bit arms are
+still a different model (47-48 of 48 streams leave fp16, KL four thousand times q8_0's), and 2 bits against 4 bits is
++0.066 [0.045, 0.088], which does exclude zero. The rung's deficit is the bit budget, not the codebook.
 
-**The four-level search has to be chosen on the objective.** The assignment map is piecewise constant in the scale,
-so iterating from one start is bistable: a one-ulp difference in the input can settle in a different basin, and one
-position-0 head measured 0.63 and 0.79 relL2 from the two basins. `q2_pack` therefore iterates four starts (three
-fractions of `amax` and the mean) and keeps the lowest error, ~10k compares per cache write against ~10^8
-multiply-adds per token.
+**At 4 bits the lever is the scale, not the alphabet.** The shipped 16-level code used `amax/7`, and a head's maximum
+is a poor estimate of the step the rest of the vector wants: the least-squares scale is 18% closer on K and 19% on V
+(relL2 0.1730 -> 0.1419 and 0.1825 -> 0.1481). Composing the 2-bit four-level alphabet twice into 4 bits - sixteen
+even levels, `(2m+1)a/4` - reaches 0.1422 / 0.1660: level with the fitted 16-level code on K and 12% worse on V, so
+the four-level code extended to four bits buys nothing the scale fit does not. End to end the fit takes the V-side
+arm from 0.0139 to 0.0131 (mean -0.0028 [-0.0087, +0.0014]: not resolvable) and the both-sides arm from 0.0199 to
+0.0143 (mean -0.0097 [-0.0180, -0.0034]: resolvable), and the two-pass form is worse on both sides
+(+0.0038 [+0.0005, +0.0073]). What the fit does fix is the tail: max KL over the 48 prompts falls 0.162 -> 0.070 on
+the V-side arm, because one outlier in a head used to squeeze every other value in it.
 
-**The smallest rung that is still the same model is 4 bits.** q8 K with 4-bit V is 6.28 bits and 2.55x; 4-bit on both
-sides is 4.06 bits and 3.93x at 0.0199 KL and 44 of 48 top-1. That is four to five times the KL of q8_0 in exchange
-for most of the memory, which is a real trade at long context and not a free one.
+**Is 4-bit V usable?** Not in the q8_0 sense: 0.0131 nats against 2e-5, 40 of 48 streams diverge, and 5 of 48 first
+tokens change. The first-token count moved the wrong way with the fit (2 of 48 under `amax/7`, 5 of 48 under the fit)
+while every KL statistic improved, which is the kind of thing three prompts can do; the medians and the tail are the
+measurements with an interval behind them. What 4-bit V is, is 6.28 bits and 2.55x, 46 of 48 top-1 at step 0 - a real
+trade at long context and not a free one.
+
+**Four starts, chosen on the objective.** The assignment map is piecewise constant in the scale, so iterating from one
+start is bistable: a one-ulp difference in the input can settle in a different basin, and one position-0 head measured
+0.63 and 0.79 relL2 from the two basins. Every fitted mode therefore iterates four starts (fractions of `amax` and the
+mean) and keeps the lowest error, ~10k compares per cache write against ~10^8 multiply-adds per token.
 
 **Is it worth any of the memory?** At ctx 1024 the whole cache is 12 MiB against 506 MB of weights, so q8_0 saves
 5.6 MiB, 1.1% of the pack, and attention is 0.9% of a token, so nothing shows in throughput. At ctx 8192 the cache is
@@ -738,10 +749,9 @@ for most of the memory, which is a real trade at long context and not a free one
 2 bits (84 MiB, 16%). **q8_0 K/V is a long-context memory knob, not a speed or quality one**; 4-bit is the smallest
 format that keeps the model, and the 2-bit rungs buy the last 12 MiB at the price of a different model.
 
-Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh`, `kqkv_asym.sh`, `kqkv_q4.sh`, `kqkv_q2.sh` run the arms, `kqkv_wide.py` is
-the sweep, `kvq_report.py` scores divergence, KL and cost, `kvq_detail.py` the divergence-step distribution,
-`q2_floor.py` the alphabet floors and `q2_check.py` the position-0 round trip).
-
+Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh`, `kqkv_asym.sh`, `kqkv_q4.sh`, `kqkv_q2.sh` and `kqkv_q45.sh` run the arms,
+`kqkv_wide.py` is the sweep, `kvq_report.py` scores divergence, KL and cost, `kvq_detail.py` the divergence-step
+distribution, `q2_floor.py` and `q45_floor.py` the alphabet floors, `q2_check.py` the position-0 round trip).
 ## Evaluated and rejected (advice from outside this repo)
 
 Three generic "how to speed up CPU inference" lists were triaged against this engine. Almost all of it was written for
