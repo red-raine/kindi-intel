@@ -730,6 +730,39 @@ its margin is small (cost set by how often the checkpoint is refreshed, not by h
 last few layers in fp32 so the head sees an undrifted stream, or move to 16-bit activations, whose step is 256x finer -
 the option the finer schemes above already point at.
 
+### The exact tail: partial exactness does not recover the decisions either
+
+The guard failed because the decision had already been lost upstream. `KINDI_CPU_Q8TAIL=<k>` asks the converse
+directly: the last `k` blocks **and** the head run the fp32 kernel while everything before them stays int8, so the head
+sees a stream drifted only by the prefix. `k = 0` is the plain int8 path and `k = NL` is plain fp32, and both endpoints
+reproduce their arms token for token (3/3 prompts each), which is what makes the switch itself trustworthy.
+
+| exact tail | prompts diverging | differing steps | flips above p1 |
+|---|---:|---:|---:|
+| 0 - plain int8 | 13 of 48 | 1,136 | 1 |
+| 1 block + head | 12 of 48 | 834 | 1 |
+| 4 blocks + head | **10 of 48** | 907 | 1 |
+| 8 blocks + head | **10 of 48** | 896 | 1 |
+| 12 blocks + head | **10 of 48** | 872 | 2 |
+| 24 (= fp32) | 0 | 0 | 0 |
+
+**The curve plateaus, and that is the result.** Making a third of the stack exact is worth three prompts; doubling
+that to half the stack is worth nothing more, and eight of the last twelve blocks contribute not one prompt. The
+remaining ten are decided by the drift already present in the prefix the tail cannot reach, and only the whole stack
+being exact returns the fp32 stream - which is to say, no exactness at all. The step count tells the same story less
+coarsely: 1,136 -> 834 with a single exact block, then flat within 40, so the tail's real effect is a 25% fall in
+differing positions rather than a fix.
+
+Cost, in this prototype, runs the wrong way to be a constraint: the elapsed time *falls* as the tail grows (1,942 s at
+one block, 1,890 s at four, 1,848 s at eight, 1,725 s at twelve for the same 7,680 tokens), because this int8 path
+measures 87.4 ms/token against 45.6 for fp32 and replacing an int8 layer with an fp32 one is a saving. That is the
+prototype's slowness, not a property of the design: a real VNNI kernel would pay about `k/NL` of the GEMV time at
+roughly a third of the int8 throughput, so four exact blocks would cost of order 10% and buy three prompts.
+
+Both cheap shapes of guard are therefore closed. What is left is changing the error rather than its location: 16-bit
+activations, whose step is 256x finer than int8's, or a state-level design that keeps an fp32 copy of the recurrent
+state and replays a token from it when the margin is small.
+
 The prototype is **not** a performance result and must not be read as one: it runs at 157 ms per token against 36 ms for
 the fp32 path, 4.3x slower, because it uses `vpmulld` per column pair and scalar int8 indexing instead of the byte-parallel
 `vpshufb` + `vpdpbusd` form, and it still reads the row-blocked pair layout rather than a column-major int8 repack. Its

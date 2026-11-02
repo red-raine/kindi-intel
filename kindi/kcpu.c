@@ -199,6 +199,21 @@ static float guard_eps(void){
 KCAPI void kc_guard_stats(long long* seen, long long* hits){ *seen = g_guard_seen; *hits = g_guard_hits; }
 KCAPI void kc_guard_reset(void){ g_guard_seen = 0; g_guard_hits = 0; }
 
+/* the exact tail (KINDI_CPU_Q8TAIL=<k>): the last k blocks and the head are computed with the fp32 kernel while the
+   rest of the stack stays int8, so the head sees a stream that has only been drifted by the layers before the tail.
+   The guard above showed a head-only fallback cannot recover a decision; this asks how much of the stack has to be
+   exact before the decision is exact again. k = 0 (the default) is the plain int8 path and k = NL is plain fp32, which
+   makes that end a control: it must reproduce the fp32 arm token for token (checked, 3/3 prompts). */
+static int g_tail = -1;
+static int q8_tail(void){
+  if(g_tail < 0){
+    const char* e = getenv("KINDI_CPU_Q8TAIL");
+    g_tail = e ? atoi(e) : 0;
+    if(g_tail < 0) g_tail = 0;
+  }
+  return g_tail;
+}
+
 static int tier(void){
   if(g_force_fp32) return (kc_tier_mask() & KCT_AVX2) ? KCT_AVX2 : KCT_SCALAR;
   if(g_tier) return g_tier;
@@ -1267,16 +1282,28 @@ KCAPI int kc_step(Model* m, int tok, int pos, int head){
   #pragma omp parallel
   {
     embed(m, tok);
+    const int tail = q8_tail();
     for(int il = 0; il < m->NL; ++il){
       Layer* L = m->L + il;
+      /* every thread stores the same value for the same layer, and the barrier inside the layer's first gemv orders the
+         store before any thread reads the tier, so no single-thread flag protocol is needed here */
+      if(tail) g_force_fp32 = (il >= m->NL - tail);
       if(L->is_attn) attn(m, L, pos, il > 0); else gdn(m, L, il > 0);
       ffn(m, L, il);
     }
     if(head){
       TS(6);
       rmsfold(m, m->out_norm, 1);
+      if(tail){
+        #pragma omp single
+        { g_force_fp32 = 1; }              /* the head is part of the exact tail */
+      }
       gemv1(m, &m->head, m->logits, m->xp, KCAL_HEAD);
-      if(tier() == KCT_Q8 && guard_eps() > 0.0f){
+      if(tail){
+        #pragma omp single
+        { g_force_fp32 = 0; }
+      }
+      if(tier() == KCT_Q8 && q8_tail() == 0 && guard_eps() > 0.0f){
         #pragma omp single
         {
           float v1 = m->logits[0], v2 = -3.4e38f;     /* top-1 and top-2 of the int8 logits */
