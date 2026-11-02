@@ -4,6 +4,7 @@
   kindi fast-head               build the cluster file for the fast head (optional; ~2 minutes)
   kindi verify                  check greedy output against llama.cpp's reference (token for token)
   kindi bench                   measure speed and GPU memory
+  kindi bench-spec TEXTFILE      measure speculative decode on real text (CPU)
   kindi serve                   run the OpenAI-compatible server
   kindi chat                    chat in the terminal (no server needed)
   kindi head exact|fast         choose the output head of a running server (next request, no restart)
@@ -74,6 +75,44 @@ def cmd_bench(cfg, a):
     _setup_gpu_env(cfg)
     from .bench import run
     return run(cfg, log=log)
+
+
+def cmd_qat_pack(cfg, a):
+    from . import ptload, quant
+    sd = {k: ptload.widen(v) for k, v in ptload.load(a.pt).items() if v.dtype.kind in "fiu"}
+    out = a.out or os.path.join(os.path.expanduser("~"), ".kindi", os.path.splitext(os.path.basename(a.pt))[0])
+    quant.selftest()
+    man = quant.pack(sd, out, log=log, name=os.path.basename(a.pt), source=a.pt, scheme=a.scheme)
+    log("kindi qat-pack: %d tensors (%d ternary, %s scale) -> %s, %.0f MB codes + %.1f MB f32"
+        % (man["tensors"], man["ternary_tensors"], a.scheme, out, man["bcodes_bytes"] / 2 ** 20,
+           man["f32_bytes"] / 2 ** 20))
+    from . import drift
+    return 0 if drift.verify_pack(sd, out, a.scheme, log=log) else 1
+
+
+def cmd_verify_tier(cfg, a):
+    from .tiers import run
+    return run(cfg, log=log, tokens=a.tokens, prompts=a.prompts)
+
+
+def cmd_moe_check(cfg, a):
+    from .moe import run
+    return run(a, log=log)
+
+
+def cmd_drift(cfg, a):
+    from . import drift
+    return drift.run(a, log=log)
+
+
+def cmd_bench_spec(cfg, a):
+    from .benchspec import run
+    return run(cfg, log=log, text=a.text, n=a.tokens, prompts=a.prompts, plen=a.prompt_len)
+
+
+def cmd_spec_check(cfg, a):
+    from .speccheck import run
+    return run(cfg, log=log, pack=a.pack, tokens=a.tokens)
 
 
 def cmd_serve(cfg, a):
@@ -198,6 +237,32 @@ def main(argv=None):
     s.add_argument("--iters", type=int, default=12)
     sub.add_parser("verify", help="check against llama.cpp's reference output")
     sub.add_parser("bench", help="measure speed")
+    s = sub.add_parser("verify-tier", help="check that the CPU kernel tiers compute the same thing (CPU)")
+    s.add_argument("--tokens", type=int, default=24, help="tokens per prompt (default 24)")
+    s.add_argument("--prompts", type=int, default=3, help="prompts (default 3)")
+    s = sub.add_parser("qat-pack", help="ternarise a float torch checkpoint into a Kindi pack")
+    s.add_argument("pt", help="a .pt state dict of float weights")
+    s.add_argument("--out", help="pack directory (default: ~/.kindi/<checkpoint name>)")
+    s.add_argument("--scheme", choices=("absmean", "lsq"), default="lsq",
+                   help="absmean is the PTQ1_0/GGUF convention; lsq searches the minimum-error scale (default lsq)")
+    s = sub.add_parser("moe-check", help="check the CPU Mixture-of-experts FFN against a NumPy reference")
+    s.add_argument("--experts", type=int, default=4)
+    s.add_argument("--active", type=int, default=2)
+    s.add_argument("--layers", type=int, default=3)
+    s.add_argument("--paged", action="store_true", help="also measure resident vs paged experts")
+    s = sub.add_parser("drift", help="measure what the ternary quantiser costs on a float checkpoint")
+    s.add_argument("checkpoint", nargs="+", help="one or more .pt state dicts")
+    s.add_argument("--groups", help="scale granularities to compare: 128,row,tensor (default 128)")
+    s.add_argument("--schemes", help="absmean,lsq (default both)")
+    s.add_argument("--pack", help="also write packs here, and check they decode back exactly")
+    s = sub.add_parser("bench-spec", help="measure speculative decode on a text file (CPU)")
+    s.add_argument("text", help="file to cut prompts from")
+    s.add_argument("--tokens", type=int, default=128, help="new tokens per prompt (default 128)")
+    s.add_argument("--prompts", type=int, default=8, help="how many prompts (default 8)")
+    s.add_argument("--prompt-len", dest="prompt_len", type=int, default=48,
+                   help="prompt length in tokens, i.e. the drafter's history (default 48)")
+    s = sub.add_parser("spec-check", help="check the CPU serving loop's two-token pass and its stop path")
+    s.add_argument("--tokens", type=int, default=8, help="greedy tokens to run (default 8)")
     s = sub.add_parser("serve", help="run the OpenAI-compatible server")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
@@ -221,8 +286,10 @@ def main(argv=None):
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
-            "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
-            "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
+            "bench-spec": cmd_bench_spec, "spec-check": cmd_spec_check, "qat-pack": cmd_qat_pack, "drift": cmd_drift,
+            "verify-tier": cmd_verify_tier, "moe-check": cmd_moe_check, "serve": cmd_serve,
+            "chat": cmd_chat, "head": cmd_head,
+            "info": cmd_info, "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":

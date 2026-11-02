@@ -144,4 +144,57 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
 | variables | `KINDI_DEVICE=cpu`, `OMP_NUM_THREADS=<cores of one socket>`, `OMP_PROC_BIND=close`, `OMP_PLACES=cores` |
 
 - The CPU engine needs gcc with OpenMP. It builds `libkcpu.so` at the first start (`KINDI_CPU_CACHE`).
+- `kindi serve` (the OpenAI-compatible server) is the only command that needs `fastapi` and `uvicorn`; chat, verify,
+  bench and convert run without them. `bash setup-server.sh` makes that venv: `~/.kindi/server-venv`, built with
+  `--system-site-packages` so it uses the numpy the system already has, with fastapi and uvicorn in it. It needs no
+  root and no `--break-system-packages`, it is safe to run again, and it prints the command to start the server.
+- `kindi bench-spec FILE` measures the speculative decode path on a real text file: draft acceptance and the
+  decode rate against plain greedy, with prefill cancelled out. `kindi bench` is the wrong command here - it needs a
+  GPU.
+- `kindi spec-check` tests the same pass where the server uses it: an accepted draft stopped on by token id and by stop
+  string, stopped one token later, every draft rejected, and one request through the server's own loop with the pass
+  off and on. Each case must end with the recurrent state and the token history where a single step would leave them.
+  It needs no pack (it builds the synthetic fixture). The serving pass is off by default: `KINDI_CPU_SPEC=1` turns it on
+  for greedy requests, and it is skipped for a request whose thinking budget can close the thinking mid-stream.
+- Finer int8 activation scaling does not rescue the int8 path. On the same 48 prompts and 7,680 decisions, per-64 and
+  per-32 groups move the logit drift by 12% and the divergence count by nothing (13, 12 and 16 of 48 prompts), because the
+  step is a group maximum and barely shrinks with the group; a calibrated per-channel scale is 6.5x worse, because one grid
+  per column cannot follow the token. `docs/CPU-PERF-2026.md` has the measurements, and `KINDI_CPU_Q8G` and
+  `KINDI_CPU_Q8C` select the schemes.
+- `kindi verify-tier` checks that the kernel tiers (scalar C, AVX2, int8 activations) compute the same thing, and
+  reports what each costs. The engine runs the same gate at load and picks the fastest tier that is bit-exact, so
+  `KINDI_CPU_TIER` is only needed to force one. On Windows the same file is built as `kcpu.dll` with MSVC (see
+  `kindi/cbuild.py`); tiers agree within a build, and greedy output agrees across gcc and MSVC builds.
+- `kindi moe-check` compares the Mixture-of-experts FFN against a NumPy implementation on a synthetic pack, and with
+  `--paged` measures resident against paged experts. A float checkpoint becomes a pack with `kindi qat-pack` and is
+  measured with `kindi drift`; see `docs/QAT-CONVERSION.md`.
 - The output is token-exact with llama.cpp.
+- Size `OMP_NUM_THREADS` to the **physical** cores, not the logical ones. A token is roughly 425 barriers, and a
+  barrier costs under a microsecond at 4 and at 8 threads on this host, but milliseconds at 16, which is the point
+  where a virtualised CPU (WSL2, a VM) can no longer co-schedule every vCPU on a physical core. More threads than
+  that is slower, not faster: 16 threads measured 0.24 tokens/s against 25 at 8.
+- The CPU profiler: `kc_get_times(double*)` and `kc_reset_times()` in `kcpu.c` report the seconds per stage
+  (0 embed, 1 norm+fold, 2 gemv, 3 gdn-other, 4 attn-other, 5 ffn-other, 6 head) since the last reset. The gemv is
+  about 90% of a token, so it is the only stage worth optimising.
+- **Throw away the first run after a rebuild.** Run-to-run spread is about 12% and the first run is roughly 30%
+  slower than the third (17.0 and 19.6 cold against 23.6, 26.2 and 29.2 warm for the same binaries). Take three or
+  more medians, and never compare a cold run to a warm figure.
+- The engine is **issue-bound, not memory-bound**. The GEMV runs at the same 18-19 GB/s whether its weights fit in
+  32 MB of cache or stream from DRAM (26 GB/s of streaming read is achievable), and per core it converts 3.2 MACs per
+  cycle. Cache and bandwidth work therefore buys nothing: the pair table's 32 KB of L1 thrash, pinned away entirely,
+  costs 0%. To go faster, remove instructions per weight word. Thread binding measured a wash here, so leave
+  `OMP_PROC_BIND=close` alone rather than tuning it. Roadmap and the twenty triaged techniques:
+  `docs/CPU-PERF-2026.md`.
+- The two-token kernel confirms the diagnosis from the other side, and says what is *not* the lever. 8 to 16
+  independent accumulator chains changes nothing at any working set, opening a second group window is neutral, and 4
+  chains instead of 8 is 5% faster at every size - so the chain-count axis is flat to negative and the kernel is not
+  ILP-bound. Its cache-resident rate is 13.8 GB/s of weight stream against 14.3 GB/s at 432 MB, so residency buys it
+  nothing either. Fewer permutes per weight word is the only lever left
+  (`docs/CPU-PERF-2026.md#the-cache-resident-shortfall-is-not-ilp-measured`).
+- `perf` is not installed on this WSL image and needs root. `~/kt/perf/gb.c` reads the PMU through
+  `perf_event_open` instead, one event set per thread, and is how to re-measure the GEMV (working-set sweep, table
+  pinning, prefetch on/off, binding).
+- A kernel change needs an interleaved A/B, not two runs: build both variants with distinct symbol suffixes, load
+  both into one process, and alternate them, reversing the order every rep. Five extra instructions per weight word
+  measured 0.55-0.63x, while pinning the whole pair table into 2 KB of L1 measured 1.09x and inside the noise. Also
+  check that `unattended-upgrades` is not running - it cost one run in this project its numbers.

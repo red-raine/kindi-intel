@@ -79,6 +79,11 @@ These variables have no config key. Use them to test or to compare.
 | `KINDI_FD` | `0` | `1` = the split flash-decode attention of the 27B on one card (with `KINDI_TC=1`) |
 | `KINDI_D1` | `0` | `1` = the one-pass RMS fold (Hadamard block 512 or 1024, with `KINDI_TC=1`) |
 | `KINDI_ATT_TC` | `0` | `1` = the attention of the prompt chunks on the tensor cores (sm_80 and later, with `KINDI_TC=1`) |
+| `KINDI_CPU_TIER` | (auto) | force one CPU kernel tier: `scalar`, `avx2` or `q8`. Without it the engine probes at load and keeps the fastest tier that is bit-exact |
+| `KINDI_CPU_Q8` | `0` | the int8 activation prototype: every CPU GEMV through the int8 form. Not a production path; [CPU-PERF-2026.md](CPU-PERF-2026.md) has the measurements |
+| `KINDI_CPU_Q8G` | `128` | the activation group width of that prototype: `128`, `64`, `32`, `16`, `8`, `4` or `2` columns per scale |
+| `KINDI_CPU_Q8C` | `0` | `1` = a static per-channel input scale instead of the group form, applied to the ordinary fp32 GEMV. Needs a calibration pass (`Engine.q8_cal_begin/end`), so it does nothing until scales are loaded |
+| `KINDI_CPU_KVQ` | `0` | the CPU K/V cache format, a storage-prototype: `0` = fp16, `1` = ternary at 2 bits with one scale per (position, head), `2` = q8_0 blocks of 32. Not a production path; [CPU-PERF-2026.md](CPU-PERF-2026.md) has the measurements |
 | `KINDI_CKPT_VRAM` | `0` | `1` = checkpoints in card memory; the copy to the host waits until the server is idle (one card) |
 | `KINDI_HOST_RAM_CHECK` | `1` | before the weights of a card load, the plan engine stops when the free host RAM is too small. `0` = no check |
 | `KINDI_BLOCKING_SYNC` | `1` | the host thread sleeps while it waits for the card, and does not use a CPU core. `0` = it waits in a loop (the driver default) |

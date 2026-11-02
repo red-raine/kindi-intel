@@ -1,0 +1,783 @@
+# CPU performance plan (AVX2, 2026)
+
+A roadmap for the CPU engine, built from the 2024-2026 literature rather than from llama.cpp-era advice, and
+triaged against what this engine actually is. Every claim is either a measurement on this host or carries a URL to
+the paper it came from.
+
+## Target and current state
+
+This host is an Intel i9-9980HK: Coffee Lake, **AVX2 + FMA3 + F16C + BMI2, no AVX-512, no VNNI, no AMX**, 8 physical
+cores, dual-channel DDR4-2667 at **~25 GB/s** measured achievable read bandwidth (42.7 GB/s peak).
+
+Bonsai-2 is already ternary: `{-1,0,+1}` at ~1.7 bits/param, 506 MB on disk. One token streams ~0.506 GB through the
+GEMV, so the machine's bandwidth ceiling is **25 / 0.506 ≈ 49 tokens/s** and we measure **23-29 tokens/s** (8 threads,
+warm). The GEMV is 88-92% of a token.
+
+That means:
+
+- The engine moves ~0.43 GB per token at 19 GB/s of GEMV throughput, so "49 tokens/s is the bandwidth ceiling" is an
+  **upper bound that the kernel never approaches for a bandwidth reason**. See below: bandwidth is not the mechanism.
+- The kernel is **not memory-bound at all**. It is issue-bound at IPC 1.6-1.8. Byte-reduction is therefore not a
+  speed lever, and every cache and prefetch item in the triage is closed.
+
+## What the hardware counters say (measured Nov 2026)
+
+There is no `perf` in this WSL image and installing one needs root, so `~/kt/perf/gb.c` opens the PMU directly with
+`perf_event_open` - one event set per OpenMP thread, summed across the team. It `#include`s `kindi/kcpu.c`, so the
+kernel under test is byte-identical to the shipped one, and drives `rows8` exactly as `gemv` does (pair tables,
+barrier, row-block split, barrier). `perf_event_paranoid` is 2, which permits self-measurement of cycles,
+instructions, L1D and dTLB; the generic `LL` event is refused on this kernel.
+
+Faithfulness check: one 1.536 GMAC pass takes 85 ms on one thread and 21-23 ms on eight, which is the rate the real
+engine implies for one token's GEMV (~39 ms for 2.1 GMAC), so the counters describe the production kernel.
+
+| working set | GB/s | IPC |
+|---|---:|---:|
+| 8 MB (L3-resident) | 18.2 | 1.71 |
+| 16 MB | 18.8 | 1.69 |
+| 49 MB | 18.2 | 1.57 |
+| 123 MB | 17.6 | 1.57 |
+| 384 MB (DRAM-resident) | 19.0 | 1.76 |
+
+**Throughput does not depend on the working set.** A set that fits in L3 runs at the same 18 GB/s as one 48x larger
+and served from DRAM. A pure streaming read of the same 432 MB reaches **26.0 GB/s** on this host, so the GEMV sits
+at 73% of what the memory system can deliver - and because making the data cache-resident changes nothing, that 73%
+is not a memory limit. It is the rate at which the instruction stream can be issued.
+
+**Confirmed on the real pack, not only a synthetic buffer.** `~/kt/perf/real.py` loads `~/.kindi/packs/bonsai-2b`
+through the shipped `Engine`, so the pair-code repack is the production one, collects all 151 distinct matrices and
+hands their real pointers to the same harness: 470 MB of pair codes + 59 MB of fp32 scales = **529 MB and 1.88 G
+parameters per token**. A 13 MB subset runs at 18.6 GB/s and the full 529 MB at 18.3, IPC 1.56-1.72, 0.17-0.19
+vpermps per cycle - the same numbers as the synthetic run to within noise.
+
+In its real context the GEMV is slower. `kc_get_times` puts it at **34.47 ms of a 40.1 ms token (85.9%)**, which is
+15.3 GB/s, against 28.9 ms for the same 151 matrices run back to back. About **19% of the GEMV is lost to running it
+interleaved** with the fold, GDN and attention stages instead of as one unbroken stream. Still far under the 26 GB/s
+ceiling, so the verdict stands; but the isolated harness is an upper bound, and part of that 19% is the per-call
+boundary that batching would remove too.
+
+One attribution bug, found while reconciling the two: `TS(cat)` closes the *current* interval into `kc_times[t_cur]`
+and only then switches to `cat`, so `gemv()`'s `TS(prev)` at its end puts its own duration in category 2. The head's
+full-vocab GEMV - a tied 248320 x 2048 tensor, 127 MB of the 529 - therefore lands in stage 2, not stage 6. Stage 6's
+0.38 ms is just the argmax scan. Read the timers with that in mind.
+
+**Per core the kernel converts 3.2 MACs per cycle** (1.536 GMAC, 22.7 ms, 8 cores, 2.6 GHz effective). A dense fp32
+FMA loop sustains 16 on this core, and AVX-VNNI would do 64. That gap is the whole opportunity.
+
+Where the cycles are *not* going, each measured rather than assumed:
+
+| suspect | measurement | verdict |
+|---|---|---|
+| memory bandwidth | 8 MB and 384 MB working sets run at the same GB/s | **not the limit** |
+| pair-table L1 thrash | pinning the table to one 2 KB group: L1D misses 25.7 M -> 7.1 M (72% fewer), **0% faster** | **not the limit**; L2 absorbs it |
+| L1D misses generally | 26 M per pass at 8 threads, 17% of 152 M loads | not the limit |
+| port 5 (`vpermps`) | 0.20 per cycle against a cap of 1.0 | 20% utilised |
+| dTLB / page walks | 106 k per pass = 1.13 per 4 KB page, i.e. one per page - already optimal for 4 KB | ~1% |
+| 4-ahead prefetch | removing it: 21.9 against 21.5 ms median, ranges overlap | inside the noise |
+| thread binding | 9 interleaved reps x 9 configs: every median between 21.1 and 24.2 ms | inside the noise |
+
+One thread reaches IPC 2.84, so IPC 1.6-1.8 at eight threads is not an architectural ceiling either - it is simply
+what this loop achieves when eight cores run it.
+
+**Implication: the only lever left is fewer instructions per weight word.** 16 MACs cost about 8.6 instructions: three
+decode the weight word (`vpbroadcastd`, `vpsrlvd`, `vpand`) and five serve one lookup. A second token batch shares
+that decode exactly as the two-row-block unroll already shares it between row blocks, which drops the estimate from
+0.54 to about 0.41 instructions per MAC - a predicted **~1.3x** on the GEMV, testable with the same harness. That
+reopens plan item #4, for a different reason than the plan gave: not bandwidth, but issue slots.
+
+The three binding and prefetch conclusions above were each *single-run* wins of 1.3-1.4x before interleaving, and
+none survived it. That is the strongest argument yet for the interleaved protocol; on this host a cold or contended
+run can invent a 40% speedup out of nothing.
+
+## Measurement protocol (read this before trusting a number)
+
+Run-to-run spread on this host is **about ±12% when the host is quiet, and far worse when it is not**: the same
+binary measured 26.1 tokens/s in one session and 19.7 in the next, and one interleaved run spanned 14.5 to 27.0. The
+first run after a rebuild is also **~30% slower than the third**: a cold build measured 17.0 and 19.6 tokens/s, the
+same binaries 23.6, 26.2 and 29.2 warm.
+
+So: **discard the first run, take three or more, compare medians, and never compare a cold run against warm
+figures.** Better still, interleave: build both variants into separate shared objects and alternate them inside one
+process, so drift in clock, cache and host load lands on both sides. A single cold sample had suggested that mirror
+consolidation was a 23% regression; the interleaved A/B puts it at 0.55x, so single-sample numbers here understate
+effects as often as they invent them. Also check that `unattended-upgrades` is not running: it produced one
+of the contaminated runs quoted above, with no other sign that the machine was busy.
+
+## The twenty techniques, triaged
+
+`AVX2` column = does it work on plain AVX2/FMA with no AVX-512 or VNNI.
+
+| # | Technique | AVX2 | Verdict for this engine |
+|---|---|---|---|
+| 1 | int16 LUT + pack/unpack (`TL1_1`/`TL2_1`) | yes | **Rejected, measured.** The element-wise form the pack allows (81 entries, `vpgatherdd`) is **3.4-4.0x slower** than the pair table; the gather is the cost. See "The element-wise LUT" below. |
+| 2 | Element-wise `3^g` index (T-MAC) | partial | **Blocked, and moot.** `3^5 = 243` needs an 8-bit index, and the 81-entry form of the same idea already loses 3.4-4.0x to the pair table on a *smaller* table. No pack change can rescue it. |
+| 3 | Vector LUT, 1 lookup → N tokens | yes | **Enables #2, #4, #5.** Pays only when N > 1, which we do not have yet. |
+| 4 | Batched GEMV, N tokens per weight pass | yes | **Measured: 1.35x at N=2, bit-exact, and now wired into decode** via n-gram speculative verification. 8.92 -> 5.92 instructions per lookup, IPC 1.64 -> 1.49. Not a bandwidth win at all - it is an instruction win, which is why it works. End to end +1.18x at 0.86 draft acceptance, 1.48x ceiling. See below. |
+| 5 | n-gram / prompt-lookup speculation | yes | **Top priority, with #4.** Draftless; no second model. |
+| 6 | Cache-aware LUT tiling | yes | 2-row-block sharing is done and is worth saving instructions, not bytes. Column tiling is **de-prioritised**: making the table L1-resident is worth 0-4%, which will not pay for a pack-format change. |
+| 7 | Mirror consolidation (`T[7-c] = -T[c]`) | yes | **Rejected, measured.** 0.63x and 0.55x, 0/9 wins in each warm interleaved run. The 16 KB table halves the table traffic and still loses, because the mirror index and the sign flip cost about five extra uops per weight word. See below. |
+| 8 | Zero-density encoding (BITCOS, `2-z` bpw) | no | **Rejected.** Needs AVX-VNNI-INT8 (Alder Lake+). The paper measures Bonsai 1.7B at 39.9% zeros → **1.00×** vs five-trit, and warns that an 8-core bandwidth-rich client sees no gain. |
+| 9 | Repack 1.7 bpw → byte-aligned 2.0 bpw | yes | **Low value.** The general case pays for per-weight bit unpacking; we unpack once per *word* (one `vpsrlvd` per 8 rows). |
+| 10 | Prefetch distance tuning | yes | **Closed.** 4 ahead against none is a wash in interleaved medians (21.5 vs 21.9 ms). The earlier 2/8/4 comparison was single-shot and its 28.6-vs-19.7 spread does not survive; do not re-tune this. |
+| 11 | 2 MB huge pages on the weight mapping | yes | **Measured, ~1%.** 106 k dTLB walks per pass is 1.13 per 4 KB page - already one per page, the best 4 KB pages can do - against 473 M cycles. `HugePages_Total` is 0 on this image, so it would need THP. Not worth the change. |
+| 12 | Non-temporal loads for the weight stream | yes | Low value. The stream is already read-once; no published win. |
+| 13 | OpenMP decomposition, physical-core thread count | yes | **Done.** 8 threads, documented in `CARDS.md`. |
+| 14 | `-march=coffee-lake -mtune=coffee-lake -flto` | — | Check the current flags; cheap. `-march=native` already resolves to exactly this. |
+| 15 | Trim the 8-12% non-GEMV | yes | Minor, but it is where the free percentage is on a 2B model. |
+| 16 | AVX-512 / VNNI / AMX kernels | **no** | Not available on this CPU. Do not port them. |
+| 17 | `I2_S` integer dot (`maddubs`/`madd`) | yes | **Rejected on exactness.** Lossless only for models trained with BitNet's per-tensor int8 activations; Bonsai is PTQ'd, so this would not be token-exact. |
+| 18 | int16 LUT to keep exactness | yes | A constraint on any of the above, not an optimisation: int8 table quantisation is lossy. |
+| 19 | MoE expert paging / hot-expert caching | yes | **Implemented, rejected on cost.** The fetch hook and the per-layer cache are in and bit-identical to residency, but staging one expert through the NumPy pair-code conversion costs 7 ms, so a cache of 6/12 experts reads 140 ms/token against 1.5. Needs pair codes in the pack before it can pay. |
+| 20 | Ternary MoE (MoTE and follow-ups) | no (GPU kernels) | Design input, not a kernel: **keep a dense shared expert and ternarise only the routed ones.** |
+
+Bonus — **KV cache quantisation**: at ctx 1024 our KV is ~12 MB against 506 MB of weights, and attention is ~2% of a
+token. Measured elsewhere, q8 KV is +0.7% decode at 6K but **−36.8% at 110K** from dequantisation. Irrelevant at our
+contexts and actively harmful at long ones. Keep f16.
+
+## Priority order
+
+1. **Batched GEMV (N tokens per weight pass) + n-gram speculation (#4, #5).** This is the only lever with a
+   published order-of-magnitude win (Vec-LUT reports 4.2× prefill and 3.2× parallel decode) and it is the one the
+   measurements here point at. Speculative decoding already exists in `spec.py` but **only for the CUDA tensor-core
+   plan engine** (`KINDI_TC=1`); the CPU engine has none.
+2. ~~Fair warm A/B of mirror consolidation (#7)~~ — **done and rejected** at 0.55x. It is the most useful negative
+   result so far: the kernel is issue-limited, not table-limited, which rules out the whole family of
+   fewer-bytes-more-ops trades that #9 and #12 belong to.
+3. **Stop guessing about the stall.** `perf stat` the GEMV for `LLC-load-misses`, `dTLB-load-misses` and IPC before
+   the next kernel rewrite. We know we are at ~50% of bandwidth; we do not know whether that is L1 latency, TLB, or
+   port-5 `vpermps` pressure, and the three want different fixes.
+4. ~~Vector LUT (#3)~~ - **closed by measurement**: the element-wise table it exists to unlock is 3.4-4.0x slower than
+   the pair table even in its cheapest form (81 entries, one gather per 8 rows x 4 columns), so the N-token page it
+   would make possible starts from too far behind.
+
+Done since this list was written: the kernel tiers (scalar / AVX2 / int8) with an exactness gate and a native Windows
+build, the MoE FFN with a NumPy-validated reference, and expert paging - the last two measured above, the paging
+rejected on transfer cost.
+
+## A structural limit worth recording
+
+With `vpermps` (8-lane) and 4-bit pair codes, **one lookup covers 8 rows × 2 columns = 16 weights, and that is the
+ceiling for a single token.** Encoding 4 trits per field would need 7 bits × 8 rows = 56 bits, more than the 32-bit
+word, so fewer rows per lookup — no net gain. Widening the index beyond 8 entries is the only way past 16 weights per
+lookup, and it requires the vector-LUT form, which requires N > 1 to pay. So **further N=1 kernel polish has a low
+ceiling**; the multi-token path is where the remaining 2× lives.
+
+## What the mirror A/B says about the table
+
+Mirror consolidation was the cheap way to ask whether the 32 KB pair table costs anything. It halves the table and
+loses 40-45% of the throughput, so the answer is not "the table is too big". More evidence, from a deliberately wrong
+build that pins the table pointer to one 2 KB group (so every thread reads the same hot table all token long): median
+1.09x against the real kernel, with a spread from 0.60 to 1.16. That is inside this host's noise, so at most the
+whole table footprint is worth about 9%, and possibly nothing.
+
+Both results point the same way: **the GEMV is limited by instructions and stalls, not by the bytes the table moves.**
+Adding roughly five uops per weight word costs 40%, and removing three quarters of the table's footprint buys 0-9%.
+Any future trade of "fewer bytes for more instructions" (#9 bit-packing, #12 non-temporal loads) starts out losing.
+
+## Batched GEMV: measured 1.35x at N=2
+
+`rows8_b2` in `~/kt/perf/gbb.c` runs two activations through one pass over the weights. Per weight word the decode
+(`vpbroadcastd`, `vpsrlvd`, `vpand`) and the zero test (`vpcmpeqd`) depend only on the codes, so both are computed once
+and reused by both tokens; each token keeps its own accumulator chain and its own add order over g and p. It is
+**bit-exact** against two separate `rows8` passes - 0 mismatched floats over the whole model - and both pair tables are
+rebuilt per call, as production would.
+
+Interleaved A/B, 7 reps, 8 threads, all 151 real matrices of the Bonsai-2 pack:
+
+| | ms / 2 tokens | ms / token | instructions per vpermps | IPC |
+|---|---:|---:|---:|---:|
+| two `rows8` passes (today) | 58.7 | 29.4 | 8.92 | 1.64 |
+| one `rows8_b2` pass | 43.6 | **21.8** | **5.92** | 1.49 |
+
+**1.35x per token against a 1.37x prediction**, driven by 8.92 -> 5.92 instructions per lookup. IPC *falls*
+(1.64 -> 1.49), so the whole win is the instruction count - which is exactly what the issue-bound diagnosis predicts.
+
+It also goes a long way to settling the bandwidth question. Mode 1 reads each weight byte once for two tokens, so
+**265 MB per token instead of 529**, and is 1.35x faster. A bandwidth-bound kernel would have gained much more from
+halving the traffic and nothing at all from anything else. At 12.1 GB/s of real DRAM it is further from the 26 GB/s
+ceiling than the unbatched kernel is. What that run could not show is whether the 1.35x **floor** survives when there is
+no DRAM traffic at all, so it was re-run that way.
+
+### Re-run with a cache-resident working set: the floor is instructions, not bandwidth
+
+`gab2.c` takes the same two arms - two `rows8` passes against one `rows8_b2` pass - and makes the working set an
+argument, from 0.59 MB (L2) to 432 MB (DRAM). Both kernels and the `Mat` layout come straight from `kindi/kcpu.c` by
+inclusion, the batched arm is checked bit-identical to the two passes before anything is timed
+(`max|sep-b2| = 0.000e+00`), and the arm order is reversed on alternate reps.
+
+| working set | sep (2 passes) | b2 (1 pass) | ratio | instruction ratio |
+|---|---:|---:|---:|---:|
+| 2.36 MB (L2/L3) | 0.225 ms | 0.167 ms | **1.345x** | 1.436x |
+| 9.44 MB (L3; the L3 is 16 MB) | 0.853 ms | 0.634 ms | **1.346x** | 1.522x |
+| 432 MB (DRAM) | 39.18 ms | 26.75 ms | 1.465x | 1.521x |
+
+A repeat of the same three sizes gave 1.333x, 1.401x and 1.493x, the same ordering, so read the absolute ratios as
++-0.05 and the ordering between cache and DRAM as the finding.
+
+A 180x reduction in working set does not move the floor: **1.345x cache-resident against 1.351x on the whole 529 MB
+model.** A bandwidth explanation would have to change between those two regimes, and the value a true bandwidth limit
+would produce is the 2.000x that two passes over the same bytes cost - nothing measured here is near it. The
+instruction ratio is 1.44-1.52 in every configuration, and achieved bandwidth was 18.7-19.7 GB/s at these three sizes
+against a 26 GB/s ceiling, so none of them came close to saturating memory. (The 0.59 MB row of the full sweep reads
+15.8 GB/s, but a pass there is 66 us and the OpenMP region cost is part of it - that row is not a bandwidth
+statement.)
+
+Memory is not irrelevant, and the DRAM row shows where it matters: 1.465x against 1.346x cache-resident, so halving
+the byte traffic is worth about 9 points of ratio once the stream is real. That is a contributor, not the floor. The
+cache-resident rows sit *below* their own instruction ratio (1.345 against 1.436-1.522), which says that with data
+supply removed something else limits the batched kernel. The first reading of this was ILP - two accumulator chains and
+two table streams per weight word - so it was tested by varying the chain count on the same sweep; the answer is below,
+and it is not ILP.
+
+**Now wired up, and measured end to end.** Items #4 and #5 turned out to be one change: the kernel needs two tokens,
+and only speculative verification produces them. That is implemented - `kc_step2` in `kindi/kcpu.c` runs two tokens
+through the whole forward pass on one weight stream, and `kindi.cpu.generate_spec` drives it from an n-gram
+drafter. The details and the tables are in [BENCHMARKS.md](BENCHMARKS.md#two-token-speculative-decode-on-the-cpu-i9-9980hk-8-threads);
+the short version:
+
+- **Bit-exact.** The pass matches two sequential `kc_step` calls to `0.000e+00` on the logits and leaves `M`, conv, K
+  and V `array_equal`. Greedy output is identical token for token.
+- **A two-token pass costs 1.351x one token**, so the ceiling is 1.48x at perfect draft acceptance, and break-even is
+  an acceptance rate of 0.35. Measured +1.18x at 0.86 acceptance and +1.53x at 1.00.
+- The ceiling is 1.48x and not 2x because only the products batch. The RMS folds, the GDN recurrence, the attention
+  bodies and the embedding still run per token, and they double.
+- **In the serving loop, off by default.** `Runner.spec_begin/spec_next/spec_stop` put the pass in `server.py`'s token
+  loop for greedy requests; a request that stops on the token of an accepted pass rolls back with `kc_state_load`, so
+  the recurrent state and `Runner.tokens` end at what one `step` leaves. `KINDI_CPU_SPEC=1` enables it, and
+  `kindi spec-check` is the test (accepted draft stopped on by token id and by stop string, stopped one token later,
+  all drafts rejected, and the server's own loop with the pass off and on). It is not the default yet because the
+  economics were measured here rather than on the serving host, and because a thinking budget closes the thinking
+  mid-stream with tokens the loop feeds one at a time - those requests do not speculate.
+
+The earlier reading of this - that batched verification is impossible because 18 of 24 layers are recurrent - was
+wrong, and the mistake is worth recording. The recurrence constrains the *state*, not the *products*: a layer can take
+both tokens through its GEMV at once and then step `M` and `conv` in token order, which is exactly how `spec.py`
+already does it on the GPU ("the GDN steps in token order inside one launch"). What the recurrence does rule out is a
+long verify batch with no per-token state work, not batching itself.
+
+### The cache-resident shortfall is not ILP: measured
+
+`~/kt/perf/gab2_ilp.c` keeps `gab2.c`'s harness, sizes and bit-exactness check and adds arms that differ only in how many
+independent accumulator chains the same per-word instruction mix is spread over. Every arm is verified against two
+`rows8` passes (`max|sep-arm| = 0.0e+00`) before anything is timed; the 4-chain arm is a timing probe only, because
+collapsing the even/odd halves changes the summation order.
+
+| arm | chains | instructions per pass (2.36 MB) | 2.36 MB (L2) | 9.44 MB (L3) | 37.7 MB | 432 MB (DRAM) |
+|---|---:|---:|---:|---:|---:|---:|
+| two `rows8` passes | - | 1.14 M | 0.192 ms | 0.774 ms | 3.355 ms | 38.30 ms |
+| `rows8_b2` (production) | 8 | 0.76 M | 0.152 ms | 0.605 ms | 2.556 ms | 26.93 ms |
+| 4 row blocks in flight | 16 | 0.86 M | 0.152 ms | 0.607 ms | 2.462 ms | 25.80 ms |
+| two group windows | 8 | 0.76 M | 0.152 ms | 0.591 ms | 2.522 ms | 27.25 ms |
+| one accumulator per row (probe) | 4 | 0.80 M | **0.144 ms** | **0.576 ms** | 2.391 ms | 25.69 ms |
+
+**Adding chains changes nothing, and removing them does not hurt: the axis is flat to slightly negative.** 8 to 16
+chains is 0.0% and +0.3% at the two cache-resident sizes and 4% faster at the two larger ones, on an arm that also halves
+the table loads per word and retires 13% more instructions - sign and size both inside the run-to-run spread, so there is
+no effect to report. Opening a second group window is -2% to +1%. The 4-chain probe keeps the production loop and instruction mix
+(single accumulator per token and row block instead of an even/odd pair) and is **5% faster at every size**: 0.144 against
+0.152 ms cache-resident, 25.69 against 26.93 ms at DRAM. If the kernel were waiting on chain latency, that arm would be
+the slow one. It is not, so the cache-resident shortfall against the instruction ratio is not ILP and not the load count
+- what is left per weight word is the work itself, two `vpermps` per word, one per token per row block, on the one port
+that issues them.
+
+The 4-chain form is not adopted: it sums the column pairs in a different order, so it would no longer be bit-identical to
+two single-token passes, and that exactness is what makes `kc_step2` safe to drop into a token loop. Five percent does not
+buy that. The measurement is what matters here: the production kernel is at the top of its chain-count curve, not below
+it, so no amount of extra parallelism is available to recover.
+
+Residency buys the two-token kernel very little either: 13.8 GB/s of weight stream at 2.36 MB and 9.44 MB, 13.1 at
+37.7 MB, 14.3 at 432 MB. The cache-resident case is not faster per byte than the DRAM one, and both are around half of
+the 26 GB/s this host can stream, so no row here is waiting on data supply.
+
+(`./gab2_ilp <threads> <iters> <row blocks> <reps>`, 15 reps each here: `8 80 512 15`, `8 30 2048 15`, `8 12 8192 15`,
+`8 5 93750 15`, after a first pass at 9 reps gave the same ordering. This session's sep/b2 ratios are 1.28x, 1.29x,
+1.32x and 1.43x, against 1.345x / 1.346x / 1.465x earlier - the absolute times move with the host, the ordering does
+not.)
+
+## Column tiling is blocked on the pack layout
+
+Column-outer tiling would make the table L1-resident, but each thread would then read 256 B every 4 KB of the weight
+matrix. That destroys DRAM row-buffer locality, so it likely loses more than it gains. The hot-table measurement
+above weakens the case further: making the table resident at all is worth single-digit percent, which will not pay
+for a pack-format change.
+
+The fix is the one T-MAC uses: permute the weights so the **column group is the outer dimension**,
+`[group][row block][64 words]`, which makes column-outer access sequential again. That is a pack-format change —
+`kindi/pack` in Python, the layout notes in `docs/HOW-IT-WORKS.md`, and the kernel together — not a kernel tweak.
+Worth doing only alongside #4.
+
+## MoE and Qwen support: scoping
+
+Neither exists in the CPU engine today, and the economics decide whether they are worth building.
+
+- **Qwen support** needs, beyond what the 2B path has: GQA with `NHKV < NH` (the attention math already carries
+  `NHKV`, so this is mostly plumbing), and the usual RoPE/SwiGLU that Bonsai's hybrid GDN layers already prove out.
+- **MoE support** needs three things: a router matmul + softmax + top-k, an expert-indexed weight table, and a gather
+  of the selected experts' rows per token.
+
+The uncomfortable arithmetic, which is why MoE is *not* first on the list:
+
+| model | active params | bytes/token at 1.7 bpw | vs Bonsai-2 (0.43 GB) |
+|---|---|---:|---|
+| Bonsai-2 dense | 2B | 0.43 GB | — |
+| Qwen3-30B-A3B | ~3B | ~0.64 GB | **1.5× worse** |
+| a 20B-A1B style MoE | ~1B | ~0.21 GB | ~2× better, but ~4.3 GB resident |
+
+So "add MoE" is only a speed feature for a **low-active-parameter** MoE whose resident set still fits. And for a
+ternary engine specifically, MoTE's lesson applies: ternarise the routed experts, keep the shared expert dense, or
+pre-trained knowledge is destroyed.
+
+Truly reported CPU-only MoE decode numbers were not found — the published systems (Apex, KTransformers) are GPU+CPU
+hybrids that treat the CPU as the slow path. Treat a CPU-only MoE throughput claim as unverified until measured here.
+
+### What landed, and what it costs
+
+The MoE FFN is in `kcpu.c` and in the engine: a router GEMV, a softmax over the experts, the `nact` highest with their
+weights renormalised, and 3 matrices per expert (gate, up, down) in the same ternary form as a dense FFN. Two details
+the pack forced:
+
+- **Every Mat is padded to a multiple of 8 rows**, so the router's output buffer has to hold the padded count, not the
+  expert count. This was a heap overflow until `kc_moe_check`'s fixture found it (ASan, 4 experts against an 8-row
+  buffer).
+- **The expert's own width is not `NFF`.** `moe_expert` takes the width from the matrix (`experts[3e].R`) and folds
+  with the expert-width sign vector (`L->moe.sF`), so an expert can be narrower than the dense FFN, as real MoE models
+  have it.
+
+Correctness is checked against a NumPy implementation of the same block (`kindi moe-check`), on the synthetic fixture,
+router and expert arithmetic both: **1.9e-7 to 5.6e-7 relative** output difference over 3 layers x 2 trials with 4
+experts and 2 active, and 2.4e-7 to 4.4e-7 with 8 experts and 3 active. The same test caught the second bug: the
+first expert's fold overwrote the block input, so the second expert was reading the first expert's intermediate. Each
+expert now starts from a fresh fold of `xn` - one FWHT per expert, which is nothing against that expert's products.
+
+One limitation is structural rather than a bug: **a MoE layer gives up the two-token pass.** The two tokens can route
+to different experts, so `kc_step2` runs each token's experts in turn. `verify-tier` shows the two-token path still
+matches two single steps, i.e. it is correct and not faster on those layers.
+
+### Paged experts: correct, and too expensive to keep
+
+An expert is a `Mat` like any other, so paging it needs no kernel change: the layer's expert table can point into a
+staging buffer, and a fetch hook refills that buffer before the expert's products run (`moe_fetch`, wired from
+`Engine.enable_paging`). The pool is a per-layer cache of `k` experts in pair-code form, loaded on demand from the
+pack's own bytes.
+
+On a fixture of 6 layers, width 1024, 12 experts of width 512 (2 active), 6 tokens after a 2-token warm-up, 8 threads:
+
+| experts resident | ms/token | expert code memory |
+|---|---:|---:|
+| all 12 | **1.5** | 27 MB |
+| cache 6 | 140.2 | 14 MB |
+| cache 4 | 174.9 | 9 MB |
+| cache 2 | 742.1 | 4 MB |
+
+Every cache size produces the resident engine's tokens exactly, so the mechanism is right. What it is not is fast: **one
+expert's three matrices take 7 ms to stage through the NumPy pair-code conversion**, and a token that misses two
+experts in six layers pays for twelve of them. The conversion, not the policy, is the cost - which is the real lesson:
+**a paged expert needs its pair codes on disk, or a C-side converter**, and neither is worth building until a model
+exists whose resident set does not fit. The docs' earlier arithmetic already said that: a 20B-A1B MoE is ~0.21 GB per
+token but ~4.3 GB resident, and Bonsai-2 is 0.43 GB in total.
+
+## The element-wise LUT: measured 3.4-4.0x slower than the pair table
+
+The triage above says two things at once: the pair table is issue-bound but cheap (one `vpermps` per 8 rows x 2
+columns), and the element-wise family (#1 int16 LUT, #2 `3^g` index) is blocked because `vpermps` selects 8 lanes.
+What was never measured is whether an element-wise table that *can* work on AVX2 - a gather from an 81-entry table,
+one lookup per 8 rows x 4 columns - actually beats the pair table. It does not.
+
+`~/kt/perf/lut81.c` runs both arms over identical weights: the pack's 4-trit encoding, the same 128-wide groups, the
+same per-row scales, `rows8` verbatim for the pair arm, and for the element-wise arm a table rebuilt from the pair
+table (index `cA + 9*cB` for a slot's two words) and one `vpgatherdd` per 8 rows per 4 columns. 2048 x 1920 ternary
+weights, both arms agreeing with a scalar reference to 1.5e-7 (the LUT arm sums its slots in slot order, so it is equal
+to rounding, not bit-equal).
+
+| arm | ms | GB/s | table per call |
+|---|---:|---:|---:|
+| pair (`rows8`, `vpermps`) | **0.18** | 10.9-11.2 | 7,680 floats (30 KB) |
+| element-wise 81-entry (`vpgatherdd`) | 0.59-0.72 | 2.7-3.3 | 38,880 floats (155 KB) |
+
+**3.4x to 4.0x slower**, single-threaded and 8-threaded alike, with both arms' table builds inside their timing. The
+reason is the gather: on Coffee Lake a 8-element `vpgatherdd` is a multi-uop instruction with a latency measured in
+cycles per element, against a `vpermps` that is one. The extra table footprint (155 KB against 30 KB, so L2 rather than
+L1) and 5x the build work compound it.
+
+That settles the family, and settles `3^5` without building it: a 243-entry table needs a different pack (5 trits per
+byte, the GGUF's 26-byte block layout) *and* more table per column, so it would be strictly worse than the 81-entry
+form measured here. The 4-trit pack's 81 entries are the most favourable case the gather could have had.
+
+## Kernel tiers, and the native Windows build
+
+`kcpu.c` now carries three GEMV implementations and a gate that picks the fastest one which reproduces the others:
+
+- **tier 0, scalar C** - no intrinsics at all, written to the same operation order as the vector kernel (same table
+  entries, the same even/odd partial sums, and `fmaf` because the vector path uses `vfmadd`). That is what makes an
+  exact comparison meaningful instead of approximate, and it is the fallback for a build without AVX2.
+- **tier 1, AVX2** - the production pair-table kernel.
+- **tier 2, int8 activations** - the prototype, expected to differ.
+
+`Engine._pick_tier` runs a one-token probe at load and refuses a tier that moves the logits; `KINDI_CPU_TIER`
+(`auto`/`scalar`/`avx2`/`q8`) overrides it. `kindi verify-tier` is the full statement of the claim - 3 prompts, 24
+tokens, greedy tokens, recurrent state and the two-token pass:
+
+| tier | prompts identical to scalar | two-token vs two steps | ms/token (fixture) |
+|---|---:|---|---:|
+| scalar | 3/3 | tokens, state and logits equal | 0.757 |
+| avx2 | 3/3 | tokens, state and logits equal | **0.234** |
+| q8 | 1/3 | state and logits differ | 0.240 |
+
+The scalar tier is bit-exact with AVX2 on the first try, including the two-token pass, which is the useful part: a
+fallback that agrees bit for bit is a reference implementation, and the int8 tier is now rejected by measurement
+rather than by argument.
+
+**The Windows build.** `kindi/cbuild.py` builds `kcpu.dll` with MSVC (`/O2 /arch:AVX2 /openmp /LD`) out of a Visual
+Studio install, and `kindi.cpu` loads it exactly as it loads `libkcpu.so`. Three things had to change for the compiler:
+OpenMP loop variables declared outside the `for` (MSVC's classic `/openmp` is C89-style), `__declspec(dllexport)` on
+the entry points, and the integer fp16 conversion instead of `_cvtsh_ss`, which MSVC does not link. The same fixture on
+the same host through both builds:
+
+| build | scalar | avx2 | q8 | tiers agree |
+|---|---:|---:|---:|---:|
+| gcc (WSL) | 0.757 | 0.234 | 0.240 ms/token | yes |
+| MSVC (Windows) | 1.080 | 0.449 | 0.777 ms/token | yes |
+
+Within each build the tiers are bit-exact. **Across the two builds they are not**: the same 12 greedy tokens, the same
+argmax, but 0 of 128 logits bit-identical, worst relative difference 7.9e-5. That is the C runtime, not the kernel -
+different `expf`/`log1pf` in glibc and the MSVC CRT, plus the fp16 conversion - and it is worth recording as the honest
+version of "bit-exact": exact within one build, token-exact across builds. The MSVC numbers are also slower, on a
+tiny fixture where fixed costs dominate (16 threads on 3 layers).
+
+## An AVX-VNNI / int8 dispatch path: scoping
+
+Not buildable end to end on this host - Coffee Lake has no VNNI - so `vpdpbusd` itself still cannot run. But the half of
+the design that the kill criterion actually rests on is **plain AVX2**: the 2-bit to int8 expansion is mask, shift and
+`vpshufb`, and it can be counted here with the same hardware counters used everywhere else in this document. It has now
+been counted; the result is below.
+
+Three facts shape the plan, checked against the code and the ISA:
+
+- `paircodes()` in `kindi/cpu.py` builds the kernel layout **at load time**, and `convert.py` has never known about it.
+  A second layout is therefore a new Python repack plus an ISA check, **not** a `pack_format` change; the shipped pack
+  stays as it is.
+- There is no dispatch today: one AVX2 path, no `__builtin_cpu_supports`, no multiversioning.
+- The kernel is deliberately exact - "Every pair sum is formed once in fp32; no activation quantisation". VNNI needs
+  int8 activations, so the token-exactness guarantee (40/40 against llama.cpp) is what is actually at risk.
+
+Byte arithmetic rules out the obvious form. int8 weights are one byte, 4x the 2-bit pack: 529 MB becomes 2.1 GB, or
+81 ms of DRAM at 26 GB/s against today's 40 ms token. **Weights must stay at 2 bits on disk and be expanded to int8 in
+registers.** That expansion is the entire question.
+
+One trick makes the cheap ISA sufficient: `vpdpbusd` is u8 x s8, and the signed x signed `vpdpbssd` of AVX-VNNI-INT8
+only arrived with Sierra Forest, not Alder Lake. But store weights as `w+1` in {0,1,2} and
+`sum (w+1)x = sum wx + sum x`, so the correction is one scalar per token subtracted from every output. Plain AVX-VNNI
+is then enough.
+
+| step | work | risk |
+|---|---|---|
+| ISA detect + dispatch (`__builtin_cpu_supports("avxvnni")`, `KINDI_CPU_ISA` override) | ~0.5 day | none |
+| second load-time repack, with a Python reference to diff against | 1-2 days | none |
+| `rows_vnni`: expand 2-bit to `{0,1,2}` via `vpshufb`, `vpdpbusd`, int32 accumulate, requantise | 3-5 days | instruction cost now measured (3.31); port 5 on real silicon is the remainder |
+| int8 activation quantisation per 128-block on top of the fold | 2-3 days | changes numerics |
+| token-exactness against llama.cpp | **measured: PASSES 40/40, and 640/640 over 160 tokens** | no longer a risk; see below |
+
+## The kill criterion, measured
+
+`rows_vnni` was built as far as this host can run it: the real expansion, with the int8 dot stood in by
+`vpmaddubsw` + `vpmaddwd` + `vpaddd` (three instructions where VNNI needs one). Subtracting that difference gives the
+VNNI projection. Harness: `~/kt/perf/gbx.c`, 21 interleaved reps, medians, net of a loads-and-loop baseline.
+
+Two checks run before any timing, and both pass:
+
+- **Layout.** 128 weights per 32-byte input, every one exact against a scalar reference.
+- **The `w+1` identity.** `sum (w+1)x - sum x` reproduces the signed product exactly, so plain AVX-VNNI really is enough.
+
+The pack's atom matters here and it works in the design's favour. `paircodes()` stores one **4-bit code per unit-sum
+pair** - "0..7 = which of the 8 nonzero (w0, w1) pairs, 8 = both zero; 2 bits per weight" ([kcpu.c:73](kindi/kcpu.c#L73))
+- so a nibble already carries two 2-bit weights and a 16-entry `vpshufb` table resolves both halves without any separate
+unpacking step. Two tables (first weight, second weight) per nibble position, no extra instruction.
+
+| per 128 weights | instructions | note |
+|---|---:|---|
+| loads + loop (baseline) | 2.25 | subtracted from everything below |
+| expansion, net | 10.25 | 8 expected: 1 load, 2 `vpand`, 1 `vpsrlw`, 4 `vpshufb` |
+| expansion + AVX2 dot, net | 21.25 | 19 expected; the 2.25 excess is compiler overhead |
+
+| per 32 MACs | value |
+|---|---:|
+| **VNNI projection** | **3.31** |
+| theoretical floor (if the compiler emitted exactly 19) | 2.75 |
+| `rows8` today (8.92 per `vpermps`, 16 MACs each) | 17.84 |
+| ratio | **5.39x fewer instructions** |
+
+**Kill criterion `<= 4 instructions per 32 MACs`: MET, at 3.31.** The instruction half of the gate this document set
+before writing any of the kernel is cleared with about 17% of margin, and it is cleared by the AVX2 part alone, which
+means it held on the machine that cannot even execute the instruction it is scoping.
+
+A supporting observation, measured on the same buffer: the expansion-plus-dot loop runs at **2.31 cycles per 16 MACs**
+(IPC 1.26). `rows8` today needs about 5.44 for the same 16 MACs - 8.92 instructions at the IPC 1.64 measured earlier on
+this host, which is a derivation rather than a fresh measurement. Even carrying the three-instruction dot stand-in, the
+shape is already ~2.4x ahead.
+
+**Port 5, the one thing still unresolved.** `vpshufb` and `vpdpbusd` are both `p5` uops on Alder Lake. Per 128 weights
+that is 4 + 4 = 8 port-5 uops, exactly one per 16 MACs - the *same* port-5 cost as today's single `vpermps` per 16 MACs.
+So the expansion does not add port pressure per MAC, and `rows8` currently uses only ~18% of port 5, which is why it is
+issue-bound. A raw `UOPS_DISPATCHED_PORT.PORT_5` event opens under WSL2 but reads 0, so this stays analytic: real silicon
+must confirm it, but the arithmetic says port 5 becomes co-binding rather than the new bottleneck.
+
+It also composes with batching rather than competing with it: the expansion is per weight word, so it is shared by
+every token in the batch, and its cost per token halves at N=2. An int8 path would want the batched structure anyway.
+
+**Kill criteria.** The instruction-count gate is cleared above. The exactness gate - "if `kindi verify` cannot be made to
+pass 40/40 within about two days of numerics work, stop" - passes on its own four prompts and **fails on a wider corpus**:
+48 prompts cross it 13 times, always at decisions the fp32 model itself had left open (measurements in the next section).
+By its literal terms the gate is cleared; as a claim about token-exactness in general it is not. Port 5 still needs real
+Alder Lake.
+
+## int8 activations: the exactness gate, measured
+
+The open question was whether quantising activations to int8 destroys the token-exactness guarantee. It was settled on
+this host, **without SDE**, because SDE is not installed and would not have helped: `vpdpbusd` is an integer
+multiply-accumulate, and `vpmaddubsw` + `vpmaddwd` + `vpaddd` produce the *identical* integers. SDE emulates the
+instruction; it does not change the value of a dot product. Only the **instruction count** needs VNNI silicon, and that
+was already counted. So the numerics can be prototyped and diffed against llama.cpp on plain AVX2, which is what was
+done.
+
+`KINDI_CPU_Q8=1` (in `kcpu.c`, off by default, prototype only) routes every GEMV through `rows8_q8`: the folded input is
+quantised to int8 symmetrically per group of 128 columns (`scale = max|x|/127`, `KINDI_CPU_Q8G` to change the group
+width), each weight is used as its signed ternary value, products accumulate in int32, and each group total is rescaled by
+`activation scale * row scale`. That is exactly the arithmetic a `vpdpbusd` kernel would produce; only the instructions
+differ.
+
+| check | result |
+|---|---|
+| `kindi verify`, fp32 control | PASS 4/4, 160/160 tokens |
+| `kindi verify`, int8 activations | **PASS 4/4, 160/160 tokens** |
+| 160 tokens per prompt, both paths | **640/640 tokens identical**, no divergence |
+| per-logit drift, int8 vs fp32 | median 0.0115, p99 0.050, max 0.219 |
+| per-logit drift, 8-prompt recheck (below) | median 0.0107, p99 0.047 |
+| argmax agreement at 40 tokens | 160/160 positions |
+| margin eaten by quantisation | median 0.1%, p90 2.3%, **max 73%** |
+
+The gate passes on its own corpus, and with headroom rather than by a single lucky token: the token sequences are
+identical for 160 tokens on all four prompts. But four prompts was the wrong size to draw the conclusion from, and the
+wider sweep below crosses it. **This is robustness, not exactness.** The int8 arithmetic is not bit-identical to the fp32
+path and never will be: logits move by up to 0.22, and the median |delta| of 0.0115 is comparable to the width of a narrow
+top-1/top-2 gap.
+
+Harness: `~/kt/perf/q8/` (`kq8_wide.py` runs the sweep below, `kq8_cmp.py` and `kq8_flips.py` compare it; one engine per
+process, because two 506 MB packs in one process corrupt the heap). The gate itself is reproducible without it:
+`KINDI_CPU_Q8=1 kindi verify`.
+
+The margin column is the honest measure of fragility, and on 640 decisions it looked comfortable: the quantisation ate a
+median of 0.1% of the winner's lead, at worst **73%** of it, and 3 of 640 positions lost more than half. A flip needs
+>100%. That 73% turned out to be the largest survivor of a corpus that never got close enough, not a bound.
+
+### The wider sweep: 13 of 48 prompts diverge
+
+48 prompts - factual answers, code in four languages, maths, translation, JSON, SQL, shell, enumeration, sentiment and
+extraction, style imitation, open-ended story text - at 160 greedy tokens each, so **7,680 decisions per arm**.
+
+| quantity | value |
+|---|---|
+| prompts whose token stream diverges | **13 of 48 (27%)** |
+| aligned decisions compared | 6,371 |
+| margin eaten, aligned decisions | median 0.02%, p90 1.6%, p99 16.3%, p99.9 64.5%, max **76%** |
+| flips at a decision above the corpus p1 fp32 margin (0.061) | **0 of 13** |
+| fp32 margin at a flip | median 0.016, max 0.057 |
+| four flip prompts x 24 tokens, each arm run twice | identical per arm, so the divergence is arithmetic, not a race |
+
+Every one of the 13 flips happened where the fp32 model itself was undecided: below the 1st percentile of its own margins
+(0.061), against quantisation noise of 0.0115 median and 0.05 at p99. Above roughly a 0.06 lead, nothing flipped anywhere
+in the sweep. Two shapes of divergence, both read off the raw token ids:
+
+- the runner-up is promoted for one token and the model rejoins the fp32 stream immediately - `List three uses of a hash
+  table:` gives fp32 `13 2972 6169` and int8 `13 220 2972 6169`;
+- the streams part for good - `Once upon a time, in a village by the sea, there lived` parts at token 10 and stays apart.
+
+So **the gate as written is cleared, and the property it stands for is not.** `kindi verify`'s four prompts are confident
+ones, which is why the int8 path passes them 40/40; a real workload meets near-ties constantly, and there 27% of 160-token
+generations diverge. VNNI cannot become a silent default on the strength of the 40/40 result. It needs either a guard -
+keep the fp32 path for decisions whose margin is under the drift, which is affordable because the head is a single GEMV
+and the cheapest place to check - or a tighter quantisation scheme. The next section scores the second option against the
+same 7,680 decisions.
+
+### Finer schemes: per-64 and per-32 groups, and a per-channel input scale
+
+`KINDI_CPU_Q8G` sets the activation group width (128 columns by default) and `KINDI_CPU_Q8C=1` switches the int8 path for
+a calibrated per-channel scale applied to the ordinary fp32 GEMV, so each arm changes one thing. Every arm below is the
+full 48 prompts x 160 tokens, compared against an fp32 arm that came out bit-identical to the one the earlier study used,
+and the per-128 arm reproduces that study's int8 arm bit for bit - the same 7,680-token stream and the same logits
+(`d96ba5fc5104db88`), since the group form at 128 columns is the old code with the group width made a parameter. That is
+what makes the widths comparable at all.
+
+| arm (scale per ...) | prompts diverging | differing steps | flips above the p1 margin | margin eaten: median / p99 / max | logit drift: median / p99 |
+|---|---|---|---|---|---|
+| fp32 | - | - | - | - | 0 / 0 |
+| 128 columns (control) | 13 of 48 | 1136 | 1 | 0.02% / 16.3% / 76% | 0.0107 / 0.047 |
+| 64 columns | 12 of 48 | 1199 | 1 | 0.00% / 15.1% / 96% | 0.0103 / 0.060 |
+| 32 columns | 16 of 48 | 1149 | 0 | 0.00% / 14.2% / 98% | 0.0094 / 0.056 |
+| per channel, calibrated | 38 of 48 | 4305 | 32 | 0.30% / 56.7% / 98% | 0.0689 / 0.451 |
+
+**The near-tie flips do not disappear. The group width barely moves the drift, and the drift is what sets the count.**
+128 to 32 columns is a 4x finer grid for a 12% smaller error: the scale is `max|x|/127` over the group, and the folded
+input has nearly the same magnitude in every column, so the largest of 32 samples is only about a quarter smaller than
+the largest of 128. The flips land at fp32 margins of the order of the drift and nowhere else - median margin at a flip
+0.0159 (128 columns), 0.0125 (64), 0.0094 (32), against drifts of 0.0107, 0.0103 and 0.0094 - so cutting the step by 12%
+moves the number of prompts that hit such a decision by one or two in either direction, which is the noise band of a
+13-of-48 measurement, not an improvement. The census says the same thing from the other side: in the fp32 arm, 17 of
+7,680 decisions - spread over 15 of the 48 prompts - have a top-1/top-2 margin under 0.01, the scale of the drift, and
+the 128-column arm diverges on 13 prompts.
+
+**A per-channel scale is worse, by 6.5x, and for a reason that is not fixable by calibration.** The step is fixed for a
+column by the largest value it ever showed during calibration (6,300 tokens of prose and code outside this sweep), so a
+token whose values are below the average of the calibration corpus is rounded on a grid that is too coarse for it. The
+dynamic group form has no such problem: its step follows the token in hand. Measured, per-channel drift is 0.0689 median
+against 0.0107, and 32 of its 38 flips land on decisions where fp32's own lead was 0.05 or more - it flips confident
+decisions, which the group form does at most once in the whole sweep (fp32 margin at its worst flip: 1.72, against 0.057
+for the group arms).
+
+One implementation detail is worth recording because it looked like a scheme result at first: the first per-channel arm
+keyed its table by GEMV width alone, and five call sites share the 2048-wide table (GDN qkv/gate, ssm_out, attention
+qkv, attention o, dense up) whose calibrated maxima range from 5.07 to 9.08, so the smallest input was quantised on the
+grid of the largest. That version measured 2.85% median margin eaten and 40 of 48 prompts diverging. Keying by call site
+plus width - `kc_cal_*`, calibrated to six entries - gives 0.30% and 38 of 48. The key matters by 10x; the conclusion does
+not change.
+
+Finer groups are not free either, if only slightly: the three arms are the same 5 threads on the same 7,680 tokens, and
+they took 1,785 s (128 columns), 1,817 s (64) and 1,846 s (32) - 1.7% and 3.4% more scale multiplications per row block,
+for no gain on the output.
+
+**What this rules out.** The flip count tracks the quantisation step, not the granularity of the scale, and no choice of
+max-based group gets the step below the model's own near-ties: a 12% smaller step leaves the same 13 to 16 divergent
+prompts. int8 activations therefore need the margin guard, or more activation bits - 16-bit activations against the same
+ternary weights would put the step 256x lower - and a smaller group is neither. The harness for all of it is
+`~/kt/perf/q8/` (`kq8_arms.sh` runs the group arms, `kq8_pc2.sh` calibrates and runs the per-channel one, `kq8_summ.py`
+scores an arm against fp32 and `kq8_drift.py` dumps the logits the drift column is computed from).
+
+The prototype is **not** a performance result and must not be read as one: it runs at 157 ms per token against 36 ms for
+the fp32 path, 4.3x slower, because it uses `vpmulld` per column pair and scalar int8 indexing instead of the byte-parallel
+`vpshufb` + `vpdpbusd` form, and it still reads the row-blocked pair layout rather than a column-major int8 repack. Its
+only job was to produce the numbers above. Speed still needs the real kernel and real silicon.
+
+**Hardware.** Correctness does not need the silicon, as the measurement above shows - and it turned out not to need SDE
+either. Intel SDE emulates AVX-VNNI, AVX-512-VNNI and AMX-INT8 (slow, 10-100x) but it is not installed here, and for the
+numerics it is unnecessary: integer results do not depend on which integer instruction computes them. SDE would still be
+the right tool to validate the *encoding* and the dispatch path before buying hardware. Throughput needs real parts.
+
+| target | hardware | note |
+|---|---|---|
+| AVX-VNNI 256-bit | Alder Lake / Raptor Lake, 12th-14th gen Core | cheapest real target, and the most likely Kindi hardware |
+| AVX-512 VNNI | Ice Lake, Tiger Lake, Cascade Lake, Sapphire Rapids | mutually exclusive with the above: 12th-14th gen disables AVX-512 |
+| AMX-INT8 | Sapphire Rapids / Emerald Rapids Xeon | cloud instances (c7i/m7i, GCP C3) are the cheap route |
+
+Strategic read: this is weeks of focused work, the numerics now say the exactness guarantee does not survive a wide
+corpus, and it pays only on hardware this host is not. The batched GEMV is measured at 1.35x and runs on the machine in front of us, so it goes
+first. The VNNI path is the branch's reason to exist on 2024+ Intel, and SDE is how to build it correctly before any
+silicon is bought.
+
+## K/V-cache quantisation: q8_0 costs nothing, ternary costs the model
+
+The K/V cache is a storage format, not an arithmetic one, so `KINDI_CPU_KVQ` (in `kcpu.c`, off by default, prototype
+only) selects it per run and every path still materialises a head's 256 values into fp32 before the same dot products.
+`0` is fp16, `1` is ternary at 2 bits with one scale per (position, head) - four codes a byte, the scale fitted by
+least squares to the code it induces - and `2` is q8_0's 32-value int8 blocks with an fp16 scale of `amax/127`. Same 48
+prompts, 160 greedy tokens, 7,680 decisions. The fp16 arm reproduces the stored `wide_fp32` arm token for token, so
+the switch is inert at 0 and the other two arms are the only difference.
+
+| arm | prompts diverging | first divergence, median step | of those, above the p1 margin | step-0 token differs | margin eaten, median | KL at step 0, median / max | top-1 at step 0 |
+|---|---|---|---|---|---|---|---|
+| fp16 | - | - | - | - | - | 0 / 0 | 48/48 |
+| q8_0 (8.5 bits) | **6 of 48** | 107 | **0** | 0 | 0.005% | 0.00002 / 0.0002 | 48/48 |
+| ternary (2.06 bits) | **47 of 48** | 3 | **40** | 10 of 48 | 11.6% | 0.0988 / 0.5627 | 38/48 |
+
+KL is over the full 248,320-token vocabulary between the two step-0 distributions, the one point where every arm sees
+an identical context; the p1 margin is the corpus threshold from the int8 study (0.0509).
+
+**q8_0 is free.** Six prompts leave the fp16 stream, every one of them at a step where fp16's own lead was below its
+p1 margin, and the median margin eaten at the aligned steps is 0.005%. The step-0 distribution moves by 2e-5 nats and
+the argmax never changes. That is a better trade than int8 *activations* (13 of 48) because it touches six layers'
+cache instead of every GEMV in the model; the two arms' divergent sets overlap by only 2 prompts of 6 and 13, so they
+are mostly different near-ties.
+
+**Ternary is not a lower rung, it is a different model.** It moves the first generated token on 10 of 48 prompts,
+median divergence at step 3, and 40 of its 47 flips land on decisions fp16 had made confidently. The cause is in the
+cache itself: 60% of trits come out zero, the median head's `max|v|` is 3.3x the fitted scale, and the reconstruction
+error is 52% on K and 53% on V.
+
+| format | bits/elt | cache MiB at ctx 1024 | vs fp16 | relL2, best per-group scale | relL2, shipped rule |
+|---|---|---|---|---|---|
+| fp16 | 16.00 | 12.00 | 1.00x | 0 | 0 |
+| q8_0, per 32 | 8.50 | 6.38 | 1.88x | 0.0065 | 0.0067 |
+| ternary, per head | 2.06 | 1.55 | 7.76x | **0.4853** | 0.518 (K) / 0.529 (V) |
+| ternary, per 32 | 2.50 | 1.88 | 6.40x | 0.4520 | - |
+| ternary, per 8 | 4.00 | 3.00 | 4.00x | 0.3743 | - |
+| ternary, per 4 | 6.00 | 4.50 | 2.67x | 0.3048 | - |
+
+**The alphabet is the floor, not the grouping or the scale rule.** The shipped Lloyd fit is within 7% of the best
+per-head scale found by a 40-point grid search, so the scale rule is not what is wrong; and shrinking the group from
+256 values to 32, 8 and 4 buys 0.485 -> 0.452 -> 0.374 -> 0.305 while the bitrate climbs 2.06 -> 6.00. Even four
+values sharing a scale leaves 30% error. Nothing at 2 to 6 bits per element is usable, and by the time the error is
+tolerable - q8_0's 0.65% - the format is 8.5 bits and 1.88x.
+
+**Is it worth any of the memory?** At ctx 1024 the whole cache is 12 MiB against 529 MB of weights, so q8_0 saves
+5.6 MiB, 1.1% of the pack, and attention is 0.9% of a token, so nothing shows in throughput (the three arms took
+1311-1326 s for the same 7,680 tokens under identical contention). At ctx 8192 the same ratio is 96 MiB against 51
+MiB: a 45 MiB saving, 9% of the pack. **q8_0 K/V is a long-context memory knob, not a speed or quality one**, and it
+is the format to ship if context length ever becomes the binding constraint. Ternary saves another 39 MiB at 8k and
+is not a trade that exists at any context.
+
+Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh` runs the three arms, `kqkv_wide.py` is the sweep, `kqkv_summ.py` scores
+divergence and KL, `kvq_detail.py` the divergence-step distribution, `kvq_err.py` and `kvq_scale.py` compare the stored
+cache against fp16 and search the grouping and scale).
+
+## Evaluated and rejected (advice from outside this repo)
+
+Three generic "how to speed up CPU inference" lists were triaged against this engine. Almost all of it was written for
+PyTorch or llama.cpp deployments of dense or MoE models in the 8B-70B range; this engine is hand-written C over a
+ternary 2B hybrid model that is already at 2 bits. Recorded so the same lists are not re-triaged.
+
+| claim | why it does not apply here |
+|---|---|
+| TorchScript, `torch.compile`, IPEX, BetterTransformer, `torch.no_grad`, DataLoader workers | there is no PyTorch on the path: `kindi/cpu.py` imports `ctypes`, `json`, `os`, `time`, `numpy` and calls C |
+| int8 / FP4 / mixed-precision quantisation, EXL3 mixed bitrate, MXFP4/NVFP4 | every one *raises* the bitrate. The weights are already ternary at 2 bits packed, with no lower rung to step to |
+| "make the model fit in the cache hierarchy" | 529 MB of weights against 16 MB of L3. Only a ~60 M-parameter model at 2 bits would fit; that is not a Kindi model |
+| operator fusion | already fused: one C function per stage inside a single OpenMP region. The only seams left are the ~425 barriers per token, about 0.5% |
+| MoE: expert sparsity, expert paging and cache compression, FP8 router, "quantise the router not the experts" | the Bonsai catalog is dense. No router, no experts, nothing to page |
+| multi-token prediction | Bonsai has no MTP heads |
+| KV-cache quantisation, FP8 KV, infinite KV, kv-less attention | now measured above: q8_0 halves the cache and only moves near-ties, ternary destroys it at any grouping. At ctx 1024 the cache is 12 MB against 529 MB of weights and attention is 0.35 ms of a 40.1 ms token (0.9%), and three of four layers are GDN holding no KV cache at all - so the saving is real only for long context. FP8, infinite KV and kv-less attention are still unread |
+| NUMA pinning, socket-local KV | single socket, dual-channel, no node to bind to |
+| ZipNN exponent coding, shared exponents, entropy-coded checkpoints | these shrink *storage*. The runtime streams 2-bit pair codes and would decompress on the fly, which adds instructions - and 5 extra instructions per weight word measured 0.6x in the mirror A/B. Bytes are not the limit |
+| L3-residency tiling, cache-aware weight layouts | measured: pinning the pair table into 2 KB is worth 0-4%, and the working-set sweep is flat from 8 MB to 384 MB |
+| `GOMP_CPU_AFFINITY`, `KMP_AFFINITY`, core pinning "significantly improves throughput" | measured over 9 configurations x 9 interleaved reps: every median between 21.1 and 24.2 ms |
+| model simplification / pruning | not a runtime setting; that is a different model |
+
+What survived, and where it lives:
+
+- **Speculative decoding** and **n-gram / prompt-lookup speculation** are the same change as batching (items #4 and
+  #5), and the batched kernel is now measured at 1.35x. The one idea from those lists that became work.
+- **Hybrid SSM** is not a future optimisation; Bonsai already is one.
+- **SpinQuant/QuaRot-style rotation** against activation outliers is already in the engine: `fold()` applies a
+  randomized Hadamard transform with the pack's sign vectors before every GEMV.
+- **AVX-VNNI / AMX dispatch** is scoped above and stays open; it is the only item rejected by *hardware* rather than
+  by measurement.
+
+Not evaluated: the infinite-KV, kv-less, TurboQuant and GEMQ papers were cited but not read. On the profile above they
+would have to beat 0.9% of a token to matter for throughput, which makes them a long-context and quality question
+rather than a speed one - but that is a judgement from the profile, not from reading them.
+
+## Sources
+
+- T-MAC, EuroSys'25 — <https://arxiv.org/abs/2407.00088> (full text: <https://arxiv.org/html/2407.00088v2>)
+- bitnet.cpp, ACL 2025 — <https://arxiv.org/html/2502.11880v1>
+- 1-bit AI Infra (bitnet.cpp tech report) — <https://arxiv.org/html/2410.16144v2>
+- Vec-LUT, MobiSys'26 — <https://arxiv.org/abs/2512.06443> (code: <https://github.com/Cipherxzc/vlut.cpp>)
+- BITCOS, Intel 2026 — <https://arxiv.org/html/2609.16338v1>
+- BitNet b1.58 — <https://arxiv.org/abs/2402.17764>
+- MoTE — <https://arxiv.org/html/2506.14435v2>
+- Apex (MoE CPU/GPU assignment) — <https://arxiv.org/html/2610.23006v1>
+- llama.cpp speculation docs — <https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md>
+- llama.cpp measured q8/q4 KV figures — <https://github.com/ggml-org/llama.cpp/discussions/20969>
+
+## Provenance of the numbers
+
+Every tokens-per-second figure in this document was measured on this host. Every speedup quoted from a paper is
+labelled with the hardware it was measured on (M2 Ultra, i7-13700H, Snapdragon, Xeon); **none of them has a
+Coffee Lake / DDR4-2667 counterpart in the literature**, so treat published speedups as upper bounds with unknown
+transfer.

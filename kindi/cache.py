@@ -40,6 +40,15 @@ def _to_dev(dst, pos, src):
         dst[:pos] = s                        # NumPy (CPU engine) or tp.Dist (copies in place itself)
 
 
+def _put(dst, src):
+    """dst = src in place. CuPy's set() for a device array (an assignment would first make a temporary device copy),
+    a plain assignment for the CPU engine's NumPy arrays, which have no set()."""
+    if hasattr(dst, "set") and not isinstance(dst, np.ndarray):
+        dst.set(src)
+    else:
+        dst[...] = src
+
+
 def _free_device_pool():
     try:
         import cupy
@@ -190,9 +199,9 @@ class Openings(object):
         Ms = [z["M%d" % i] for i in range(len(eng.M))]
         Cs = [z["C%d" % i] for i in range(len(eng.conv))]
         for a, h in zip(eng.M, Ms):
-            a.set(h)
+            _put(a, h)
         for a, h in zip(eng.conv, Cs):
-            a.set(h)
+            _put(a, h)
         for i in range(len(eng.Kc)):
             eng.Kc[i][:p] = z["K%d" % i]
             eng.Vc[i][:p] = z["V%d" % i]
@@ -397,6 +406,9 @@ class Runner(object):
         self.prefix_min = int(cfg["prefix_min"])
         self.progress = progress or {}
         self.tokens, self.ckpt, self.parked = [], {}, []
+        # the two-token pass in the serving loop (see spec_begin): the drafter, the token an accepted draft left in the
+        # state, and this request's counters
+        self._draft, self._pending, self._spec = None, None, None
         self.fingerprint = engine_fingerprint(eng, cfg)
         log("engine fingerprint %s: %s" % (self.fingerprint[0], json.dumps({k: v for k, v in self.fingerprint[1].items()
                                                                            if k != "code"})))
@@ -479,9 +491,9 @@ class Runner(object):
 
     def _set_state(self, Ms, Cs):
         for a, h in zip(self.eng.M, Ms):
-            a.set(h)
+            _put(a, h)
         for a, h in zip(self.eng.conv, Cs):
-            a.set(h)
+            _put(a, h)
 
     def _park(self):
         n = len(self.tokens)
@@ -657,3 +669,69 @@ class Runner(object):
         nxt = self.eng.step(tok, len(self.tokens))
         self.tokens.append(tok)
         return nxt
+
+    # ---- the two-token pass in the serving loop (CPU engine, greedy requests)
+    def spec_begin(self, greedy, drafter=None):
+        """Start drafting this request; True when the loop must call spec_next instead of step.
+
+        Only the CPU engine has the two-token pass (kc_step2: both tokens in one weight stream), and only a greedy
+        request can use it: the pass returns greedy tokens, so a sampled request has nothing to verify a draft
+        against. `drafter` replaces the n-gram drafter; `kindi spec-check` scripts one to make acceptance
+        deterministic. KINDI_CPU_SPEC=1 turns this on (default 0: the loop's stop path is covered by spec-check, but
+        the economics still have to be re-measured on the machine that runs it)."""
+        self._draft, self._pending, self._spec = None, None, None
+        if not greedy or os.environ.get("KINDI_CPU_SPEC", "0") == "0":
+            return False
+        if not hasattr(self.eng, "step2") or os.environ.get("KINDI_CPU_Q8") == "1":
+            return False          # not the CPU engine, or the int8 prototype (its two-token pass would be fp32)
+        if drafter is not None:
+            self._draft = drafter
+        else:
+            from .cpu import Ngram
+            self._draft = Ngram()
+            for t in self.tokens:                 # the prompt is the drafter's history
+                self._draft.push(t)
+        self._spec = dict(passes=0, drafted=0, accepted=0, rejected=0)
+        return True
+
+    def spec_next(self, tok):
+        """`step`, and when the n-gram's draft is confirmed, the token after that one too.
+
+        The pass feeds both tokens, so the second one is queued here and comes out of the next call without touching
+        the engine: the loop must not step it again."""
+        if self._pending is not None:
+            nxt, self._pending = self._pending, None
+            return nxt
+        st = self._spec
+        d = self._draft.propose(1) if len(self.tokens) + 1 < self.eng.ctx else []
+        st["passes"] += 1
+        if not d:
+            self._draft.push(tok)
+            return self.step(tok)
+        st["drafted"] += 1
+        nxt, ahead = self.eng.step2(tok, d[0], len(self.tokens))
+        self._draft.push(tok)
+        if d[0] == nxt:                            # the draft was right: both tokens are in the state
+            self.tokens += [tok, d[0]]
+            self._draft.push(d[0])
+            self._pending = ahead
+            st["accepted"] += 1
+            return nxt
+        self.eng.rollback()                        # back to the state after `tok`
+        self.tokens.append(tok)
+        st["rejected"] += 1
+        return nxt
+
+    def spec_stop(self):
+        """The request is over: undo the pass's second token if it was never used.
+
+        A request can stop on the token of an accepted pass (EOS, a stop string, max_tokens, a client that went
+        away), and that pass has already fed the token after it. `kc_state_load` restores the recurrent state between
+        the pass's two tokens, so the state and self.tokens end up exactly where one `step` would have left them.
+        Returns the counters (None when the request never drafted)."""
+        if self._pending is not None:
+            self.eng.rollback()
+            self.tokens.pop()
+            self._pending = None
+        st, self._spec, self._draft = self._spec, None, None
+        return st

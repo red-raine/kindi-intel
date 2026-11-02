@@ -14,5 +14,7 @@ kindi.conf
 __pycache__/
 *.pyc
 *.log
+.venv/
+.venv-*/
 .vscode/
 .idea/

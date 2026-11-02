@@ -47,6 +47,119 @@ count. llama.cpp: Prism ML's fork, CPU build.
 | Intel Core i7-8700 (6 cores) | 2B | 42.50 | 33.45 | 28.92 | 18.12 |
 | Intel Core i7-8700 | 4B | 17.02 | 12.97 | 12.61 | 7.75 |
 
+### The CPU engine on an i9-9980HK (8 cores / 16 threads, AVX2 only)
+
+One machine, `OMP_NUM_THREADS` swept, the 2B model, decode from position 100, 10 tokens each. "gemv" is the share of
+the token spent in the ternary GEMV, from the CPU profiler (`kc_get_times`; see CARDS.md). "GB/s" is tokens/s x
+0.506 GB, the bytes of the 2B pack streamed per token, against the 24.99 GB/s a plain 8-thread read of 512 MB reaches
+on this host.
+
+| threads | ms/token | tokens/s | gemv share | GB/s |
+|---|---:|---:|---:|---:|
+| 1 | 140 | 7.1 | 92% | 3.6 |
+| 2 | 79 | 12.7 | 92% | 6.4 |
+| 4 | 53 | 19.0 | 90% | 9.6 |
+| 8 | 39 | **25.4** | 88% | 12.9 |
+| 16 | — | not usable, see below | — | — |
+
+Repeat runs of the 8-thread row landed between 24.5 and 28.6 tokens/s, so treat the last digit as noise.
+
+**Thread count is limited by the 16-thread cliff, not by cores.** An empty `#pragma omp barrier` costs 0.3-0.6 us at 4
+and at 8 threads on this host (three repeats), but 3.3-4.1 ms at 16, and one token is roughly 425 barriers. 16
+threads therefore measured 0.24 tokens/s before the change below, about 90x slower than 8. That cliff is the
+hypervisor co-scheduling 16 vCPUs on 8 physical cores: native Windows measures 203 us there instead. A hand-rolled
+sense-reversing barrier is no faster than libgomp's (0.25-0.6 us at 4 and 8 threads), so replacing the barrier buys
+nothing - size `OMP_NUM_THREADS` to the physical cores and stop there.
+
+A single earlier reading of 24.9 us at 8 threads was an outlier under host load; treat the <1 us figure as the
+repeatable one.
+
+Against the 0.3.0 engine on the same box: 6.9 tokens/s (its best of 1/2/4/8/16 threads) to 25.4, and the `kindi verify`
+workload from 141.7 s to 12.7 s. Three changes to `rows8`, each keeping the arithmetic and its order:
+
+1. It walks two row blocks per table pass, so a group's table part is read once for 16 rows instead of once for 8.
+2. The zero-code mask is one compare instead of two shifts.
+3. It prefetches the weight group four ahead. Two ahead gives 25.7 tokens/s and eight ahead 19.7, so four is the knee;
+   the prefetch is why the 8-thread row moved off 44% of this host's 25 GB/s.
+
+`kindi verify` still matches llama.cpp on all four prompts after all three.
+
+### Mirror consolidation, measured and rejected
+
+The eight nonzero pair sums are ordered so that code `c` and code `7-c` are exact negations, so the table can hold
+only codes 0-3 (16 KB instead of 32 KB) and recover the rest by flipping a sign. Both builds came from the same
+source with only `pair_tables` and the inner loop changed, linked with distinct symbol names, and the two libraries
+alternated inside one process, warm, 24 decode tokens per run, order reversed every rep:
+
+| run | current | mirror | mirror/current, median | mirror wins |
+|---|---:|---:|---:|---:|
+| 1 | 26.09 | 16.11 | 0.63 | 0/9 |
+| 2 | 23.08 | 12.77 | 0.55 | 0/9 |
+
+Both runs output the same tokens as the current kernel on three 32-token prompts, so the table is right and the
+trade is simply bad: the mirror index (`min(c, 7-c)`) and the sign mask cost about five extra instructions per
+weight word, and that is worth more than the bytes saved. In run 1 the two distributions did not overlap at all
+(mirror max 19.11, current min 23.25).
+
+Two implementations of the mirror were wrong before the exactness check caught them: `cmpgt` returns all ones, so
+the "negation" was a bitwise complement; and `(7-c) & 3` maps code 0 to lane 3. Neither is visible in a timing run.
+
+A second, deliberately wrong build pins the table pointer to a single 2 KB group, so every step re-reads the same hot
+table: 1.09x median against the real kernel, with a 0.60-1.16 spread. Making the table resident is worth at most
+single-digit percent, which is why the plan's column-tiling item is not worth a pack-format change.
+
+### What the counters say about the GEMV (i9-9980HK, 8 threads)
+
+`~/kt/perf/gb.c` opens the PMU with `perf_event_open` - there is no `perf` binary on this image and installing one needs
+root - and drives `rows8` exactly as `gemv` does, over 432 MB of packed weights. One 1.536 GMAC pass takes 85 ms on one
+thread and 21-23 ms on eight, which is the rate the real engine implies for a token's GEMV, so these numbers describe
+the shipped kernel.
+
+| working set | GB/s | IPC | L1D load miss | vpermps/cycle |
+|---|---:|---:|---:|---:|
+| 8 MB (L3-resident) | 18.2 | 1.71 | 17.9% | - |
+| 49 MB | 18.2 | 1.57 | 16.3% | - |
+| 123 MB | 17.6 | 1.57 | 17.1% | - |
+| 384 MB (DRAM-resident) | 19.0 | 1.76 | 17.9% | 0.20 |
+
+Throughput is flat across a 48x change in working set, so the GEMV is **not memory-bound**: a pure streaming read of
+the same bytes reaches 26.0 GB/s on this host. Per core it converts **3.2 MACs per cycle**, against 16 for a dense
+fp32 FMA loop. What that closes:
+
+- Pinning the pair table into 2 KB of L1 cuts L1D misses from 25.7 M to 7.1 M - 72% of all of them - and is **0%
+  faster**. The table costs cache, not throughput; L2 absorbs it.
+- dTLB takes 106 k walks per pass, 1.13 per 4 KB page. That is already one per page, the best 4 KB pages can do, so
+  huge pages are worth about 1%.
+- Removing the 4-ahead prefetch is a wash (21.9 against 21.5 ms median).
+- Thread binding is a wash: nine interleaved reps over nine configurations put every median between 21.1 and 24.2 ms.
+  Single runs had shown `OMP_PLACES=cores OMP_PROC_BIND=spread` at 1.43x over unbound, and that was noise.
+
+The GEMV is issue-bound at IPC 1.6-1.8, so the lever left is fewer instructions per weight word, not fewer bytes.
+The batched-token estimate that follows from this is in `docs/CPU-PERF-2026.md`.
+
+Confirmed on the real pack (`~/kt/perf/real.py`), not only a synthetic buffer: the 151 distinct matrices of
+`~/.kindi/packs/bonsai-2b`, repacked by the shipped `Engine`, total **470 MB of pair codes + 59 MB of scales = 529 MB
+and 1.88 G parameters per token**. A 13 MB subset runs at 18.6 GB/s and the whole 529 MB at 18.3, IPC 1.56-1.72,
+which is the synthetic result to within noise. In situ the engine's own timers put the GEMV at **34.47 ms of a
+40.1 ms token (85.9%, 15.3 GB/s)**, so roughly 19% is lost to running it interleaved with the other stages rather
+than as one stream. That is still nowhere near the 26 GB/s ceiling, so nothing above changes - but the isolated
+figure is an upper bound.
+
+Two-token batching works. `rows8_b2` shares each weight word's decode and zero-mask between two activations and is
+bit-exact against two separate `rows8` passes (0 mismatched floats over the whole model). Interleaved A/B, 7 reps,
+8 threads, all 151 real matrices:
+
+| | ms / 2 tokens | ms / token | instructions per vpermps | IPC |
+|---|---:|---:|---:|---:|
+| two `rows8` passes (today) | 58.7 | 29.4 | 8.92 | 1.64 |
+| one `rows8_b2` pass | 43.6 | **21.8** | **5.92** | 1.49 |
+
+**1.35x per token**, against a 1.37x prediction, from 8.92 -> 5.92 instructions per lookup. IPC falls, so the win is
+the instruction count and not the memory traffic - and the batched pass reads each weight byte once for two tokens
+(265 MB/token instead of 529) yet is only 1.35x faster, which is the final proof that bandwidth was never the limit.
+It is not wired into decode, because decode is serial and there is no second token to batch with until speculative
+verification or a second sequence exists.
+
 ### The prompt cache, GTX 1080
 
 Seconds for each request (prompt and reply), `examples/prompt_cache_bench.py`. Kindi with its cache off and on; llama.cpp
@@ -224,7 +337,115 @@ sm_30 generation (GT 640/730, K420/K600). We found none. To our knowledge, Kindi
 current-generation LLM on this card. We have not had it independently verified. If you know of a faster result,
 please tell us.
 
+## Two-token speculative decode on the CPU (i9-9980HK, 8 threads)
+
+The batched pair-code GEMV is wired into a real decode path rather than measured in isolation. `kc_step2` runs two
+tokens through the whole forward pass with one weight stream (`rows8_b2`), and `kindi.cpu.generate_spec` drives it
+from an n-gram (prompt-lookup) drafter.
+
+**Exactness.** The two-token pass is bit-identical to two `kc_step` calls: `max|dlogit| = 0.000e+00` at every position
+tested, and the recurrent state after the pass (every layer's `M`, every layer's conv, the fp16 K and V caches) is
+`array_equal` to the state two sequential calls leave. `generate_spec` therefore reproduces plain greedy decoding
+token for token, which is asserted in every run below.
+
+The shipped single-token path was re-gated against llama.cpp after the `gdn`/`attn` split that made the pass possible:
+`kindi --pack ~/.kindi/packs/bonsai-2b verify` with `KINDI_DEVICE=cpu` gives **4/4 prompts PASS, 40/40 tokens each,
+"ALL PASS: token-exact with llama.cpp"**. Note what that gate does and does not cover: `verify` drives `generate`,
+which is `feed`/`step`, so it proves the refactor left the ordinary decode untouched, but it never calls `kc_step2`.
+The speculative path's guarantee rests on the bit-exactness above, which is why that was checked to the logit and to
+the recurrent state rather than only to the token.
+
+**Pass cost.** Two tokens in one pass cost 1.35x one token, so a pass buys 1.35 tokens' worth of time and returns
+1 + acceptance tokens. That makes the break-even acceptance **0.35** and the ceiling at perfect acceptance 1.48x.
+
+| | ms | note |
+|---|---:|---|
+| one-token `kc_step` | 42.13 | 23.7 tok/s |
+| two-token `kc_step2` | 56.92 | 1.351x the pass |
+
+The ceiling is 1.48x, not 2x, because only the products batch: the RMS folds, the GDN recurrence, the attention
+bodies and the embedding still run per token, and they double. With the GEMV at ~86% of a token and the pair kernel
+at 1.35x, `2/(0.86/1.35 + 0.14*2)` is exactly the 1.35 measured.
+
+**End to end, decode loop only, medians of 3, prefill excluded:**
+
+| context | plain | spec | | acceptance | identical |
+|---|---:|---:|---:|---:|---|
+| repetitive tokens | 18.75 tok/s | 22.07 tok/s | **+1.177x** | 0.86 | yes |
+| degenerate (random prompt) | 23.55 tok/s | 36.09 tok/s | **+1.533x** | 1.00 | yes |
+
+The two rows bracket what the mechanism does: the gain is the acceptance rate, nothing else. The random-prompt row
+is not a good model reading, it is a degenerate one - the model emits a fixed token, the drafter predicts that same
+token from the suffix index, and acceptance is 1.00, at the ceiling. The repetitive-prompt row is the more realistic
+case at 0.86. Neither row is natural text, so treat the range as a bracket and not as a claim about prose.
+
+One measurement mistake worth recording: the first run of this benchmark timed the prefill along with the decode
+loop, which diluted the ratio to +1.11x. Both arms paid the same 47-token prefill, so the *shape* was right but the
+number was not. The table above times only the decode loop.
+
+**On real text, through the tokenizer.** Both rows above are synthetic token ids, which the paragraph above is careful
+to say. `kindi bench-spec TEXTFILE` runs the same two arms over prompts cut from a real file and tokenised by the pack's
+own tokenizer, so the prompts are prose or code rather than token ids. 128 new tokens per prompt, 48- and 256-token
+prompts (the prompt is the drafter's history), at 8 and 4 prompts per cell:
+
+| corpus | prompt | acceptance | plain | spec | | identical |
+|---|---:|---:|---:|---:|---:|---:|
+| prose (`README.md`) | 48 | 0.764 (381/499) | 18.2-22.4 tok/s | 23.1-25.1 tok/s | **+1.27x** (1.12-1.35) | 8/8 |
+| prose (`README.md`) | 256 | 0.645 (169/262) | 14.4 tok/s | 20.6 tok/s | +1.44x | 4/4 |
+| code (`kindi/cache.py`) | 48 | 0.753 (387/514) | 18.6 tok/s | 20.5 tok/s | +1.10x | 8/8 |
+| code (`kindi/cache.py`) | 256 | 0.719 (200/278) | 20.7 tok/s | 25.8 tok/s | +1.24x | 4/4 |
+
+Every generation was token-identical to plain greedy. Acceptance on natural text is **0.65-0.76, i.e. 1.9-2.2x the 0.35
+break-even**, on prose and code alike, so this is not a code-only win. The +1.27x median is also what the pass cost
+predicts: a pass returns 1 + acceptance tokens for 1.351x the cost of one token, so `(1 + 0.76)/1.351 = 1.30`, and the
+cells bracket 1.10x to 1.44x around it. Read the per-cell ratios as +-0.15 and the acceptance figures as exact - they
+are deterministic for the same text.
+
+The earlier version of this table read +1.11x to +1.35x at 0.75-0.87 acceptance, from a harness that estimated the
+prefill with a separate timed read and subtracted it. At 48-token prompts prefill is a quarter of the arm's time, so
+that subtraction moved the ratio by up to 0.2x. `bench-spec` removes prefill by cancellation instead - each arm also
+runs the same prompt at `--tokens 1`, giving `(t(n) - t(1)) / (n - 1)` - and those are the numbers above. The old
+figures are superseded, not merely noisier.
+
+One sample had to be thrown away: the first `code 256` run read **2.594x**, which is above the 1.48x ceiling and so
+impossible. Per-prompt timings showed the cause was the host, not the kernel - the plain arm decoded the same 128
+tokens in 3.76 s on one prompt and 7.92 s on the next. The re-run of that cell gives 1.24x. This VM's plain-arm rate
+has swung 14-25 tok/s within one session; that is why the ratios move and why a single cell is not evidence.
+
+**Decision: wired into the serving loop, off by default (`KINDI_CPU_SPEC=1` turns it on).** The acceptance data
+removes the numerical doubt - real text is 1.9-2.2x the break-even, and the one-token draft did not change the output
+in any generation run here. What blocked the default was not decode economics but the stop path: the server's token
+loop handles EOS, stop strings, `</think>` boundaries and tool-call parsing one token at a time, so a two-token pass
+has a second token that may have to be thrown away.
+
+That is now implemented. `Runner.spec_begin/spec_next/spec_stop` draft through `kc_step2` and keep the loop's shape
+(one `nxt` per emitted token); a request that stops on the token of an accepted pass calls `kc_state_load`, so the
+recurrent state and `Runner.tokens` end up exactly where one `step` would have left them. `kindi spec-check` is the
+test: a stop by token id, a stop by stop string, a stop one token later, a run whose drafts are all rejected, and the
+same request through `server.Kindi.generate` with the pass off and on. Removing the rollback from `spec_stop` makes
+the two stop cases fail while the tokens still match - the failure mode below, now caught.
+
+It stays off by default for two reasons, both about evidence rather than mechanism. The economics above were measured
+on this host and should be re-read on the machine that serves. And two loop paths still feed tokens of their own: a
+thinking budget, and the loop stop that sets one, close the thinking mid-stream - so speculation is skipped for those
+requests rather than restructured around them.
+
+**Why the state snapshot matters.** A rejected draft has to roll back to the state after the pass's first token, so
+`kc_step2` snapshots every GDN layer between the two tokens (19 MB, copied by one thread under `omp single`). The
+first version copied on every thread with no barrier; the group after the copy then ran `gdn_mid` for the second
+token, which rewrites `conv` almost immediately, so the copy raced it and all 18 conv layers rolled back wrong. The
+output was still token-identical (the argmax did not move) and only the state comparison caught it. Rolling back by
+replaying the first token instead would cost 0.76 of a pass against the snapshot's ~3% of one.
+
 ## How to reproduce
 
 `kindi verify` checks the output against llama.cpp. `kindi bench` gives the write speed at several positions and
 the prompt reading speed. [CARDS.md](CARDS.md) gives the settings for each card.
+
+The real-text speculative numbers above come from `kindi bench-spec`: `KINDI_DEVICE=cpu kindi bench-spec README.md`
+for prose, `kindi bench-spec kindi/cache.py` for code, with `--prompt-len` and `--prompts` for the two prompt sizes. It
+is a separate command from `kindi bench` because that one needs a GPU - it imports CuPy to read memory - so the CPU
+speculative path had nothing in-tree to hang a benchmark on.
+
+The serving loop's side of it is `KINDI_DEVICE=cpu kindi spec-check`, which needs no pack (it builds the synthetic
+fixture) and exits 1 if the pass changes the tokens or leaves the state anywhere but where a single step would.

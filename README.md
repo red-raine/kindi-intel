@@ -122,6 +122,18 @@ pip install "numpy==1.19.5" "fastrlock==0.8.3" "cupy-cuda102==9.6.0" "fastapi==0
 Then run Kindi from the repository root with `python3 -m kindi ...` (put the repository on `PYTHONPATH` to run it
 from elsewhere).
 
+`kindi serve` is the only command that needs `fastapi` and `uvicorn`; chat, verify, convert and bench need numpy
+alone. On a system that installs packages into a venv only (PEP 668: Ubuntu 23.04 and later, Debian 12, Fedora 38),
+or simply to keep them out of the system python, let the setup script make that venv:
+
+```sh
+bash setup-server.sh          # ~/.kindi/server-venv, with fastapi and uvicorn in it; no root, no --break-system-packages
+```
+
+It shares the system's numpy (`--system-site-packages`), installs `fastapi` and `uvicorn` into the venv, checks that
+the venv imports the server from this checkout, and prints the line to run. `--dir` puts the venv elsewhere and
+`--python` chooses the interpreter.
+
 ## Get the model and convert it
 
 These steps use the 2B. For the 4B, 9B and 27B, use their PTQ1_0 files from the same publisher. The installer
@@ -172,7 +184,7 @@ docker run --rm --gpus all -u $(id -u):$(id -g) -v ~/.kindi:/data kindi:0.3.0 fa
 ```sh
 docker run -d --name kindi --restart unless-stopped --gpus all -u $(id -u):$(id -g) \
     -p 127.0.0.1:8093:8093 -v ~/.kindi:/data kindi:0.3.0
-# native:  python3 -m kindi serve
+# native:  python3 -m kindi serve    (the venv's python, if you ran setup-server.sh)
 ```
 
 The first start compiles Kindi's CUDA kernels for your card (about 1.5 minutes on the K420). Kindi caches them under

@@ -327,6 +327,10 @@ class Kindi(object):
         self.busy["phase"] = "generating"
         if hasattr(self.eng, "spec_begin"):
             self.eng.spec_begin(temperature <= 0, temperature, top_p, top_k, rng)   # speculative decoding (KINDI_SPEC)
+        # the CPU engine's two-token pass (KINDI_CPU_SPEC), through the cache: greedy requests only, and not one whose
+        # thinking can be closed mid-stream (a thinking budget, or the loop stop that sets one) - that branch feeds
+        # tokens of its own between two emitted ones, and a queued draft would be skipped
+        spec = self.runner.spec_begin(temperature <= 0 and not (think and (budget or repeat_stop)))
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         text, gen, finish = "", [], "length"
         # while thinking, pieces go out as ("reasoning", ...) - the last 8 characters are held back in case they are
@@ -381,7 +385,7 @@ class Kindi(object):
                     self.log("stopped a repeating loop after %d tokens" % len(gen))
                     finish = "length"
                     break
-                nxt = self.runner.step(tok)
+                nxt = self.runner.spec_next(tok) if spec else self.runner.step(tok)
                 if loop and st["think"] and not st["forced"]:
                     budget = len(gen)                         # a loop in the thinking: close it now, then answer
                 if st["think"] and budget and len(gen) >= budget and not st["forced"]:
@@ -397,7 +401,10 @@ class Kindi(object):
                         nxt = self.runner.step(ft)
                 tok = self._pick(nxt, temperature, top_p, top_k, rng)
         finally:
-            sp = self.eng.spec_end() if hasattr(self.eng, "spec_end") else None
+            # a stop on the token of an accepted pass leaves that pass's second token in the state: spec_stop undoes
+            # it, so the state is the one a single step would have left
+            sp = self.runner.spec_stop() if spec else \
+                (self.eng.spec_end() if hasattr(self.eng, "spec_end") else None)
             self.busy["active"] = False
             if hasattr(self.runner, "idle"):
                 self.runner.idle()                            # (KINDI_CKPT_VRAM: checkpoint host copies now)
@@ -630,7 +637,12 @@ def create_app(cfg, log=print):
 
 
 def serve(cfg, log=print):
-    import uvicorn
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn
+    except ImportError:
+        raise SystemExit("kindi serve: the server needs fastapi and uvicorn (python3 -m pip install fastapi uvicorn;"
+                         " on a PEP 668 system make a venv with --system-site-packages and run the server with it)")
     app = create_app(cfg, log)
     log("serving on http://%s:%d/v1 (model %s)" % (cfg["host"], cfg["port"], cfg["model_name"]))
     uvicorn.run(app, host=cfg["host"], port=int(cfg["port"]), log_level="warning")
