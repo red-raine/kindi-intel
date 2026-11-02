@@ -319,6 +319,7 @@ llama.cpp on the same card, with the same model file and the same context: on th
 tokens/s and reads prompts at 1.2 tokens/s (512 tokens). The tables for each card, with their method, are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 How Kindi works: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
+An experiment on reusing the activation code as a routing fingerprint: [docs/ROUTING-FINGERPRINT.md](docs/ROUTING-FINGERPRINT.md).
 The settings for each tested card (K420, K1200, K6000, GTX 1080, RTX 3080, Radeon 780M, CPU): [docs/CARDS.md](docs/CARDS.md).
 
 ## Agent benchmark
