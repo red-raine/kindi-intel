@@ -71,6 +71,39 @@ The depth curve (lsq, per-128) rises gently with depth - layer 0 at 0.4701, the 
 23 at 0.5030 - and `out_proj` is the worst matrix in every layer. Embeddings are the easiest (0.4347) and the output
 head one of the hardest (0.4884), which is the usual shape for post-hoc ternary quantisation.
 
+## Re-ternarising an already-ternary pack
+
+A different question from the one above: if a pack's weights move by a fraction of a scale step - a fine-tune, a
+rounding pass, a re-pack - how much of the ternary structure survives re-quantisation? Measured on the served Bonsai-2B
+pack (151 ternary matrices, 1880.1 M parameters, per-128 absmean scales), offsetting every dequantised weight by
+`t*a` inside its own group and re-rounding on the **unchanged** grid:
+
+| offset | retention, ties-to-even | retention, ties-away | what it is |
+|---|---:|---:|---|
+| `t < 0.5` | 1.0000 | 1.0000 | every code absorbed |
+| `t = 0.5` | 0.6629 | 0.6736 | decided by the tie rule, not by the weights |
+| `t > 0.5` | 0.3366 | 0.3366 | only the `+1` codes survive |
+
+All 151 tensors follow the closed form exactly: `1 - P(-1)` at even ties, `1 - P(0)` at away ties, `P(+1)` beyond,
+with a largest deviation of **1.1e-16** over ten offsets from 0.1 to 1.0 and both rules. Refitting the scale on the
+drifted weights with absmean or least squares buys at most 1.2 points (0.6749 and 0.6640 at half a step against
+0.6629 for the untouched grid) and cannot approach 1.0, so no choice of scale recovers a code sitting on a boundary.
+
+Two consequences worth keeping:
+
+1. **Half a step is the one offset that measures nothing about the model.** Every weight lands exactly on a rounding
+   boundary, so the answer is the tie-breaker's, and the two plausible rules differ by a full point of retention
+   because the code histogram is slightly asymmetric. Absorption is complete - and trivially complete - strictly below
+   half a step, which is where a drift study has to sample to say anything about stability.
+2. **The floor above half a step is a third, and that is arithmetic, not a quality bar.** The lowest retention
+   anywhere in the sweep is 0.3348, and it equals the `+1` share of the codes.
+
+The histogram behind those numbers: **0.337 / 0.326 / 0.337** for `-1` / `0` / `+1`, and flat over depth - the zero
+fraction moves only between 0.3226 and 0.3284 across all 151 matrices (sd 0.0010), with layer 0 (0.3229-0.3284) inside
+the range of layers 1+ (0.3226-0.3276). So a single layer's ternary statistics do represent the model's, which is what
+makes layer-0-only measurements safe to generalise *for this quantity*; the drift curve above is a different matter,
+where depth does move the error.
+
 ## Limits worth stating
 
 - **No reference forward pass.** The checkpoint is 24 pure-GDN layers with per-head scalar B/C (`in_proj` = 2·1024 +
@@ -80,3 +113,7 @@ head one of the hardest (0.4884), which is the usual shape for post-hoc ternary 
 - **The probes are synthetic.** The weight-space numbers are exact for the checkpoint; the `output` column uses
   Gaussian probes of unit RMS because the real activation distribution of that checkpoint is not available here.
 - `kindi drift` takes about 90 s and 1 GB of RAM per 255M checkpoint: it holds the full state dict as float32.
+- The re-ternarisation sweep is arithmetic on the pack, not a forward pass: it says which codes survive a drifted
+  re-quantisation and says nothing about what the surviving codes cost in tokens. Its closed forms are exact by
+  construction, so the identities are a check on the implementation rather than an empirical discovery; what is
+  empirical is the histogram and its flatness over depth.
