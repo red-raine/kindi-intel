@@ -746,12 +746,13 @@ reproduce their arms token for token (3/3 prompts each), which is what makes the
 | 12 blocks + head | **10 of 48** | 872 | 2 |
 | 24 (= fp32) | 0 | 0 | 0 |
 
-**The curve plateaus, and that is the result.** Making a third of the stack exact is worth three prompts; doubling
-that to half the stack is worth nothing more, and eight of the last twelve blocks contribute not one prompt. The
-remaining ten are decided by the drift already present in the prefix the tail cannot reach, and only the whole stack
-being exact returns the fp32 stream - which is to say, no exactness at all. The step count tells the same story less
-coarsely: 1,136 -> 834 with a single exact block, then flat within 40, so the tail's real effect is a 25% fall in
-differing positions rather than a fix.
+**The curve plateaus, and that is the result.** Making a sixth of the stack exact is worth one prompt and making a
+third exact is worth three; doubling that to half the stack is worth nothing more, and the eight blocks between `k = 4`
+and `k = 12` contribute not one prompt. The remaining ten are decided by the drift already present in the prefix the
+tail cannot reach. The step count tells the same story less coarsely: 1,136 -> 834 with a single exact block, then flat
+within 40, so the tail's real effect is a 25% fall in differing positions rather than a fix. The plateau is measured
+from `k = 4` to `k = 12`; `k = 24` is exact because it is fp32, and nothing between 12 and 24 was run, so whether the
+count falls back to zero somewhere in that gap or only at the end is open.
 
 Cost, in this prototype, runs the wrong way to be a constraint: the elapsed time *falls* as the tail grows (1,942 s at
 one block, 1,890 s at four, 1,848 s at eight, 1,725 s at twelve for the same 7,680 tokens), because this int8 path
