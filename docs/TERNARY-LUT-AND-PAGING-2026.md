@@ -205,11 +205,27 @@ overtakes exact fetch with perfect recall at any batch in the table.
 Note also what the columns say about the whole idea: prefetching is worth most at **B = 4-6** (43-47%), precisely where
 compute rises to meet the link - the same batching conclusion as above, reached from the scheduling side.
 
+### One layer of lookahead is all these heads can reach
+
+The runtime integration submits L+1's speculative reads from L's pre-attention normalisation. That is the correct
+place for the *signal* - a head consumes a hidden state of its own layer - and it is also the ceiling: at batch 1 a
+layer's compute is top-2 GEMV = **2 x 1.8 = 3.6 ms**, while an expert read is **9.5 ms**. One layer of lookahead can
+therefore hide at most **38%** of the read, and the remaining 5.9 ms is exposed no matter how good the head is.
+
+Going deeper is not a training problem. A head maps layer L's state to layer L+1's router, so predicting L+2 would need
+L+1's hidden state, which does not exist until L+1's attention has run. Chaining predictions through a *fabricated*
+state is a different model, and its recall would compound (0.82^k for k layers). The integer router itself costs
+~4-5 us per layer at 64 experts x 4096, i.e. ~160 us per token - 0.02% of a 723 ms token, so the head is not the
+constraint and neither is its cost: the constraint is that 3.6 ms of compute cannot cover 9.5 ms of read. At batch 6
+the same layer has 21.6 ms of compute for 9.5 ms of read, one layer of lookahead is comfortably enough, and the policy
+becomes worth building.
+
 Three defects in the training harness as written, beyond the model: the recall it prints is computed on the **training
 batches it is fitting**, with no held-out split, so 82% and 96% are upper bounds; the recall metric counts hits against a
 K+1 candidate set and divides by K, so over-fetching inflates the score by construction - the very comparison being drawn;
-and the calibration section takes the hidden state at the *start* of layer L while the runtime integration evaluates the
-head on layer L's post-attention output, so a head trained as specified is being used out of distribution.
+and the two runtime sketches disagree about what feeds the head - one uses L's post-attention output, the other L's
+pre-attention normalisation - so whichever is trained, the other integration is out of distribution. Post-attention is
+the better predictor (less drift to bridge) and should be the one written down.
 
 What does move the floor is changing the bytes or the work per byte, which is what the earlier sections already found:
 a **batch of 5-6 tokens** puts one expert's 9.5 ms under its own compute, and **smaller experts** (clustering 64 experts
