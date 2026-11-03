@@ -563,7 +563,7 @@ Two checks run before any timing, and both pass:
 - **The `w+1` identity.** `sum (w+1)x - sum x` reproduces the signed product exactly, so plain AVX-VNNI really is enough.
 
 The pack's atom matters here and it works in the design's favour. `paircodes()` stores one **4-bit code per unit-sum
-pair** - "0..7 = which of the 8 nonzero (w0, w1) pairs, 8 = both zero; 2 bits per weight" ([kcpu.c:73](kindi/kcpu.c#L73))
+pair** - "0..7 = which of the 8 nonzero (w0, w1) pairs, 8 = both zero; 2 bits per weight" ([kcpu.c:73](../kindi/kcpu.c#L73))
 - so a nibble already carries two 2-bit weights and a 16-entry `vpshufb` table resolves both halves without any separate
 unpacking step. Two tables (first weight, second weight) per nibble position, no extra instruction.
 

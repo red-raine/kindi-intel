@@ -328,6 +328,20 @@ The settings for each tested card (K420, K1200, K6000, GTX 1080, RTX 3080, Radeo
 [kbench](https://github.com/ahtx/kindi-bench) has 65 agent tasks with hidden tests and a runner. It also has
 the results of our runs with Kindi on the K420. kbench works with any OpenAI-compatible server.
 
+## Testing
+
+One command runs every check in this repository - module imports, the quantiser and converter self-tests, the four tool
+suites, the CLI, and the links in these documents:
+
+```bash
+python -m tools.selftest            # 10 ok, 6 skipped, 0 failed, ~11 s
+python -m tools.selftest --verbose  # timings, and every skip with its reason
+```
+
+The exit status is the answer. It needs no GPU, no network and no pytest. [docs/TESTING.md](docs/TESTING.md) lists what
+each check asserts, which modules are skipped and why (the five that import `cupy` unconditionally), and what the gate
+does not cover.
+
 ## Limits
 
 - **One request at a time.** Concurrent requests queue (the card holds one engine).

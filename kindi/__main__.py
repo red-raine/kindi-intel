@@ -226,7 +226,7 @@ def main(argv=None):
     p.add_argument("--pack")
     p.add_argument("--state-dir", dest="state_dir")
     p.add_argument("--ctx", type=int)
-    p.add_argument("--version", action="version", version="kindi " + __version__)
+    p.add_argument("--version", action="version", version="Kindi " + __version__)
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("convert", help="build the weight pack from the GGUF")
     s.add_argument("gguf", nargs="?")
