@@ -47,10 +47,45 @@ curl -fsSL https://amirhusain.com/kindi/install.sh | bash
 The script finds your cards, shows each setup that they support with the recommended one first, and can set up
 one server for each card (`--auto` takes the recommendation). It downloads the model and checks
 its sha256, converts it, checks that the output is token-for-token identical to llama.cpp, and starts the server
-on `127.0.0.1:8093`. It explains each step, and it asks before it installs Docker or the NVIDIA Container Toolkit.
+on `127.0.0.1:8093`.
+It explains each step, and it asks before it installs Docker or the NVIDIA Container Toolkit.
 To see each step before anything changes, add `-s -- --dry-run` after `bash`. Run it again to upgrade or repair;
 `--uninstall` removes it. To check the script's sha256 before you run it, and for the model that each card gets,
 see [docs/INSTALL.md](docs/INSTALL.md).
+
+```
+   curl -fsSL https://amirhusain.com/kindi/install.sh | bash
+                          |
+                          v
+        +-------------------------------------+
+        | 1. look at the hardware             |   nvidia-smi, rocminfo,
+        |    GPUs and the CPU                 |   AVX2 on the host
+        +------------------+------------------+
+                           v
+        +-------------------------------------+     Kepler / Pascal / Turing /
+        | 2. choose a setup                   |     Ampere / Radeon 780M / CPU
+        |    (recommended one first)          |     --auto takes it, no prompts
+        +------------------+------------------+
+                           v
+        +-------------------------------------+     ~430 MB (2B) ... ~15 GB (27B)
+        | 3. download the model               | --> sha256 checked before use
+        +------------------+------------------+
+                           v
+        +-------------------------------------+     exact: same weights, re-laid out
+        | 4. convert it to a weight pack      |     ~1 minute
+        +------------------+------------------+
+                           v
+        +-------------------------------------+     40 tokens x 4 prompts against
+        | 5. verify against llama.cpp         |     llama.cpp's reference output
+        +------------------+------------------+
+                           v
+        +-------------------------------------+     curl -s localhost:8093/health
+        | 6. serve on 127.0.0.1:8093          |     API: /v1/chat/completions
+        +-------------------------------------+
+
+   dry run first?  curl ... | bash -s -- --dry-run     undo it?  ... --uninstall
+   no shell script? the same six steps by hand: Install -> Get the model and convert it -> Run the server
+```
 
 - [Quick start: one command](#quick-start-one-command)
 - [Requirements](#requirements)
@@ -196,6 +231,33 @@ curl -s localhost:8093/health
 
 The server listens on `127.0.0.1:8093` (natively) or on the port you publish (Docker). To serve your network, publish
 `-p 8093:8093` (Docker) or set `host = 0.0.0.0`, and set an `api_key`.
+
+What happens to one token while it is being written:
+
+```
+   prompt text
+        |
+        v
+   +-----------------------+     a repeated prefix? its prefill comes from the
+   | tokenize + prompt cache|--> prompt cache instead of running again
+   +-----------+-----------+
+               v
+   +---------------------------------------------------------------+
+   | embed                                                          |
+   | every layer:  RMS norm -> Hadamard fold -> ternary GEMV         |  weights stream
+   |               (2 bits a weight) -> attention / MoE FFN           |  from ~/.kindi/pack
+   |               CUDA: kernels cached after the first start        |
+   |               CPU:  AVX2, or the T-MAC LUT                      |
+   +-------------------------------+-------------------------------+
+                                   v
+   +---------------------------------------------------------------+
+   | output head:  exact / fast / sampled                            |
+   +-------------------------------+-------------------------------+
+                                   v
+                             next token ----> detokenize ----> stream (SSE)
+                                   |
+                                   +---- appended to the prompt, round again
+```
 
 ## Use it
 

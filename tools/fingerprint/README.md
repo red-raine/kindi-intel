@@ -1,5 +1,40 @@
 # fingerprint: the 20-NN routing index, and what it is tuned on
 
+```
+   one position's code (2,048 bits, the sign of the folded residual stream)
+        |
+        v
+   +--------------------------+        p bits  ->  one int64 key
+   | program a fixed bit order|
+   +------------+-------------+
+                v
+   +------------------------------------------------------------------+
+   |  MULTI-PROBE (probe.py, index.py)                                |
+   |                                                                  |
+   |   key ......... the query's own cell          (radius 0)         |
+   |   key ^ bit_i . p neighbours, one bit away    (radius 1)         |
+   |   key ^ bit_i ^ bit_j . p(p-1)/2 pairs        (radius 2)         |
+   |   key ^ bit_i ^ bit_j ^ bit_k . triples       (radius 3)         |
+   |                                                                  |
+   |   cells searched nearest-first until the budget is reached,      |
+   |   always whole cells - a cut never splits one                     |
+   +------------+-----------------------------------------------------+
+                v
+   +--------------------------+     distance over the WHOLE code:
+   | 20-NN inside the gathered |     bits as +-1, one dot product
+   | candidates                |
+   +------------+-------------+
+                v
+   +--------------------------+
+   | ballot -> five largest   |     ties broken by class index, so it is
+   | class bins -> prediction |     deterministic
+   +------------+-------------+
+                v
+   hit1 = is the model's own argmax in those five?
+
+   tune: pick (layer, k) per held-out document by scoring only the OTHER documents
+```
+
 `docs/ROUTING-FINGERPRINT.md` reports that the sign code of the folded residual stream predicts the model's own next-token
 class: 20-NN over all 2,048 bits, 0.5361 hit1 at layer 23 against 0.1772 for a global majority table. That result came
 from `~/kt_route`, which is not in this tree; its corpus (`fp_bits_centred.npy`, `argmax.npy`, `top5.npy`) no longer
@@ -8,7 +43,7 @@ exists either - only four scripts survive in a temp directory. **The published n
 What can be built and checked here is the machinery that produced them, which is this module:
 
 ```bash
-python -m tools.fingerprint.router --selftest           # 17 checks, known answers
+python -m tools.fingerprint.router --selftest           # 18 checks, known answers
 python -m tools.fingerprint.router                      # tuning + baselines on a synthetic corpus
 python -m tools.fingerprint.router --corpus DIR         # a ~/kt_route/corpus-style directory, if you have one
 ```
@@ -36,7 +71,7 @@ above 0.5 for a table that learned nothing, so tuning on hit5 optimises mostly t
 
 `synth_corpus` plants the class in the bits with per-layer agreement rates, document-level drift and its own topic
 distribution, so the right answers are known: the tuned layer must be the planted one, k must be interior, and the
-majority and previous-token baselines must lose. All 17 checks assert those.
+majority and previous-token baselines must lose. All 18 checks assert those.
 
 It does **not** say anything about the best k for real fingerprints. On the planted corpus with a clean signal
 (agreement 0.92) the tuner picks k = 1 and 1-NN scores 0.9875 against 0.8750 for 20-NN - one neighbour is enough when

@@ -102,7 +102,7 @@ by the *zero pattern* itself being class-informative, and no measurement here sh
 
 `tools/fingerprint` implements the machinery above as a component: the full-code index, folds by document, the
 `hit1`/`hit5` definitions, document-level bootstrap, the three baselines, and a `tune()` that picks `(layer, k)` for each
-held-out document by running leave-one-document-out on the other documents only. 17 checks assert the parts whose answers
+held-out document by running leave-one-document-out on the other documents only. 18 checks assert the parts whose answers
 are known - the distance recovers brute-force agreement, a held-out document contributes no neighbours, the tuner finds a
 planted layer, k is interior on a noisy corpus, and a router that ignores the bits loses to one that uses them.
 

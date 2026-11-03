@@ -405,12 +405,22 @@ def t_real_layout():
         shutil.rmtree(d)
 
 
+def t_missing_corpus_is_an_error():
+    """`--corpus` with a path that does not hold one must exit 2, not quietly score the synthetic corpus instead.
+
+    The fallback used to be silent, so a typo printed planted-signal numbers (0.9875 hit1) under whatever directory the
+    user named. The other three fingerprint modules already refused; this pins the fourth.
+    """
+    rc = main(["--corpus", os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-such-corpus")])
+    check("cli: a `--corpus` path with no corpus exits 2", rc == 2, "exit %r" % (rc,))
+
+
 def selftest():
     del PASS[:]
     for t in (t_distance, t_no_leak, t_recovers_planted_layer, t_neighbour_count, t_prediction_shape, t_bootstrap,
-              t_baselines_lose, t_real_layout):
+              t_baselines_lose, t_real_layout, t_missing_corpus_is_an_error):
         t()
-    expected = 17
+    expected = 18
     ok = len(PASS) == expected
     print("\n%d checks passed%s" % (len(PASS), "" if ok else " of %d - a check did not run" % expected))
     return 0 if ok else 1
@@ -440,7 +450,10 @@ def main(argv):
         path = argv[argv.index("--corpus") + 1]
     c = load_corpus(path) if path else None
     if path and c is None:
-        print("no fingerprint corpus at %s - falling back to the synthetic one" % path)
+        # Not a fallback: a mistyped path would otherwise print planted-signal numbers under a real corpus's name, which is
+        # exactly the kind of number nobody can reproduce. The other three fingerprint modules already exit 2 here.
+        print("no fingerprint corpus at %s" % path)
+        return 2
     if c is None:
         c = synth_corpus(docs=10, positions=16, dim=128, nclass=40, seed=7, layer_signal=(0.5, 0.65, 0.92))
         return report(c, " (synthetic: layer 2 holds the signal, layer 0 is at the 0.5 noise point)")
