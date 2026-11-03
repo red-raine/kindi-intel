@@ -85,6 +85,39 @@ enough that cells exceed it.** At probe 4 a cell holds about N/16 candidates, so
 the same 0.34 - the budget is never consulted. The frontier is therefore not "few probe bits, large budget" but "probe
 wide enough that the budget is the binding constraint".
 
+## multi-probe: the answer changes when the ball is wider (`probe.py`)
+
+```bash
+python -m tools.fingerprint.probe --selftest    # 15 checks
+python -m tools.fingerprint.probe               # sweep, verdict, and the frontier across three corpora
+```
+
+A single cell can only see what it is allowed to reach: a true neighbour one key bit away sits in another cell and is
+invisible at any budget, which is the structural reason the single-probe sweep needed 94% of a scan. **Multi-probe**
+visits cells in increasing Hamming distance from the query key - the query's own cell, then every key one bit away, then
+two, then three - nearest first, stopping when the budget is reached. Completions are sorted by code distance, so a
+budget that cuts the search keeps the closest codes.
+
+With pairs only (radius 2) the best setting under half a scan reached **92.8%** retention, and the answer read as a no.
+The triples were the missing ring: at `p=8` the radius-3 ball is 93 of 256 cells, so it can be searched inside half a
+scan, and that is where the bar is met.
+
+| corpus | reference hit1 | cheapest setting keeping 95% | of a scan |
+|---|---:|---|---:|
+| seed 61, layer 1 | 0.870 | probe 8, radius 3, budget 96 | **37%** |
+| seed 62, layer 1 | 0.932 | probe 10, radius 3, budget 48 | **17%** |
+| seed 63, layer 1 | 0.849 | probe 6, radius 2, budget 96 | **38%** |
+| seed 51, layer 2 (the detailed sweep) | 0.865 | probe 6, radius 3, budget 96 | 55% |
+
+**Yes, on three of four:** 95% of the hit rate for 17-38% of a scan. The fourth is not a contradiction, it is the same
+measurement on a corpus whose codes carry signal differently, and it is reported rather than dropped - 95% there costs
+55%, a wedge either side of the half-scan line. What changed from `cell.py` is not the arithmetic but the search: a
+single cell cannot reach a near neighbour, and three bits of probing can.
+
+Radius 3 was silently a no-op in the first version - `probe_keys` stopped at pairs, so `radius=3` returned exactly
+radius 2's cells and the table read as if a wider probe bought nothing. The `radius 3 really visits triples` check exists
+so that cap cannot come back.
+
 ## To re-derive the real numbers
 
 The index needs fingerprints, which need a pack and a forward pass. `route_dump.py` in the temp directory is the script

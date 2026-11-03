@@ -90,6 +90,7 @@ SUITES = [
     ("suite:datahub", [sys.executable, "-m", "tools.datahub.selftest"], "checks passed"),
     ("suite:fingerprint", [sys.executable, "-m", "tools.fingerprint.router", "--selftest"], "checks passed"),
     ("suite:fingerprint_cell", [sys.executable, "-m", "tools.fingerprint.cell", "--selftest"], "checks passed"),
+    ("suite:fingerprint_probe", [sys.executable, "-m", "tools.fingerprint.probe", "--selftest"], "checks passed"),
 ]
 
 

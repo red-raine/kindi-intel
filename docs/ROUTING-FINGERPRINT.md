@@ -54,6 +54,13 @@ Two negative results are worth as much as that one:
   corpus on three separate signal strengths (probe 12, budget 256: 98.4% retention for 93.8% of the scan). Below 95% the
   curve is no kinder - 88.9% of the scan buys 94.5% of the hit rate. A cell index is not worth a second data structure
   here, which is what the sentence above says in one line and this table says in seven.
+
+  **One correction to that verdict.** The single-probe result is a statement about a cell that cannot reach its own
+  neighbours: a true neighbour one key bit away is in another cell and invisible at any budget. `tools/fingerprint/probe.py`
+  searches the query's cell and its Hamming neighbours - radius 1, 2, then 3, nearest first - and at `p=8` keeps **97%** of
+  the hit rate for **37%** of a scan (radius 3 is 93 of 256 cells). On three corpora with comparable reference strength the
+  bar lands at 17%, 37% and 38% of a scan; on a fourth it lands at 55%, just outside half. So the compression verdict holds
+  for a *hash bucket* and not for a *probe ball*: what costs the 94% is the exact-match key, not the hashing.
 - **Which bits you pick barely matters.** Random bit selection scores 0.2911 against 0.2928 for the learned selection
   at layer 15 (`ablate.log`), so the "learned" table was measuring the table, not the bit choice.
 
