@@ -275,7 +275,64 @@ def report(corpus, layer):
     return 0
 
 
+def scale_probe(positions=3456, dim=2048, queries=60, seed=61, settings=None):
+    """The same comparison at the note's corpus size (48 documents x 72 positions), sampled rather than exhaustive.
+
+    This exists because the sweep's answer **does not transfer unchanged**. A budget is a count, and the sweep held it at 96
+    while the corpus grew three positions at a time: at N=176 that is 55% of everything, at N=3,384 it is 3%, so the first
+    scale run reported "22.6x faster" with hit1 fallen from 0.986 to 0.306. Sweeping the budget here shows the real curve:
+    the retention the sweep promised costs about a third of a scan at this size, not a quarter.
+    """
+    if settings is None:
+        settings = ((8, 3, 96), (8, 3, 512), (8, 3, 1024), (8, 3, 2048), (12, 3, 1024))
+    c = R.synth_corpus(docs=48, positions=positions // 48, dim=dim, nclass=751, seed=seed,
+                       layer_signal=(0.4, 0.6, 0.8))
+    bits = c.layer(2)
+    test = np.nonzero(c.doc_of == 0)[0]
+    train = np.nonzero(c.doc_of != 0)[0]
+    ref_bits, ref_cls = bits[train], c.cls[train]
+    picks = np.random.RandomState(0).choice(test, size=min(queries, len(test)), replace=False)
+    every = np.arange(len(ref_bits))
+    tf, full_hit = [], {}
+    for q in picks:
+        t0 = time.perf_counter()
+        full = answer(bits, ref_bits, ref_cls, q, every)
+        tf.append(time.perf_counter() - t0)
+        full_hit[q] = c.cls[q] in set(full.tolist())
+    ref_rate = float(np.mean(list(full_hit.values())))
+    rows = []
+    for p, radius, budget in settings:
+        idx = Index(ref_bits, p, seed=0)
+        hit, scan, t = [], [], []
+        for q in picks:
+            t0 = time.perf_counter()
+            cand, n = idx.candidates(bits[q], radius, budget)
+            pred = answer(bits, ref_bits, ref_cls, q, cand)
+            t.append(time.perf_counter() - t0)
+            scan.append(n)
+            hit.append(c.cls[q] in set(pred.tolist()))
+        rows.append(dict(probe=p, radius=radius, budget=budget, hit1=float(np.mean(hit)),
+                         retention=float(np.mean(hit) / max(ref_rate, 1e-12)),
+                         scan=float(np.mean(scan)), scan_frac=float(np.mean(scan) / len(train)),
+                         us=1e6 * float(np.mean(t)), us_frac=float(np.mean(tf) / np.mean(t))))
+    return dict(n=len(train), queries=len(picks), full_us=1e6 * float(np.mean(tf)), full_hit1=ref_rate, rows=rows)
+
+
 def main(argv):
+    if "--scale" in argv:
+        s = scale_probe()
+        print("at the note's corpus size: %d training rows, 2,048 bits, %d queries from one held-out document"
+              % (s["n"], s["queries"]))
+        print("full 20-NN over everything: %.0f us/query, hit1 %.3f\n" % (s["full_us"], s["full_hit1"]))
+        print("  %-14s %7s %9s %7s %9s %8s" % ("setting", "hit1", "retain", "scan%", "us/query", "speedup"))
+        for r in s["rows"]:
+            print("  p%-2d r%d b%-6d %7.3f %9.3f %6.0f%% %9.0f %7.2fx"
+                  % (r["probe"], r["radius"], r["budget"], r["hit1"], r["retention"], 100 * r["scan_frac"],
+                     r["us"], r["us_frac"]))
+        print("\nThe budget is a count, not a fraction: at 96 candidates the index visits 3%% of this corpus, so the retention\n"
+              "it showed on a 176-row corpus does not survive the growth. The %d queries are a reading, not an interval."
+              % s["queries"])
+        return 0
     if "--corpus" in argv:
         c = R.load_corpus(argv[argv.index("--corpus") + 1])
         if c is None:

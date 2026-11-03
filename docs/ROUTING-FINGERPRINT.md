@@ -67,8 +67,13 @@ Two negative results are worth as much as that one:
   corpus** (38%, 37%, 28% of the code scanned), while at 192 bits it is still 1.7x slower. That table is a property of the
   implementation and it moved once already: searching the probe keys one at a time cost **7.2x slower at 192 bits and 1.3x
   faster at 2,048**, and batching the 93 lookups into one `searchsorted` moved the crossover from 2,048 bits down past
-  1,024. Since the fingerprint is 2,048 bits and the probes' fixed cost does not grow with N, the note's regime is the
-  winning side of both versions - but the line is worth measuring rather than assuming.
+  1,024. The line is worth measuring rather than assuming, and so is the corpus size: **the 17-38% figures above come from
+  a 176-row corpus, and the budget that produced them was a count, not a fraction of N.** At the note's 3,384 rows
+  (`index.py --scale`) the same setting (96 candidates) touches 3% of the corpus and keeps 27% of the hit rate - a 29x
+  speedup that is a wrong answer. Scaled to 2,048 candidates it keeps **93% for 36% of a scan (2.7x on wall clock)**, and
+  a wider key does not help: 12 probe bits spread the corpus over 4,096 cells and the radius-3 ball covers 7% of it at
+  any budget. So the scaling claim that survives is the wall-clock crossover above plus 2.7x at the note's size, not the
+  quarter-scan and not the 23x a constant budget pretends.
 - **Which bits you pick barely matters.** Random bit selection scores 0.2911 against 0.2928 for the learned selection
   at layer 15 (`ablate.log`), so the "learned" table was measuring the table, not the bit choice.
 

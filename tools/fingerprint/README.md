@@ -174,7 +174,30 @@ not the distance work, the expensive part:
 | 2,048 bits | 352 | 3,330 us | 1,420 us | 967 us | **3.4x faster** |
 
 Batching the probe keys into one `searchsorted` moved the crossover from 2,048 bits down past 1,024, i.e. from "exactly
-where the fingerprint lives" to "everywhere above a tenth of its width". A check asserts the batched gather visits
+where the fingerprint lives" to "everywhere above a tenth of its width".
+
+### At the note's corpus size the budget stops being a fraction (`--scale`)
+
+Every row above holds N at ~176. The note measured 3,408 positions, and running the same setting there corrects the
+reading - the first attempt at it reported **22.6x faster** and would have been wrong:
+
+| setting | hit1 | retention | scan | us/query | vs full |
+|---|---:|---:|---:|---:|---:|
+| full 20-NN | 0.983 | 100% | 100% | 32,916 | 1.0x |
+| p8 r3 **b96** | 0.267 | **27%** | 3% | 1,133 | 29x (and wrong) |
+| p8 r3 b512 | 0.633 | 64% | 15% | 5,894 | 5.6x |
+| p8 r3 b1024 | 0.867 | 88% | 30% | 10,845 | 3.0x |
+| p8 r3 **b2048** | 0.917 | **93%** | 36% | 12,276 | **2.7x** |
+| p12 r3 b1024 | 0.483 | 49% | 7% | 3,098 | 11x (and wrong) |
+
+A budget is a **count, not a fraction**. At N=176, 96 candidates was 55% of the corpus; at N=3,384 it is 3%, so the same
+setting that kept 97% of the hit rate on the small corpus keeps 27% here - a 29x speedup that is simply a wrong answer.
+Scaled up to 2,048 candidates it recovers to 93% retention for 36% of a scan: 2.7x on wall clock, which is the honest
+number for the note's size and less flattering than either the quarter-scan or the 23x.
+
+The `p=12` row is the same mistake in the other direction: a 12-bit key spreads 3,384 rows over 4,096 cells, so a radius-3
+ball touches ~1 row a cell and covers 7% of the corpus however large the budget is. Probe width trades cell occupancy
+against ring count, and both depend on N. A check asserts the batched gather visits
 **exactly** the cells the loop visits - an optimisation that changes which cells are searched is a different index, not a
 faster one - and both sides of the remaining line are asserted, because at 192 bits the idea still loses.
 
