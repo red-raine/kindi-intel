@@ -88,6 +88,7 @@ SUITES = [
     ("suite:prefetch_budget", [sys.executable, "-m", "tools.bitnet_gemm.prefetch_budget"], "over-fetch"),
     ("suite:exodus", [sys.executable, "-m", "tools.exodus"], "check groups passed"),
     ("suite:datahub", [sys.executable, "-m", "tools.datahub.selftest"], "checks passed"),
+    ("suite:fingerprint", [sys.executable, "-m", "tools.fingerprint.router", "--selftest"], "checks passed"),
 ]
 
 

@@ -79,6 +79,23 @@ One argument in its favour, which is reasoning and not a measurement: for a Hamm
 thresholding signs into zeros can only erase coordinates' sign information. A trit would have to earn its extra level
 by the *zero pattern* itself being class-informative, and no measurement here shows that.
 
+## The router is now in this tree
+
+`tools/fingerprint` implements the machinery above as a component: the full-code index, folds by document, the
+`hit1`/`hit5` definitions, document-level bootstrap, the three baselines, and a `tune()` that picks `(layer, k)` for each
+held-out document by running leave-one-document-out on the other documents only. 17 checks assert the parts whose answers
+are known - the distance recovers brute-force agreement, a held-out document contributes no neighbours, the tuner finds a
+planted layer, k is interior on a noisy corpus, and a router that ignores the bits loses to one that uses them.
+
+It does **not** reproduce the tables above, and it cannot: the corpus those numbers came from is gone. `load_corpus()`
+reads a `~/kt_route/corpus`-style directory if one reappears; until then the numbers in this note remain unverifiable from
+this tree for the same reason the rotation conclusion does, and for a different reason the router itself is now
+testable - the arithmetic and the protocol are checked, the measurement is not.
+
+One thing the component already shows about method: on a planted corpus with clean codes (0.92 agreement) the tuner picks
+**k = 1** and 1-NN scores 0.9875 against 0.8750 for 20-NN, while on the real corpus above 1-NN scored 0.2946 against
+0.4960. The best k follows signal quality, so "20-NN" is a result about that corpus rather than a constant of the method.
+
 ## What would settle it
 
 Re-dump the activations (the corpus pipeline above regenerates them from the pack), build trit codes at several
