@@ -1,7 +1,9 @@
 # BitNet b1.58 GEMM: 2-bit weights, unpacked on the fly
 
 A GEMM whose weights are stored four to a byte (2 bits each) and unpacked in registers before the multiply, plus the
-host reference that decides whether the kernel is right. Nothing under `kindi/` imports this: it is a separate tool
+host reference that decides whether the kernel is right. The measurement record for this tool - the LUT and its
+tiling, and what an expert read costs - is [docs/TERNARY-LUT-AND-PAGING-2026.md](../../docs/TERNARY-LUT-AND-PAGING-2026.md).
+Nothing under `kindi/` imports this: it is a separate tool
 because the engine's CPU path (`kindi/cpu.py`, `kindi/kcpu.c`) already has its own packing and its own GEMV, and this
 measures a different design.
 
