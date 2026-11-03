@@ -225,6 +225,26 @@ def t_candidate_ids_are_training_rows():
           "max id %s of %d training rows" % (int(rows.max()) if len(rows) else "-", len(train)))
 
 
+def t_budget_is_a_count_not_a_fraction():
+    """The mistake that produced "22.6x faster" at the note's size: a fixed budget covers a shrinking share of a growing corpus.
+
+    Same `p`, radius and budget, four times the positions. The absolute scan stays near the budget while its share of the
+    corpus falls by more than half - which is why the small-corpus retention does not follow the setting to a bigger one.
+    """
+    shares = {}
+    for docs in (24, 96):                         # 384 and 1,536 positions: both large enough to fill the budget
+        c = R.synth_corpus(docs=docs, positions=16, dim=64, nclass=40, seed=77, layer_signal=(0.5, 0.9))
+        bits = c.layer(1)
+        index = Index(bits, 8, seed=0)
+        scans = [index.candidates(bits[q], 3, 96)[1] for q in range(0, len(bits), 5)]
+        shares[len(bits)] = (float(np.mean(scans)), float(np.mean(scans)) / len(bits))
+    (n_small, (scan_small, frac_small)), (n_big, (scan_big, frac_big)) = sorted(shares.items())
+    check("index: the same budget covers a smaller share as the corpus grows",
+          frac_big < 0.6 * frac_small and scan_big < 2 * scan_small,
+          "%d positions: %d scanned (%.0f%%); %d positions: %d scanned (%.0f%%)"
+          % (n_small, scan_small, 100 * frac_small, n_big, scan_big, 100 * frac_big))
+
+
 def t_the_crossover_is_at_the_real_width():
     """Where the index starts to pay, measured on both sides instead of assumed.
 
@@ -250,9 +270,9 @@ def selftest():
     del PASS[:]
     for t in (t_zero_setting_is_the_router, t_budget_is_whole_cells, t_build_is_deterministic,
               t_probe_finds_a_bit_flip, t_vectorised_gather_matches_the_loop, t_candidate_ids_are_training_rows,
-              t_the_crossover_is_at_the_real_width):
+              t_budget_is_a_count_not_a_fraction, t_the_crossover_is_at_the_real_width):
         t()
-    expected = 9
+    expected = 10
     ok = len(PASS) == expected
     print("\n%d checks passed%s" % (len(PASS), "" if ok else " of %d - a check did not run" % expected))
     return 0 if ok else 1

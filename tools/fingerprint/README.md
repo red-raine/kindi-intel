@@ -156,7 +156,7 @@ so that cap cannot come back.
 ## the cost in wall-clock, and where the index starts to pay (`index.py`)
 
 ```bash
-python -m tools.fingerprint.index --selftest    # 9 checks
+python -m tools.fingerprint.index --selftest    # 10 checks
 python -m tools.fingerprint.index               # the crossover table: same setting, four code widths
 ```
 
