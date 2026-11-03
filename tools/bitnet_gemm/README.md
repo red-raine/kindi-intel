@@ -183,31 +183,37 @@ order so `assert cur_id == active_expert_id` fails whenever the next token flips
 sub-millisecond GEMV cannot hide a 14.7 MB NVMe read - the prefetch has to be issued during the *previous token's whole
 decode*, into a double buffer sized for the union of the next token's top-k experts, with the pack streamed as packed.
 
-## Paging experts from disk: measured, and the ceiling is 16%
+## Paging experts from disk: measured, with the measurement's own limits stated
 
 The next note streams cold experts with `io_uring` + `O_DIRECT` + `mlock`, double-buffered against the GEMV. That is a
-Linux mechanism and this box is Windows, so it is not built here; but the number it rests on is measurable, and it
-decides the design. `stream_probe.py` reads a 256 MB file with `FILE_FLAG_NO_BUFFERING` (the POSIX arm uses `O_DIRECT`)
-so the page cache cannot answer, at spread offsets, 14.7 MB at a time - one 14336 x 4096 expert:
+Linux mechanism and this box is Windows, so it is not built here; but the number it rests on is measurable.
+`stream_probe.py` reads with `FILE_FLAG_NO_BUFFERING` (the POSIX arm uses `O_DIRECT`), and the flag is enforced - an
+unaligned `ReadFile` under it fails with `ERROR_INVALID_PARAMETER` (87), checked rather than assumed.
 
-| arm | min | median | throughput |
+| read | C: (KIOXIA NVMe) | B: (WDC 4 TB HDD) | E: (Seagate USB) |
 |---|---:|---:|---:|
-| unbuffered (`FILE_FLAG_NO_BUFFERING`) | 9.25 ms | 9.31 ms | 1.67 GB/s |
-| buffered | 14.89 ms | 16.19 ms | 1.03 GB/s |
+| 14.7 MB, one call | 9.25 ms, 1.6 GB/s | 4.3 ms, 3.6 GB/s | 175 ms, 0.09 GB/s |
+| 200 MB, one call | 3.3 GB/s | 2.5-3.0 GB/s | 32 MB/s |
+| write 2 GB | 69 MB/s | 57 MB/s | - |
 
-64 MB reads on the same file land at 1.68 GB/s unbuffered, so the figure is not a transfer-size artifact.
+**A 4 TB spinning disk cannot read at 2.5-3 GB/s, so this table is not a device measurement.** Whatever serves these
+reads sits outside the guest's page cache: in this virtualised environment, freshly written data comes back faster than
+the medium could deliver it, and both disks write at ~60 MB/s. An earlier version of this probe reported 1.67 GB/s and I
+called it "the device" - that was wrong, and the HDD control is what exposed it. Two other artifacts had to be fixed
+before the probe gave even these numbers: a file smaller than the drive's own cache reads from that cache (a *spinning*
+HDD reported 4 GB/s), and a repeated 1 MB block compresses to nothing under NTFS compression, measuring the decompressor.
 
-The buffered arm is not faster at all - 1.03 GB/s on the larger file - so the page cache is not answering and **1.67 GB/s
-is the device, not the software**. It holds at 14.7 MB, at 64 MB and across a 256 MB file, i.e. it is not a size or seek
-effect. A read therefore costs **9.25 ms against 1.8 ms of GEMV**: double buffering can hide the shorter side only, so the
-scheme's ceiling is `1.8 / (1.8 + 9.25) = 16%`, per expert, per layer, per token. At top-2 over 32 layers a token streams
-~940 MB, which is **0.57 s/token before any arithmetic**.
+The one number here that does not depend on the medium's identity is the **expert-sized read: ~9 ms for 14.7 MB**, and it
+is stable at queue depths 1, 4 and 8 (1.61, 1.37, 1.65 GB/s - no gain from depth). Against 1.8 ms of GEMV that is a
+ceiling of `1.8 / (1.8 + 9) = 17%` for a pipeline that hides one expert read behind one expert multiply, per expert, per
+layer, per token. Reading a 200 MB batch instead does reach 3.3 GB/s, i.e. larger transfers amortise the per-call cost -
+that is the same "more work per read" conclusion from the other direction.
 
-The arithmetic that decides when streaming becomes worth building: the kernel digests 58.7 M weights in 1.8 ms = **32.6 G
-weights/s**, while 1.67 GB/s of packed weights is **6.7 G weights/s**. Compute outruns the disk by **4.9x**, so at batch 1
-the read can never be hidden - and the fix is not a faster I/O path, it is **more tokens per weight read**: at a batch of
-5 or more, one expert's 9.25 ms read sits under 5 x 1.8 = 9 ms of compute and the pipeline is level. Streaming experts is
-therefore a *batched* inference design; at batch 1, on this box, the expert set has to fit in RAM.
+The arithmetic that decides when streaming is worth building: the kernel digests 58.7 M weights in 1.8 ms = **32.6 G
+weights/s**, while 6.7 G weights/s is what 1.67 GB/s of packed weights amounts to. Compute outruns the read by ~5x at
+expert granularity, so at batch 1 the read can never be hidden. The fix is not a faster I/O path - it is **more tokens
+per weight read**: at a batch of 5 or more, one expert's ~9 ms read sits under 5 x 1.8 = 9 ms of compute and the pipeline
+is level. Streaming experts is a *batched* inference design; at batch 1 the expert set has to fit in RAM.
 
 As code, the note needs five things before it runs correctly: (1) `wait_completion` returns whichever CQE arrives and
 the loop pairs it with `cur_slot`, which only holds while exactly one read is outstanding - set the constructor's
