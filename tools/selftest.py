@@ -86,6 +86,7 @@ SUITES = [
     ("suite:bitnet_gemm", [sys.executable, "-m", "tools.bitnet_gemm.test_bitnet"], "checks passed"),
     ("suite:expert_merge", [sys.executable, "-m", "tools.expert_merge.merge"], "permutation logic verified"),
     ("suite:prefetch_budget", [sys.executable, "-m", "tools.bitnet_gemm.prefetch_budget"], "over-fetch"),
+    ("suite:exodus", [sys.executable, "-m", "tools.exodus"], "check groups passed"),
 ]
 
 

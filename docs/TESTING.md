@@ -3,7 +3,7 @@
 One command runs everything this repository checks:
 
 ```bash
-python -m tools.selftest            # 10 ok, 6 skipped, 0 failed, ~11 s
+python -m tools.selftest            # 11 ok, 6 skipped, 0 failed, ~32 s
 python -m tools.selftest --verbose  # per-check timing, and every skip with its reason
 ```
 
@@ -23,6 +23,7 @@ CPU-only host, which is the case it most needs to cover.
 | `suite:bitnet_gemm` | 2-bit packing, the reference GEMV, and the CPU kernels against it | 9 checks |
 | `suite:expert_merge` | permutation alignment recovers a permuted expert to float rounding, and refuses an unalignable family instead of averaging it silently | 4 cases |
 | `suite:prefetch_budget` | the paging byte/time model, and that over-fetching beats exact fetch at the proposal's own recall | table |
+| `suite:exodus` | the distillation specification's arithmetic: rotation identity and direction, ternary SQNR, top-k renormalisation against the engine, halting, KL loss scaling, head slicing | 36 checks |
 | `cli:version`, `cli:info` | the CLI starts, prints a banner, reads config, exits 0 on a host with no pack | smoke |
 | `docs:links` | every relative Markdown link in `README.md` and `docs/` resolves | 51 links, 17 files |
 
