@@ -156,24 +156,27 @@ so that cap cannot come back.
 ## the cost in wall-clock, and where the index starts to pay (`index.py`)
 
 ```bash
-python -m tools.fingerprint.index --selftest    # 7 checks
+python -m tools.fingerprint.index --selftest    # 9 checks
 python -m tools.fingerprint.index               # the crossover table: same setting, four code widths
 ```
 
-A candidate count is not a clock. Gathering cells costs a `searchsorted` per probed key (93 at radius 3, `p=8`), a
-concatenate and a sort; the full arm costs one matmul of `N x D`. `index.py` builds the keys once and times both arms on
-the same queries, and the outcome is a **crossover**, not a win:
+A candidate count is not a clock. Gathering cells costs a search and a gather; the full arm costs one matmul of `N x D`.
+`index.py` builds the keys once and times both arms on the same queries, and the outcome is a **crossover**, not a win.
 
-| corpus | N | full 20-NN | probe index | ratio | scanned |
+The first version searched the keys one at a time - 93 `searchsorted` calls at radius 3, `p=8` - which made the gather,
+not the distance work, the expensive part:
+
+| corpus | N | full 20-NN | index, one call per key | index, one call for all 93 | speedup |
 |---|---:|---:|---:|---:|---:|
-| 192 bits | 176 | 122 us | 875 us | 7.2x slower | 37% |
-| 1,024 bits | 176 | 1,001 us | 1,415 us | 1.4x slower | 38% |
-| 2,048 bits | 176 | 1,788 us | 1,341 us | **1.3x faster** | 37% |
-| 2,048 bits | 352 | 3,798 us | 1,420 us | **2.7x faster** | 28% |
+| 192 bits | 176 | 109 us | 875 us | 182 us | 0.6x (still loses) |
+| 1,024 bits | 176 | 748 us | 1,415 us | 413 us | **1.8x faster** |
+| 2,048 bits | 176 | 1,617 us | 1,341 us | 653 us | **2.5x faster** |
+| 2,048 bits | 352 | 3,330 us | 1,420 us | 967 us | **3.4x faster** |
 
-The fingerprint is 2,048 bits, so the index is on the winning side of the line the note cares about - and the win grows
-with corpus size, because the fixed probe cost does not. It was still worth measuring at 192 bits, where the same idea is
-eight times slower: had the check only asserted the favourable side, the regime in which the idea loses would be invisible.
+Batching the probe keys into one `searchsorted` moved the crossover from 2,048 bits down past 1,024, i.e. from "exactly
+where the fingerprint lives" to "everywhere above a tenth of its width". A check asserts the batched gather visits
+**exactly** the cells the loop visits - an optimisation that changes which cells are searched is a different index, not a
+faster one - and both sides of the remaining line are asserted, because at 192 bits the idea still loses.
 
 The `p=0, radius 0` row is the full router reached through the index (one cell, every training row) and reproduces its
 predictions exactly - which is what makes the timed comparison a comparison of two correct arms rather than of one.

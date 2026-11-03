@@ -63,10 +63,12 @@ Two negative results are worth as much as that one:
   for a *hash bucket* and not for a *probe ball*: what costs the 94% is the exact-match key, not the hashing.
 
   In wall-clock the probe ball pays only above a width: `tools/fingerprint/index.py` times the built index against the full
-  20-NN on the same queries and measures **7.2x slower at 192 bits, 1.4x slower at 1,024, 1.3x faster at 2,048 and 2.7x
-  faster at 2,048 bits with twice the corpus** (37%, 38%, 37%, 28% of the code scanned). Since the fingerprint is 2,048
-  bits and the probes' fixed cost does not grow with N, this is the regime the note measured in - but the crossover is a
-  property of the implementation, so it is reported as a table rather than assumed.
+  20-NN on the same queries and measures **1.8x faster at 1,024 bits, 2.5x at 2,048 and 3.4x at 2,048 with twice the
+  corpus** (38%, 37%, 28% of the code scanned), while at 192 bits it is still 1.7x slower. That table is a property of the
+  implementation and it moved once already: searching the probe keys one at a time cost **7.2x slower at 192 bits and 1.3x
+  faster at 2,048**, and batching the 93 lookups into one `searchsorted` moved the crossover from 2,048 bits down past
+  1,024. Since the fingerprint is 2,048 bits and the probes' fixed cost does not grow with N, the note's regime is the
+  winning side of both versions - but the line is worth measuring rather than assuming.
 - **Which bits you pick barely matters.** Random bit selection scores 0.2911 against 0.2928 for the learned selection
   at layer 15 (`ablate.log`), so the "learned" table was measuring the table, not the bit choice.
 

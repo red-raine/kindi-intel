@@ -38,17 +38,47 @@ class Index(object):
         self.rows = perm                              # candidate id -> row of ref_bits
         self.n = len(perm)
 
+    def _probe_keys(self, q_bits, radius):
+        qkey = int(C.key_of(q_bits[None, :], self.order, self.p)[0])
+        n = P.probe_count(self.p, radius)
+        return np.fromiter(P.probe_keys(qkey, self.p, radius), np.int64, count=n)
+
     def candidates(self, q_bits, radius, budget):
-        """Training rows in probe order, cut at the budget by whole cells. Returns (rows, scanned)."""
-        qkey = C.key_of(q_bits[None, :], self.order, self.p)[0]
+        """Training rows in probe order, cut at the budget by whole cells. Returns (rows, scanned).
+
+        One `searchsorted` over all probe keys, not one per key: at radius 3 and `p=8` that is 93 numpy calls turned into a
+        single vectorised one, which is the difference between the per-query cost being dominated by the gather or by the
+        interpreter. `candidates_loop` is the same search written the obvious way, and a check asserts the two agree
+        exactly - an optimisation that changes which cells are visited is a different index, not a faster one.
+        """
+        keys = self._probe_keys(q_bits, radius)
+        lo = np.searchsorted(self.keys, keys, "left")
+        hi = np.searchsorted(self.keys, keys, "right")
+        counts = hi - lo
+        if budget is not None:
+            cum = np.cumsum(counts)
+            take = int(np.searchsorted(cum, budget, "left")) + 1     # cells whose start is still under budget
+            lo, counts = lo[:take], counts[:take]
+        total = int(counts.sum())
+        if total == 0:
+            return np.zeros(0, np.int64), 0
+        starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        idx = np.repeat(lo - starts, counts) + np.arange(total)       # position inside each cell's slice
+        rows = self.rows[idx]
+        return np.sort(rows), total
+
+    def candidates_loop(self, q_bits, radius, budget):
+        """The reference form: a `searchsorted` per probe key, cells concatenated in order. Same answer, more calls."""
         out = []
-        for key in P.probe_keys(qkey, self.p, radius):
-            if budget is not None and len(out) and sum(len(c) for c in out) >= budget:
+        scanned = 0
+        for key in self._probe_keys(q_bits, radius):
+            if budget is not None and out and scanned >= budget:
                 break
             lo = int(np.searchsorted(self.keys, key, "left"))
             hi = int(np.searchsorted(self.keys, key, "right"))
             if hi > lo:
                 out.append(self.rows[lo:hi])
+                scanned += hi - lo
         if not out:
             return np.zeros(0, np.int64), 0
         rows = np.concatenate(out)
@@ -168,6 +198,22 @@ def t_probe_finds_a_bit_flip():
           "radius 0 -> %d, radius 1 -> %d" % (n0, n1))
 
 
+def t_vectorised_gather_matches_the_loop():
+    """The fast gather must visit the same cells as the obvious one - at every radius and budget, on real codes."""
+    c = R.synth_corpus(docs=8, positions=12, dim=192, nclass=20, seed=76, layer_signal=(0.5, 0.9))
+    bits = c.layer(1)
+    index = Index(bits, 8, seed=0)
+    bad = []
+    for q in range(0, len(bits), 7):
+        for radius in (0, 1, 2, 3):
+            for budget in (None, 8, 40):
+                fast, nf = index.candidates(bits[q], radius, budget)
+                slow, ns = index.candidates_loop(bits[q], radius, budget)
+                if nf != ns or not np.array_equal(fast, slow):
+                    bad.append((q, radius, budget, nf, ns))
+    check("index: the vectorised gather agrees with the loop exactly", not bad, "%d disagreements" % len(bad))
+
+
 def t_candidate_ids_are_training_rows():
     """The regression cell.py's identity test caught: ids index the training subset, never the full corpus."""
     c = R.synth_corpus(docs=6, positions=10, dim=64, nclass=10, seed=74, layer_signal=(0.9,))
@@ -187,11 +233,15 @@ def t_the_crossover_is_at_the_real_width():
     Asserting only the favourable side would have hidden the regime in which this whole idea loses.
     """
     narrow = R.synth_corpus(docs=10, positions=16, dim=192, nclass=40, seed=75, layer_signal=(0.5, 0.92))
+    middle = R.synth_corpus(docs=10, positions=16, dim=1024, nclass=40, seed=75, layer_signal=(0.5, 0.92))
     wide = R.synth_corpus(docs=10, positions=16, dim=2048, nclass=40, seed=75, layer_signal=(0.5, 0.92))
     _, tf_n, ti_n, _ = timed_fold(narrow, 1, 8, 3, 96, repeats=2)
+    _, tf_m, ti_m, _ = timed_fold(middle, 1, 8, 3, 96, repeats=2)
     _, tf_w, ti_w, _ = timed_fold(wide, 1, 8, 3, 96, repeats=2)
     check("index: at 192 bits the full 20-NN is still the cheaper arm", tf_n < ti_n,
           "full %.1f us vs index %.1f us" % (1e6 * tf_n, 1e6 * ti_n))
+    check("index: at 1024 bits the vectorised gather already pays", ti_m < tf_m,
+          "index %.1f us vs full %.1f us (%.1fx)" % (1e6 * ti_m, 1e6 * tf_m, tf_m / ti_m))
     check("index: at 2048 bits the built index answers faster than the full 20-NN", ti_w < tf_w,
           "index %.1f us vs full %.1f us (%.1fx)" % (1e6 * ti_w, 1e6 * tf_w, tf_w / ti_w))
 
@@ -199,9 +249,10 @@ def t_the_crossover_is_at_the_real_width():
 def selftest():
     del PASS[:]
     for t in (t_zero_setting_is_the_router, t_budget_is_whole_cells, t_build_is_deterministic,
-              t_probe_finds_a_bit_flip, t_candidate_ids_are_training_rows, t_the_crossover_is_at_the_real_width):
+              t_probe_finds_a_bit_flip, t_vectorised_gather_matches_the_loop, t_candidate_ids_are_training_rows,
+              t_the_crossover_is_at_the_real_width):
         t()
-    expected = 7
+    expected = 9
     ok = len(PASS) == expected
     print("\n%d checks passed%s" % (len(PASS), "" if ok else " of %d - a check did not run" % expected))
     return 0 if ok else 1
