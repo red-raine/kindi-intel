@@ -149,6 +149,39 @@ so at batch 1 the read can never be hidden. The fix is not a faster I/O path, it
 5-6 tokens one expert's 9 ms read sits under 5-6 x 1.8 ms of compute and the pipeline is level. Streaming experts is a
 *batched* inference design; at batch 1 the expert set has to fit in RAM.
 
+### Prefetch depth cannot fix this, and the numbers say why
+
+The next proposal attacked the same problem from the scheduling side: predict layer L+1's experts from layer L's
+hidden state, predict the next token from an n-gram table, and submit `io_uring` reads early so the transfer overlaps
+compute. Its latency budget assumes a cold expert read is **15-35 us**.
+
+That unit is off by three orders of magnitude, and the arithmetic is not close. 14.7 MB in 18-25 us is **590-820 GB/s**,
+which is 100x a PCIe Gen4 x4 link (~8 GB/s) and 500x what this host measures. At line rate 14.7 MB cannot arrive in
+less than 1.8 ms; measured, it is 9.5 ms. To have a 35 us transfer at 1.63 GB/s the expert would have to be **57 KB** -
+at which size the design is correct, and which is a different model from this one.
+
+The deeper problem is that prefetching hides *latency*, and there is no latency left to hide once the link is
+saturated: the steady state is total bytes divided by bandwidth, which scheduling cannot change. Measured over one
+token's FFN expert stream (32 layers x 14.7 MB, 470 MB), at the two depths the proposal would use:
+
+| read pattern | throughput | 470 MB takes |
+|---|---:|---:|
+| depth 1 | 1.63 GB/s | 0.28 s |
+| depth 4 (four readers in flight) | 1.37 GB/s | 0.33 s |
+
+Deeper pipelining is **slightly worse**, and both are far above the 115 ms of GEMV compute they would feed. At top-2 the
+stream is ~940 MB per token, so the floor is **0.58 s/token** however the reads are scheduled, predicted or reordered.
+
+That also disposes of "mispredictions cost minimal CPU overhead beyond PCIe bus occupancy": on a bandwidth-bound stream
+a wasted read costs 9.5 ms of *link time* and directly displaces a useful one. And a prediction path that maps a
+speculated token to an expert as `token_id % num_experts` is not a prediction - it is a hash, with an expected hit rate
+of 1/num_experts.
+
+What does move the floor is changing the bytes or the work per byte, which is what the earlier sections already found:
+a **batch of 5-6 tokens** puts one expert's 9.5 ms under its own compute, and **smaller experts** (clustering 64 experts
+into 12, or a rank cut) divide the read by five and drop the break-even batch to about one. Both are model-side changes;
+no amount of queue depth substitutes for them.
+
 ### The disk claims are the least trustworthy numbers here
 
 Every figure in that section is what a process sees when it asks for these bytes, not a device characteristic. The HDD
