@@ -125,3 +125,43 @@ fp16 safetensors (nine shards, 40 GB) for the Transformers runtime, 24 layers wi
 131,072-token context, and a custom architecture whose reference implementation needs Triton and FlashAttention.
 There is no GGUF, no `PTQ1_0` file, and `kindi convert` reads GGUF only, so nothing in this repository can load it -
 the ternary tags on its card describe the training, not the file.
+
+## The DeepSeek expert pack: nothing to load, one thing to take
+
+[`meshapplied/DeepSeek-V4.1-Flash-Ternary-Latest`](https://huggingface.co/meshapplied/DeepSeek-V4.1-Flash-Ternary-Latest)
+is the same idea at a different scale, and it is not convertible here: 40 shards of fp16 safetensors (about 140 GB),
+no GGUF, `qwen35` nowhere in sight, and a custom runtime (`goethe`'s `ternary_runtime` on SGLang) that unpacks it.
+Its `ternary_config.json` names the format - `ternary-g128-hadamard-gptq`, group 128, `pack_layout: w123`, hidden
+5120, intermediate 2304 - which is the family this engine already lives in: a Hadamard rotation folded into the
+weights, ternary codes in 128-weight groups, one scale a group. The difference is scope. It ships **routed experts
+only**; attention, router, shared experts, Engram and the draft model stay in the base checkpoint, and unused
+experts fall back to FP4 from it. That is why it is 140 GB of shards but 40 files - one layer a file, with a
+`manifest-layer-NN.json` beside it.
+
+What is worth taking is not the format but the accounting. The repository carries three JSON files that answer a
+question this repository could not answer before:
+
+| file | what it holds |
+|---|---|
+| `nll-eval.json` | teacher-forced NLL over a held-out corpus, per domain, with token counts |
+| `nll-reference.json` | the same walk for the reference (FP4) model, so the ternary cost is a subtraction |
+| `nll-walk.json` | calibration and held-out NLL, and the two digests |
+
+Both carry `code_sha256` and `corpus_sha256`. That is the part that matters: an NLL means nothing without saying
+which text produced it and which code computed it, and their card's numbers (overall 0.7646 against the FP4
+reference's 0.5628, so +0.2018; by domain code +0.105, math +0.086, general +0.415) are only comparable because
+those digests pin the corpus.
+
+`tools/nll.py` is that walk for a Kindi pack, writing the same key names so the artefacts sit in the same shape:
+
+```bash
+python -m tools.nll --pack PACK --corpus DIR --json out.json          # a domain per subdirectory
+python -m tools.nll --pack PACK --corpus DIR --reference ref.json     # and the subtraction
+```
+
+On the 2B pack it reports, over 133 tokens of two domains, code 1.1164 and prose 4.6979 nats for 2.9475 overall -
+and repeats to the digit. The number to check first is the one it prints beside that: chance is `ln(248320)` = 12.42
+nats, which is also what a scoring loop aligned one token off will produce. Two limits are worth knowing before
+reading a delta off it: the corpus in `nll-reference.json` upstream is not distributed, so their numbers and ours
+are not comparable to each other, only within their own corpus; and teacher-forced NLL needs one head evaluation a
+token, which is generation speed - minutes per hundred tokens on a 27B.
