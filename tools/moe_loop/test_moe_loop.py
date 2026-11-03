@@ -86,21 +86,32 @@ def test_split_router_sees_a_subvector():
 
 
 def test_dispatch_work():
+    """Row arithmetic is deterministic; the timing is not, unless it is repeated.
+
+    One call of this block is ~50 ms, and a single sample of it came back 59.7 ms for `mask` against 62.5 ms for
+    `index_add` on a busy machine - which failed the gate on a run where nothing had changed. Best-of-5 after a warm-up
+    is the measurement the claim needs; the row ratio below is the part that must hold exactly.
+    """
     x = torch.randn(512, 32)
     rows = {}
     times = {}
     for dispatch in ("mask", "index_add"):
         b = _block(loops=3, dispatch=dispatch)
         with torch.no_grad():
-            b(x)
+            b(x)                                    # warm-up, also allocates the cached tensors
             b.calls = b.rows = 0
-            t0 = time.perf_counter()
-            b(x)
-            times[dispatch] = time.perf_counter() - t0
+            best = float("inf")
+            for _ in range(5):
+                t0 = time.perf_counter()
+                b(x)
+                best = min(best, time.perf_counter() - t0)
+            times[dispatch] = best
         rows[dispatch] = b.rows
     assert rows["mask"] == 8 * rows["index_add"], \
         "the mask dispatch should do 8x the rows for 8 experts: %r" % rows
-    assert times["index_add"] < times["mask"], "the sparse dispatch was not faster on the host: %r" % times
+    assert times["index_add"] < times["mask"], \
+        "the sparse dispatch was not faster on the host (best of 5): mask %.1f ms, index_add %.1f ms" \
+        % (1e3 * times["mask"], 1e3 * times["index_add"])
 
 
 def test_logit_average_flattens():
