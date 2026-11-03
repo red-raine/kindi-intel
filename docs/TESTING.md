@@ -3,7 +3,7 @@
 One command runs everything this repository checks:
 
 ```bash
-python -m tools.selftest            # 15 ok, 6 skipped, 0 failed, ~50 s
+python -m tools.selftest            # 16 ok, 6 skipped, 0 failed, ~65 s
 python -m tools.selftest --verbose  # per-check timing, and every skip with its reason
 ```
 
@@ -28,6 +28,7 @@ CPU-only host, which is the case it most needs to cover.
 | `suite:fingerprint` | the 20-NN routing index: distance against brute force, folds that leak nothing, a planted layer recovered by tuning, interior k, and baselines that must lose | 17 checks |
 | `suite:fingerprint_cell` | cell-plus-NN: the single-cell identity against full 20-NN, a split cell respecting its budget, monotone cost, both probe regimes, and a selection rule that returns None rather than the best available | 12 checks |
 | `suite:fingerprint_probe` | multi-probe cells: the Hamming ball sizes and distinct keys, radius 3 actually reaching triples, p=0 as the full router, radius 1 beating an exact cell at the same budget, the budget bound, and the 95%-under-half-a-scan result with a strict bar that returns None | 15 checks |
+| `suite:fingerprint_index` | the built index: p=0 reproducing the full router exactly, whole-cell budgets, a one-bit neighbour invisible to radius 0 and found by radius 1, candidate ids confined to training rows, and the measured crossover - full 20-NN wins at 192 bits, the index wins at 2,048 | 7 checks |
 | `cli:version`, `cli:info` | the CLI starts, prints a banner, reads config, exits 0 on a host with no pack | smoke |
 | `docs:links` | every relative Markdown link in `README.md` and `docs/` resolves | 51 links, 17 files |
 

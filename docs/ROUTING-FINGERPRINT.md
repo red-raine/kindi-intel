@@ -61,6 +61,12 @@ Two negative results are worth as much as that one:
   the hit rate for **37%** of a scan (radius 3 is 93 of 256 cells). On three corpora with comparable reference strength the
   bar lands at 17%, 37% and 38% of a scan; on a fourth it lands at 55%, just outside half. So the compression verdict holds
   for a *hash bucket* and not for a *probe ball*: what costs the 94% is the exact-match key, not the hashing.
+
+  In wall-clock the probe ball pays only above a width: `tools/fingerprint/index.py` times the built index against the full
+  20-NN on the same queries and measures **7.2x slower at 192 bits, 1.4x slower at 1,024, 1.3x faster at 2,048 and 2.7x
+  faster at 2,048 bits with twice the corpus** (37%, 38%, 37%, 28% of the code scanned). Since the fingerprint is 2,048
+  bits and the probes' fixed cost does not grow with N, this is the regime the note measured in - but the crossover is a
+  property of the implementation, so it is reported as a table rather than assumed.
 - **Which bits you pick barely matters.** Random bit selection scores 0.2911 against 0.2928 for the learned selection
   at layer 15 (`ablate.log`), so the "learned" table was measuring the table, not the bit choice.
 

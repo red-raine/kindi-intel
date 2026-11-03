@@ -118,6 +118,31 @@ Radius 3 was silently a no-op in the first version - `probe_keys` stopped at pai
 radius 2's cells and the table read as if a wider probe bought nothing. The `radius 3 really visits triples` check exists
 so that cap cannot come back.
 
+## the cost in wall-clock, and where the index starts to pay (`index.py`)
+
+```bash
+python -m tools.fingerprint.index --selftest    # 7 checks
+python -m tools.fingerprint.index               # the crossover table: same setting, four code widths
+```
+
+A candidate count is not a clock. Gathering cells costs a `searchsorted` per probed key (93 at radius 3, `p=8`), a
+concatenate and a sort; the full arm costs one matmul of `N x D`. `index.py` builds the keys once and times both arms on
+the same queries, and the outcome is a **crossover**, not a win:
+
+| corpus | N | full 20-NN | probe index | ratio | scanned |
+|---|---:|---:|---:|---:|---:|
+| 192 bits | 176 | 122 us | 875 us | 7.2x slower | 37% |
+| 1,024 bits | 176 | 1,001 us | 1,415 us | 1.4x slower | 38% |
+| 2,048 bits | 176 | 1,788 us | 1,341 us | **1.3x faster** | 37% |
+| 2,048 bits | 352 | 3,798 us | 1,420 us | **2.7x faster** | 28% |
+
+The fingerprint is 2,048 bits, so the index is on the winning side of the line the note cares about - and the win grows
+with corpus size, because the fixed probe cost does not. It was still worth measuring at 192 bits, where the same idea is
+eight times slower: had the check only asserted the favourable side, the regime in which the idea loses would be invisible.
+
+The `p=0, radius 0` row is the full router reached through the index (one cell, every training row) and reproduces its
+predictions exactly - which is what makes the timed comparison a comparison of two correct arms rather than of one.
+
 ## To re-derive the real numbers
 
 The index needs fingerprints, which need a pack and a forward pass. `route_dump.py` in the temp directory is the script
