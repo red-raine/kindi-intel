@@ -1,0 +1,176 @@
+{
+  "note": "Hand-labelled sample for the validity pass. `contradictions` lists the assignment classes that are genuinely inconsistent, by the names the code writes; `tri` is the verdict a correct pass should reach for the case: false when some class is contradictory, true when the code is consistent and says at least one definite type, unknown when nothing definite is stated. The pass is deliberately stricter than pyright's inference: pyright accepts `x = 1` then `x = \"one\"` because it re-narrows an unannotated name, while this sample treats two unrelated definite types reaching one location as the defect the pass exists to report. `x = None` then `x = 1` is the Optional idiom and is clean. Two cases are expected to be missed without pyright (c14, and c11/c22 where only a class attribute declares a type), and each says so.",
+  "cases": [
+    {
+      "file": "c01_rebind_literal.py",
+      "contradictions": [
+        [
+          "x"
+        ]
+      ],
+      "tri": "false"
+    },
+    {
+      "file": "c02_alias_chain.py",
+      "contradictions": [
+        [
+          "x",
+          "y"
+        ]
+      ],
+      "tri": "false",
+      "why": "y is the same location as x through the alias"
+    },
+    {
+      "file": "c03_annotation_vs_literal.py",
+      "contradictions": [
+        [
+          "count"
+        ]
+      ],
+      "tri": "false"
+    },
+    {
+      "file": "c04_same_type_rebind.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c05_param_then_int.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c06_attribute_alias.py",
+      "contradictions": [
+        [
+          "box.n",
+          "read"
+        ]
+      ],
+      "tri": "false",
+      "why": "the attribute is one location; `read` is that location through an alias"
+    },
+    {
+      "file": "c07_tuple_unpack.py",
+      "contradictions": [
+        [
+          "b"
+        ]
+      ],
+      "tri": "false"
+    },
+    {
+      "file": "c08_clean_tuple.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c09_isinstance_agree.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c10_isinstance_conflict.py",
+      "contradictions": [
+        [
+          "alias",
+          "value"
+        ]
+      ],
+      "tri": "false"
+    },
+    {
+      "file": "c11_pyright_only.py",
+      "contradictions": [
+        [
+          "counter.count"
+        ]
+      ],
+      "tri": "false",
+      "why": "only the class body's annotation declares int; without pyright the pass has no claim at this line"
+    },
+    {
+      "file": "c12_for_loop_clean.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c13_conditional_int.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c14_subscript_conflict.py",
+      "contradictions": [
+        [
+          "d[k]"
+        ]
+      ],
+      "tri": "false",
+      "why": "subscript values are not tracked, so this is an expected miss"
+    },
+    {
+      "file": "c15_optional_none.py",
+      "contradictions": [],
+      "tri": "true",
+      "why": "None then a value is the Optional idiom, not a conflict"
+    },
+    {
+      "file": "c16_method_chain.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c17_bool_then_int.py",
+      "contradictions": [],
+      "tri": "true",
+      "why": "bool and int are related; nothing declared says otherwise"
+    },
+    {
+      "file": "c18_int_then_float.py",
+      "contradictions": [],
+      "tri": "true",
+      "why": "int and float are related; nothing declared says otherwise"
+    },
+    {
+      "file": "c19_same_name_two_scopes.py",
+      "contradictions": [],
+      "tri": "true"
+    },
+    {
+      "file": "c20_unrelated_pyright_error.py",
+      "contradictions": [],
+      "tri": "unknown",
+      "why": "the only pyright error is a call's arity, which is no evidence about assigned types"
+    },
+    {
+      "file": "c21_alias_annotation.py",
+      "contradictions": [
+        [
+          "alias",
+          "limit"
+        ]
+      ],
+      "tri": "false",
+      "why": "the annotation is declared on limit and the alias is the same location"
+    },
+    {
+      "file": "c22_pyright_through_alias.py",
+      "contradictions": [
+        [
+          "alias",
+          "counter.count"
+        ]
+      ],
+      "tri": "false",
+      "why": "pyright supplies the declared type, the alias carries the finding to both names"
+    },
+    {
+      "file": "c23_normalise_after_guard.py",
+      "contradictions": [],
+      "tri": "true",
+      "why": "the guard narrows the incoming value; the list is a replacement, not a second type in one read"
+    }
+  ]
+}

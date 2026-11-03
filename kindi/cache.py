@@ -677,8 +677,8 @@ class Runner(object):
         Only the CPU engine has the two-token pass (kc_step2: both tokens in one weight stream), and only a greedy
         request can use it: the pass returns greedy tokens, so a sampled request has nothing to verify a draft
         against. `drafter` replaces the n-gram drafter; `kindi spec-check` scripts one to make acceptance
-        deterministic. KINDI_CPU_SPEC=1 turns this on (default 0: the loop's stop path is covered by spec-check, but
-        the economics still have to be re-measured on the machine that runs it)."""
+        deterministic. KINDI_CPU_SPEC=1 turns this on. Default 0: measured through the server on the real pack it is
+        0.93-1.02x at agent-length prompts and 1.26-1.37x at short ones (docs/BENCHMARKS.md)."""
         self._draft, self._pending, self._spec = None, None, None
         if not greedy or os.environ.get("KINDI_CPU_SPEC", "0") == "0":
             return False
@@ -698,19 +698,22 @@ class Runner(object):
         """`step`, and when the n-gram's draft is confirmed, the token after that one too.
 
         The pass feeds both tokens, so the second one is queued here and comes out of the next call without touching
-        the engine: the loop must not step it again."""
+        the engine: the loop must not step it again.
+
+        `tok` goes into the drafter's history *before* the proposal, because the proposal is what follows `tok`: fed
+        the other way round, the drafter answers the previous token's question and the draft is always one behind
+        (measured: 0 of 84 drafts accepted on real requests, and 2 of 93 on a request that echoed the prompt)."""
         if self._pending is not None:
             nxt, self._pending = self._pending, None
             return nxt
         st = self._spec
+        self._draft.push(tok)
         d = self._draft.propose(1) if len(self.tokens) + 1 < self.eng.ctx else []
         st["passes"] += 1
         if not d:
-            self._draft.push(tok)
             return self.step(tok)
         st["drafted"] += 1
         nxt, ahead = self.eng.step2(tok, d[0], len(self.tokens))
-        self._draft.push(tok)
         if d[0] == nxt:                            # the draft was right: both tokens are in the state
             self.tokens += [tok, d[0]]
             self._draft.push(d[0])

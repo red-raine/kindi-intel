@@ -357,6 +357,8 @@ the recurrent state rather than only to the token.
 
 **Pass cost.** Two tokens in one pass cost 1.35x one token, so a pass buys 1.35 tokens' worth of time and returns
 1 + acceptance tokens. That makes the break-even acceptance **0.35** and the ceiling at perfect acceptance 1.48x.
+Re-timed on 2026-11-02 the pass reads 1.5x, which moves break-even to 0.5 and the ceiling to 1.33x; the serving
+measurement below is what the current numbers are.
 
 | | ms | note |
 |---|---:|---|
@@ -395,11 +397,49 @@ prompts (the prompt is the drafter's history), at 8 and 4 prompts per cell:
 | code (`kindi/cache.py`) | 48 | 0.753 (387/514) | 18.6 tok/s | 20.5 tok/s | +1.10x | 8/8 |
 | code (`kindi/cache.py`) | 256 | 0.719 (200/278) | 20.7 tok/s | 25.8 tok/s | +1.24x | 4/4 |
 
-Every generation was token-identical to plain greedy. Acceptance on natural text is **0.65-0.76, i.e. 1.9-2.2x the 0.35
-break-even**, on prose and code alike, so this is not a code-only win. The +1.27x median is also what the pass cost
-predicts: a pass returns 1 + acceptance tokens for 1.351x the cost of one token, so `(1 + 0.76)/1.351 = 1.30`, and the
-cells bracket 1.10x to 1.44x around it. Read the per-cell ratios as +-0.15 and the acceptance figures as exact - they
+Every generation was token-identical to plain greedy. Those four cells read **0.65-0.76, i.e. 1.9-2.2x the 0.35
+break-even**, on prose and code alike - and the next measurement shows that range belongs to the four windows rather
+than to natural text. The +1.27x median is also what the pass cost predicts: a pass returns 1 + acceptance tokens for
+1.351x the cost of one token, so `(1 + 0.76)/1.351 = 1.30`, and the cells bracket 1.10x to 1.44x around it. Read the per-cell ratios as +-0.15 and the acceptance figures as exact - they
 are deterministic for the same text.
+
+A re-run of the `prose 48` cell on 2026-11-02 gives **1.051x at the same 0.764 acceptance** (381/499 drafted tokens,
+the identical count), so the prediction no longer holds on this host: the pass measured 1.5x a step rather than 1.351x.
+The acceptance reproduced exactly and the ratios did not, which is the whole argument for the serving measurement
+below - a speed-up claim about this feature has to be re-timed, not re-read.
+
+**Seven files, one prompt length: 0.36-0.82.** The same pack, the same two arms, 96 new tokens a prompt and two
+prompts of 272 tokens cut from one file of each kind - `kindi bench-spec FILE --tokens 96 --prompts 2 --prompt-len
+272`, which reproduces a cell to the token (the sweep below and the CLI both read `kindi/cpu.py` as 45/96):
+
+| file | kind | acceptance | plain | spec | | identical |
+|---|---|---:|---:|---:|---:|---:|
+| `docs/CPU-PERF-2026.md` | prose | 0.822 (83/101) | 20.74 tok/s | 33.68 tok/s | 1.62x | 2/2 |
+| `docs/BENCHMARKS.md` | prose | 0.814 (83/102) | 22.60 tok/s | 23.95 tok/s | 1.06x | 2/2 |
+| `install.sh` | shell | 0.786 (77/98) | 20.46 tok/s | 30.64 tok/s | 1.50x | 2/2 |
+| `docs/TROUBLESHOOTING.md` | prose | 0.736 (39/53) | 24.60 tok/s | 30.86 tok/s | 1.25x | 1/1 |
+| `kindi/kcpu.c` | C | 0.612 (63/103) | 18.87 tok/s | 33.15 tok/s | 1.76x | 2/2 |
+| `kindi/cpu.py` | Python | 0.469 (45/96) | 28.68 tok/s | 20.91 tok/s | 0.73x | 2/2 |
+| `README.md` | prose | 0.359 (37/103) | 26.73 tok/s | 19.39 tok/s | 0.73x | 2/2 |
+
+`docs/TROUBLESHOOTING.md` is too short for a second 272-token window at this stride, so it contributes one prompt. The
+median is 0.74 and two cells lose time outright. Prompt length does not rescue it either - the same two files over
+four lengths:
+
+| file | 32 | 128 | 272 | 512 |
+|---|---:|---:|---:|---:|
+| `README.md` | 0.304 (24/79) | 0.710 (66/93) | 0.359 (37/103) | 0.557 (59/106) |
+| `kindi/cpu.py` | 0.943 (83/88) | 0.804 (78/97) | 0.469 (45/96) | 0.729 (70/96) |
+
+`README.md` moves from 0.30 to 0.71 with nothing changed but the cut point, and `kindi/cpu.py` reads 0.943 at 32 tokens
+and 0.469 at 272. So **the 0.65-0.76 range describes four windows, not prose and not this model**: what reproduces
+exactly is a cell - same file, same prompt length, same offsets - and the serving sweep below had already shown the
+same thing on real traffic at 269-273 tokens, 0.200 to 0.867. That is also the case for a guard rather than a fixed
+`KINDI_CPU_SPEC=1`: speculate while recent acceptance clears the break-even, not unconditionally.
+
+Only one model is measured here. There is no second ternary pack on this machine, and the GGUFs beside it (Mixtral
+8x22B Q8, Qwen3-Coder-30B-A3B Q2_K, phi-2 Q4_K_M) are llama.cpp quants that `kindi convert` refuses by architecture
+(`expected a qwen35 or Gemma 4 GGUF`), so whether the spread holds on another model is open.
 
 The earlier version of this table read +1.11x to +1.35x at 0.75-0.87 acceptance, from a harness that estimated the
 prefill with a separate timed read and subtracted it. At 48-token prompts prefill is a quarter of the arm's time, so
@@ -413,8 +453,9 @@ tokens in 3.76 s on one prompt and 7.92 s on the next. The re-run of that cell g
 has swung 14-25 tok/s within one session; that is why the ratios move and why a single cell is not evidence.
 
 **Decision: wired into the serving loop, off by default (`KINDI_CPU_SPEC=1` turns it on).** The acceptance data
-removes the numerical doubt - real text is 1.9-2.2x the break-even, and the one-token draft did not change the output
-in any generation run here. What blocked the default was not decode economics but the stop path: the server's token
+removes the numerical doubt about the mechanism - it is deterministic, it reproduces to the draft, and the one-token
+draft did not change the output in any generation run here - but not the doubt about the average: the same text reads
+0.36 to 0.82 depending on where the window is cut. What blocked the default was not decode economics but the stop path: the server's token
 loop handles EOS, stop strings, `</think>` boundaries and tool-call parsing one token at a time, so a two-token pass
 has a second token that may have to be thrown away.
 
@@ -425,10 +466,43 @@ test: a stop by token id, a stop by stop string, a stop one token later, a run w
 same request through `server.Kindi.generate` with the pass off and on. Removing the rollback from `spec_stop` makes
 the two stop cases fail while the tokens still match - the failure mode below, now caught.
 
-It stays off by default for two reasons, both about evidence rather than mechanism. The economics above were measured
-on this host and should be re-read on the machine that serves. And two loop paths still feed tokens of their own: a
-thinking budget, and the loop stop that sets one, close the thinking mid-stream - so speculation is skipped for those
-requests rather than restructured around them.
+**Measured end to end, through the server, on the real pack (2026-11-02).** `kindi serve` on `bonsai-2b`, greedy
+requests over HTTP with `max_tokens 96`, the decode time taken from the server's own `done: N tokens in Ss` line so
+the prompt read is excluded, three repetitions per request. All 36 generations were token-identical between the arms.
+Prompts are token windows of real files, so the server tokenises them with the pack's tokenizer:
+
+| request | prompt | plain tok/s | spec tok/s | | acceptance |
+|---|---:|---:|---:|---:|---:|
+| prose, continue | 273 | 22.09 | 20.65 | 0.94 | 0.867 (39/45) |
+| prose, summarise | 269 | 20.00 | 18.60 | 0.93 | 0.619 (26/42) |
+| code, continue | 273 | 21.59 | 22.09 | 1.02 | 0.725 (37/51) |
+| code, summarise | 269 | 17.95 | 17.95 | 1.00 | 0.200 (6/30) |
+| prose, continue | 65 | 20.00 | 25.26 | **1.26** | 1.000 (24/24) |
+| code, continue | 65 | 20.77 | 28.42 | **1.37** | 0.962 (25/26) |
+
+**Stays off by default, now on this evidence.** At the prompt lengths an agent client sends (269-273
+tokens) the pass is a wash - 0.93x to 1.02x, two cells below 1 - and what gain there is sits at 65 tokens, where the
+drafter's history holds most of what the model is about to repeat. The mean over the six cells is +1.09x, and those
+two short-prompt cells are what carry it. The cause is the pass cost, and it is not the
+serving loop: re-running `kindi bench-spec README.md --tokens 128 --prompts 8 --prompt-len 48` on the same host the
+same day gives **1.051x at 0.764 acceptance**, where the 1.351x constant in the table above predicts 1.30x, and timing
+`step` against `step2` through the same `Engine` from starting positions 65 / 273 / 700 gives **1.51x / 1.57x / 1.49x**,
+with a rollback at 2.6 ms. The plain arm is as fast as it was (20.94 tok/s today against 18.2-22.4 in that table), so
+what moved is the pass, not the machine. At ~1.5x, break-even acceptance is 0.5 rather than 0.35 and the ceiling 1.33x
+rather than 1.48x, which is also why the 0.867-acceptance cell returns 0.94x and not the 1.1x the old constant predicts.
+Whether the pass slowed with a kernel change or with this VM's clocks is not separated here - both arms of every
+measurement above ran in the same session, so the ratios hold even where the absolute rates do not.
+
+The same sweep found a defect. `Runner.spec_next` proposed *before* handing the drafter the token it had just emitted,
+so the n-gram answered the previous token's question: acceptance was 0 of 84 on this request set and 2 of 93 on a
+request that echoed the prompt verbatim, and the pass was a 0.70x mean slowdown. Feeding `tok` first moved those same
+cells to the table above. `kindi spec-check` could not catch it - its scripted drafter is indexed by how many tokens it
+has been fed, not by their content - and running `kindi --pack DIR spec-check` against the real pack afterwards caught
+a second assumption, that a greedy run does not repeat a token: it does (`198 3 16 15 15 59 4 3`), so the stop-by-id
+case fired at the wrong index and the test now picks ids that do not occur earlier in the run.
+
+One caveat is unchanged: two loop paths still feed tokens of their own. A thinking budget, and the loop stop that sets
+one, close the thinking mid-stream, so speculation is skipped for those requests rather than restructured around them.
 
 **Why the state snapshot matters.** A rejected draft has to roll back to the state after the pass's first token, so
 `kc_step2` snapshots every GDN layer between the two tokens (19 MB, copied by one thread under `omp single`). The

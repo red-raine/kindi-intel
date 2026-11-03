@@ -272,7 +272,7 @@ of 295 agent turns were the same). The details are in [docs/PROMPT-CACHE.md](doc
 
 | | |
 |---|---|
-| `kindi convert MODEL.gguf [--out DIR] [--force]` | build the weight pack (default: the configured `pack`) |
+| `kindi convert MODEL.gguf [--out DIR] [--force] [--paircodes]` | build the weight pack (default: the configured `pack`); `--paircodes` adds `pcodes.bin`, the expert staging file a paged MoE pack copies from |
 | `kindi fast-head [--clusters N]` | build the fast-head cluster file (stop the server first: needs ~300 MB of GPU memory) |
 | `kindi verify` | check greedy output against llama.cpp's reference |
 | `kindi bench` | speed at several context positions, prompt read speed, GPU memory |

@@ -9,6 +9,14 @@ session uses a few MB, which is fine; another CUDA or Vulkan program is not). Fr
 **`needs the PTQ1_0 GGUF`.** Kindi reads the PTQ1_0 files of Ternary-Bonsai-2-2B, -4B, -9B and -27B. The Q2_0 / PQ2_0
 files hold the same models in another format, and Kindi does not support them yet.
 
+**`kindi-cpu: the pack at ... does not match the model layout`.** The CPU engine reads its tensors by name, and those
+names come from the GGUF the pack was converted from, so a pack for another model - or one written by an older
+`kindi convert` - is refused at load instead of failing later. The message lists what is missing, from which index,
+against how many tensors the layout reads, and how many the pack holds that the layout never reads. Convert the
+matching GGUF again: `kindi convert MODEL.gguf DIR`. A pack missing whole files (no `index.json`,
+`bcodes_index.json`, `bcodes.bin`) is not a CPU pack at all: a Gemma 4 or Nemotron pack holds `model_path` and is
+served by the GPU backend.
+
 **CUDA errors such as `no kernel image is available` or `CUDA driver version is insufficient`.** Use the NVIDIA 470
 driver and the CUDA 10.2 stack in the Docker image.
 

@@ -9,12 +9,14 @@ model: the weights are noise, so the logits mean nothing.
   python -m kindi.synthpack /tmp/tinypack            # 3 layers, width 256, ffn 512
   python -m kindi.synthpack /tmp/tinypack --layers 5 --width 512
 """
+import contextlib
 import json
 import os
 
 import numpy as np
 
 from . import __version__, quant
+from .cpu import is_expert, pair_bytes
 
 DIMS = {"layers": 3, "width": 256, "ffn": 512, "heads": 4, "kv_heads": 2, "head_dim": 64, "groups": 2,
         "state_size": 64, "gdn_inner": 128, "rope_dim": 32, "rope_base": 1e4, "full_attention_interval": 2}
@@ -31,7 +33,10 @@ def _dims(**kw):
 
 
 def build(out_dir, seed=7, log=print, **kw):
-    """write the pack and return (directory, quantised ternary tensors) - the tests compare against the latter"""
+    """write the pack and return (directory, quantised ternary tensors) - the tests compare against the latter
+
+    `paircodes=True` also writes pcodes.bin, the pair-code variant: one expert matrix's GEMV form as bytes, so a paged
+    expert stages by memcpy instead of rebuilding it (see `cpu.pair_bytes`)."""
     d = _dims(**kw)
     nexp, nact = int(kw.get("experts", 0)), int(kw.get("experts_active", 2))
     rng = np.random.RandomState(seed)
@@ -90,8 +95,11 @@ def build(out_dir, seed=7, log=print, **kw):
     index = {"tensors": {}, "base": 0, "hadamard": {}}
     bindex = {"tensors": {}}
     bc_off = dpm_off = f32_off = 0
+    want_pc = bool(kw.get("paircodes"))
+    pc_off = n_pc = 0
     with open(os.path.join(out_dir, "bcodes.bin"), "wb") as fb, \
-            open(os.path.join(out_dir, "dpm.bin"), "wb") as fd, open(os.path.join(out_dir, "f32.bin"), "wb") as ff:
+            open(os.path.join(out_dir, "dpm.bin"), "wb") as fd, open(os.path.join(out_dir, "f32.bin"), "wb") as ff, \
+            (open(os.path.join(out_dir, "pcodes.bin"), "wb") if want_pc else contextlib.nullcontext()) as fp:
         for name in sorted(tern):
             a, rows = quant._pad8(np.ascontiguousarray(tern[name], dtype=np.float32))
             codes, sc, deq = quant.quantise(a, 128)
@@ -101,6 +109,13 @@ def build(out_dir, seed=7, log=print, **kw):
             index["tensors"][name] = {"dims": list(tern[name].shape), "type": quant.PTQ1_0, "folded": False,
                                       "rows": rows, "ne0": a.shape[1], "bc_off": bc_off, "dpm_off": dpm_off}
             bindex["tensors"][name] = {"bc_off": bc_off, "dpm_off": dpm_off, "rows": rows, "ne0": a.shape[1]}
+            if want_pc and is_expert(name):
+                Wb, Sb = pair_bytes(codes, sc, rows, a.shape[1])
+                fp.write(Wb)
+                fp.write(Sb)
+                bindex["tensors"][name]["pc_off"] = pc_off
+                pc_off += len(Wb) + len(Sb)
+                n_pc += 1
             bc_off += codes.shape[0] * rows
             dpm_off += sc.shape[0] * rows * 2
         for name in sorted(flt):
@@ -130,6 +145,8 @@ def build(out_dir, seed=7, log=print, **kw):
                                                  "head_dim", "rope_dim", "state_size", "gdn_inner", "rope_base",
                                                  "full_attention_interval")},
                                **{"experts": nexp, "experts_active": nact} if nexp else {})}
+    if n_pc:
+        man["paircodes"] = {"tensors": n_pc, "bytes": pc_off}
     with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:
         json.dump(man, f, indent=2)
     (log or (lambda *a: None))("kindi synthpack: %d ternary + %d f32 tensors -> %s (layers %d, width %d%s)"

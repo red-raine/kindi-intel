@@ -26,6 +26,127 @@ PU8 = ctypes.POINTER(ctypes.c_uint8)
 PU16 = ctypes.POINTER(ctypes.c_uint16)
 
 
+class _Index(dict):
+    """A pack index whose missing key names the tensor and the file, not a bare KeyError.
+
+    `_layout_problem` reports a whole mismatch before the build starts; this is the backstop for a name the build
+    reads and that list does not know about (a tensor added to the loop and not to `_pack_names`).
+    """
+
+    def __init__(self, data, pack, where):
+        dict.__init__(self, data)
+        self.pack, self.where = pack, where
+
+    def __getitem__(self, k):
+        try:
+            return dict.__getitem__(self, k)
+        except KeyError:
+            raise SystemExit("kindi-cpu: %s has no %s, which the layout reads by name.\n"
+                             "  The pack does not match this model; `kindi info --pack %s` shows what it is."
+                             % (os.path.join(self.pack, self.where), k, self.pack))
+
+
+def _pack_names(d, head):
+    """The tensor names the CPU layout reads, split by the file they live in: ternary codes, and f32 vectors.
+
+    The other half of the layout is the wiring in `Engine.__init__`. A pack from another model, another variant of
+    the same family, or an older `kindi convert` differs in these names, and looked up one at a time they end in a
+    KeyError from the middle of the build.
+    """
+    tern, f32 = ["token_embd.weight", head], ["output_norm.weight"]
+    nexp = int(d.get("experts") or 0)
+    interval = max(1, int(d["full_attention_interval"]))
+    for il in range(int(d["layers"])):
+        p = "blk.%d." % il
+        f32 += [p + "attn_norm.weight", p + "post_attention_norm.weight"]
+        if nexp:                                     # a Mixture-of-experts FFN: a router and nexp expert triples
+            tern.append(p + "moe_router.weight")
+            for e in range(nexp):
+                tern += [p + "moe_gate.e%d.weight" % e, p + "moe_up.e%d.weight" % e, p + "moe_down.e%d.weight" % e]
+        else:
+            tern += [p + "ffn_gate.weight", p + "ffn_up.weight", p + "ffn_down.weight"]
+        if (il + 1) % interval == 0:                 # a full-attention layer, else a gated-DeltaNet one
+            tern += [p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight", p + "attn_output.weight"]
+            f32 += [p + "attn_q_norm.weight", p + "attn_k_norm.weight"]
+        else:
+            tern += [p + "attn_qkv.weight", p + "attn_gate.weight", p + "ssm_out.weight"]
+            f32 += [p + "ssm_beta.weight", p + "ssm_alpha.weight", p + "ssm_dt.bias", p + "ssm_a",
+                    p + "ssm_conv1d.weight", p + "ssm_norm.weight"]
+    return tern, f32
+
+
+def _few(names):
+    """the first few names, then how many are left, so one line stays one line"""
+    names = list(dict.fromkeys(names))
+    return ", ".join(names[:4]) + (" and %d more" % (len(names) - 4) if len(names) > 4 else "")
+
+
+def is_expert(name):
+    """a matrix of one MoE expert - the three per expert that can be paged; the router is resident"""
+    return ".moe_gate.e" in name or ".moe_up.e" in name or ".moe_down.e" in name
+
+
+def _pack_files(pack):
+    """The files a CPU pack holds. A missing one means the directory is not a CPU pack at all, which is a different
+    answer from a tensor mismatch and has a different fix."""
+    need = ["kindi_pack.json", "index.json", "bcodes_index.json", "bcodes.bin", "dpm.bin", "f32.bin", "vocab.json"]
+    miss = [n for n in need if not os.path.isfile(os.path.join(pack, n))]
+    if miss:
+        raise SystemExit("kindi-cpu: %s is not a Kindi CPU pack - it has no %s.\n"
+                         "  A pack is written by `kindi convert MODEL.gguf PACK_DIR`. A Gemma 4 or Nemotron pack holds\n"
+                         "  model_path and is served by the GPU backend, not by KINDI_DEVICE=cpu."
+                         % (pack, _few(miss)))
+
+
+def _layout_problem(pack, man, d, bi, idx, head, widths):
+    """None when the pack holds every tensor this layout reads, else the message to stop with.
+
+    A bare KeyError says which dict was missing a key and nothing about why: not whether the pack is for another
+    model, which file it is missing from, or that the rest of the pack is intact. This answers those.
+    """
+    tern, f32 = _pack_names(d, head)
+    miss_t = [n for n in tern if n not in bi]
+    miss_f = [n for n in f32 if n not in idx]
+    miss_s = [w for w in sorted(set(widths))
+              if not os.path.isfile(os.path.join(pack, "signs_%d.f32" % w))]
+    known = set(tern)
+    extra = [n for n in bi if n not in known]
+    # a Mixture-of-experts layer is taken by name in the build, so a manifest and a pack that disagree about whether
+    # the model has experts would fail on an empty expert table rather than on a name
+    nexp = int(d.get("experts") or 0)
+    routers = [n for n in bi if n.endswith(".moe_router.weight")]
+    confused = bool(routers) != bool(nexp)
+    if not (miss_t or miss_f or miss_s or confused):
+        return None
+    lines = ["kindi-cpu: the pack at %s does not match the model layout." % pack,
+             "  pack: %s - %d layers, width %d, ffn %d, %d heads, attention every %d layers, %s"
+             % (man.get("model") or "unnamed", d["layers"], d["width"], d["ffn"], d["heads"],
+                d["full_attention_interval"],
+                "%d experts" % d["experts"] if d.get("experts") else "dense ffn")]
+    if miss_t:
+        lines.append("  bcodes_index.json is missing %d of the %d ternary tensors: %s"
+                     % (len(miss_t), len(tern), _few(miss_t)))
+    if miss_f:
+        lines.append("  index.json is missing %d of the %d f32 tensors: %s" % (len(miss_f), len(f32), _few(miss_f)))
+    if miss_s:
+        lines.append("  the fold signs are missing: %s" % _few(["signs_%d.f32" % w for w in miss_s]))
+        lines.append("  (their widths are `width`, `gdn_inner`, `heads*head_dim` and `ffn` from the manifest)")
+    if extra:
+        lines.append("  the pack holds %s this layout never reads: %s"
+                     % ("1 tensor" if len(extra) == 1 else "%d tensors" % len(extra), _few(extra)))
+    if confused:
+        lines.append("  the manifest says %s, the pack holds %s: its dimensions are not its own"
+                     % ("%d experts" % nexp if nexp else "no experts",
+                        "1 MoE router tensor" if len(routers) == 1 else "%d MoE router tensors" % len(routers)))
+    if miss_t or miss_f or confused:
+        lines.append("  Tensor names come from the GGUF the pack was converted from: convert the matching one again")
+        lines.append("  with `kindi convert MODEL.gguf DIR` (DIR is the path above); `kindi info --pack DIR` shows a pack.")
+    else:
+        lines.append("  The signs are written beside the codes by `kindi convert`: the pack is incomplete, or its")
+        lines.append("  dimensions are not the ones its weights were written for.")
+    return "\n".join(lines)
+
+
 class Mat(ctypes.Structure):
     _fields_ = [("W", PU8), ("S", PF), ("R", ctypes.c_int), ("C", ctypes.c_int)]
 
@@ -117,14 +238,51 @@ def _p(a, t=PF):
     return a.ctypes.data_as(t)
 
 
+def pair_scales(sc):
+    """(G, R) fp16 scales -> the GEMV order as float32, [R/8][G][8]: 8 rows' scales a group, contiguous per block"""
+    G, R = sc.shape
+    return np.ascontiguousarray(np.asarray(sc).reshape(G, R // 8, 8).transpose(1, 0, 2).astype(F32))
+
+
 def pair_mat(bc, dp, rec):
     """one ternary matrix from the pack's bytes: pair codes [R/8][C/128][64] and the row-block scales"""
     R, C = rec["rows"], rec["ne0"]
     ns, G = C // 4, C // 128
     o, q = rec["bc_off"], rec["dpm_off"] // 2
     W = paircodes(bc[o:o + ns * R], R, C)
-    S = np.ascontiguousarray(np.asarray(dp[q:q + G * R]).reshape(G, R // 8, 8).transpose(1, 0, 2).astype(F32))
+    S = pair_scales(np.asarray(dp[q:q + G * R]).reshape(G, R))
     return W, S
+
+
+def pair_bytes(codes, sc, R, C):
+    """The staged form of one ternary matrix as bytes, built once at convert time.
+
+    A paged expert is copied into its slot when it is selected, and `pair_mat` takes milliseconds a matrix to build
+    that form from the pack's own bytes. Written down, the same bytes stage with two memcpys. `codes` is the pack's
+    layout (C//4, R) and `sc` its scales (C//128, R) fp16 - the two arrays `kindi convert` and `synthpack` stream.
+    """
+    W = paircodes(np.ascontiguousarray(codes), R, C)
+    S = pair_scales(np.ascontiguousarray(sc))
+    return W.tobytes(), S.tobytes()
+
+
+def _pair_len(rec):
+    """bytes one tensor takes in pcodes.bin: its pair codes, then its float32 scales"""
+    R, C = rec["rows"], rec["ne0"]
+    return R * (C // 4) + (C // 128) * (R // 8) * 8 * 4
+
+
+def _pair_views(pc, rec):
+    """One tensor's staged bytes out of pcodes.bin, as views: no conversion, two slices.
+
+    The layouts are the ones pair_mat builds - [R/8][C/128][64] words and [R/8][C/128][8] float32 - so a slot is
+    filled by copying these two arrays and nothing else.
+    """
+    R, C = rec["rows"], rec["ne0"]
+    o, nw = rec["pc_off"], R * (C // 4)
+    W = np.frombuffer(pc, dtype=np.uint32, count=nw // 4, offset=o)
+    S = np.frombuffer(pc, dtype=F32, count=(_pair_len(rec) - nw) // 4, offset=o + nw)
+    return W.reshape(R // 8, C // 128, 64), S.reshape(R // 8, C // 128, 8)
 
 
 class Engine(object):
@@ -132,9 +290,10 @@ class Engine(object):
         t0 = time.time()
         if threads:
             os.environ["OMP_NUM_THREADS"] = str(threads)
-        self.lib = _lib()
         self.pack = pack
         self.ctx = int(ctx)
+        _pack_files(pack)                 # before _lib(): a wrong pack should not start a kernel build
+        self.lib = _lib()
         man = json.load(open(os.path.join(pack, "kindi_pack.json")))
         d = self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
         self.HB = int(man.get("hadamard_block", 512))
@@ -147,6 +306,11 @@ class Engine(object):
         interval = d["full_attention_interval"]
         idx = json.load(open(os.path.join(pack, "index.json")))["tensors"]
         bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        problem = _layout_problem(pack, man, d, bi, idx, self.head_name,
+                                  [D, NV * HK, NH * HD, NFF] + ([NFF // 2] if d.get("experts") else []))
+        if problem:
+            raise SystemExit(problem)
+        idx, bi = _Index(idx, pack, "index.json"), _Index(bi, pack, "bcodes_index.json")
         bc = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
         dp = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.float16, mode="r")
         self.keep = []                    # every array the C side points at
@@ -154,9 +318,10 @@ class Engine(object):
         def keep(a):
             self.keep.append(a)
             return a
-        mats = {}
+        mats = _Index({}, pack, "bcodes_index.json")
         self.moe_arrays = []
         self.pager = None                 # set when experts are paged rather than resident
+        self.pc = None                    # pcodes.bin, when the pack carries pair codes (enable_paging maps it)
         for name, rec in bi.items():
             W, S = pair_mat(bc, dp, rec)
             mats[name] = Mat(_p(keep(W), PU8), _p(keep(S)), rec["rows"], rec["ne0"])
@@ -497,18 +662,37 @@ class Engine(object):
         p["next"][layer] = (k + 1) % len(ins)
         arr = p["arr"][layer]
         for j, rec in enumerate(p["src"][(layer, expert)]):
-            W, S = pair_mat(big["bc"], big["dp"], rec)
             dw, ds = p["slots"][layer][k][j]
-            np.copyto(dw, W)
-            np.copyto(ds, S)
+            if self.pc is not None and "pc_off" in rec:
+                W, S = _pair_views(self.pc, rec)      # the pair-code pack: two memcpys, no conversion
+            else:
+                W, S = pair_mat(big["bc"], big["dp"], rec)
+            np.copyto(dw, W.reshape(dw.shape))
+            np.copyto(ds, S.reshape(ds.shape))
             arr[3 * expert + j] = Mat(_p(dw, PU8), _p(ds), rec["rows"], rec["ne0"])
 
     def enable_paging(self):
-        """wire the fetch hook to the pack's own bytes: a paged expert is converted when it is selected"""
+        """wire the fetch hook to the pack's own bytes: a paged expert is staged when it is selected.
+
+        With the pair-code pack variant (`pcodes.bin`) staging is a memcpy of both halves. Without it every miss
+        rebuilds the pair codes from the pack's trits, which costs milliseconds a matrix set - that is what made
+        paging too slow to keep."""
         if self.pager is None:
             raise SystemExit("kindi: expert_resident was not set, so nothing is paged")
         self._paging_src = {"bc": np.memmap(os.path.join(self.pack, "bcodes.bin"), dtype=np.uint8, mode="r"),
                             "dp": np.memmap(os.path.join(self.pack, "dpm.bin"), dtype=np.float16, mode="r")}
+        pc = os.path.join(self.pack, "pcodes.bin")
+        if os.path.isfile(pc):
+            self.pc = np.memmap(pc, dtype=np.uint8, mode="r")
+            self._paging_src["pc"] = self.pc
+            size = int(self.pc.shape[0])
+            for (il, e), recs in self.pager["src"].items():        # a short file would stage half an expert
+                for rec in recs:
+                    if "pc_off" in rec and rec["pc_off"] + _pair_len(rec) > size:
+                        raise SystemExit(
+                            "kindi-cpu: pcodes.bin holds %d bytes, but layer %d expert %d needs bytes %d..%d.\n"
+                            "  The pair-code file is incomplete; convert the model again (`kindi convert MODEL.gguf DIR`)."
+                            % (size, il, e, rec["pc_off"], rec["pc_off"] + _pair_len(rec)))
         self.set_fetcher(lambda _ctx, layer, expert: self._page_expert(self._paging_src, layer, expert),
                          self._paging_src)
         return self.pager

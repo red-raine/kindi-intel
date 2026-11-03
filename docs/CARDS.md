@@ -149,13 +149,16 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
   `--system-site-packages` so it uses the numpy the system already has, with fastapi and uvicorn in it. It needs no
   root and no `--break-system-packages`, it is safe to run again, and it prints the command to start the server.
 - `kindi bench-spec FILE` measures the speculative decode path on a real text file: draft acceptance and the
-  decode rate against plain greedy, with prefill cancelled out. `kindi bench` is the wrong command here - it needs a
-  GPU.
+  decode rate against plain greedy, with prefill cancelled out. Acceptance belongs to the window, not the file -
+  seven files read 0.36-0.82 at one prompt length - so quote the flags and the cuts with the number. `kindi bench`
+  is the wrong command here: it needs a GPU.
 - `kindi spec-check` tests the same pass where the server uses it: an accepted draft stopped on by token id and by stop
   string, stopped one token later, every draft rejected, and one request through the server's own loop with the pass
   off and on. Each case must end with the recurrent state and the token history where a single step would leave them.
-  It needs no pack (it builds the synthetic fixture). The serving pass is off by default: `KINDI_CPU_SPEC=1` turns it on
-  for greedy requests, and it is skipped for a request whose thinking budget can close the thinking mid-stream.
+  It needs no pack (it builds the synthetic fixture); `kindi --pack DIR spec-check` runs it on a real one. The serving
+  pass is off by default: `KINDI_CPU_SPEC=1` turns it on for greedy requests, and it is skipped for a request whose
+  thinking budget can close the thinking mid-stream. Measured through the server it is 0.93-1.02x at 269-273-token
+  prompts and 1.26-1.37x at 65-token ones, so it stays off for agent-length traffic.
 - Finer int8 activation scaling does not rescue the int8 path. On the same 48 prompts and 7,680 decisions, per-64 and
   per-32 groups move the logit drift by 12% and the divergence count by nothing (13, 12 and 16 of 48 prompts), because the
   step is a group maximum and barely shrinks with the group; a calibrated per-channel scale is 6.5x worse, because one grid
@@ -166,8 +169,9 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
   `KINDI_CPU_TIER` is only needed to force one. On Windows the same file is built as `kcpu.dll` with MSVC (see
   `kindi/cbuild.py`); tiers agree within a build, and greedy output agrees across gcc and MSVC builds.
 - `kindi moe-check` compares the Mixture-of-experts FFN against a NumPy implementation on a synthetic pack, and with
-  `--paged` measures resident against paged experts. A float checkpoint becomes a pack with `kindi qat-pack` and is
-  measured with `kindi drift`; see `docs/QAT-CONVERSION.md`.
+  `--paged` measures resident against paged experts on both staging paths: rebuilding the pair codes from the trits,
+  and the memcpy a `kindi convert --paircodes` pack allows. All of them must produce the resident tokens. A float
+  checkpoint becomes a pack with `kindi qat-pack` and is measured with `kindi drift`; see `docs/QAT-CONVERSION.md`.
 - The output is token-exact with llama.cpp.
 - Size `OMP_NUM_THREADS` to the **physical** cores, not the logical ones. A token is roughly 425 barriers, and a
   barrier costs under a microsecond at 4 and at 8 threads on this host, but milliseconds at 16, which is the point

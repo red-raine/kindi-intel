@@ -54,9 +54,10 @@ class Scripted(object):
         self.fed += 1
 
     def propose(self, _k):
-        if self.fed + 1 >= len(self.seq):
+        # the loop feeds `tok` before asking, so `fed` is already the index of the token that follows it
+        if self.fed >= len(self.seq):
             return []
-        t = self.seq[self.fed + 1]
+        t = self.seq[self.fed]
         return [(t + 1) % self.vocab if self.wrong else t]
 
 
@@ -172,14 +173,24 @@ def run(cfg, log=print, pack=None, tokens=8):
         return tokz.decode_bytes(seq[i]).decode("utf-8", "replace")
 
     # the same two stop decisions the loop makes on the token of an accepted pass (the second one in the pass), and
-    # then the same two one token later; a stop string only works when its text is not in the token before it
+    # then the same two one token later; a stop string only works when its text is not in the token before it, and a
+    # stop by id only means what it says when that id does not occur earlier in the run. A real pack repeats tokens -
+    # the 2B's greedy run starts `198 3 16 15 15 59 4 3`, so a stop at 7 fired at 1 - which a fixture of noise does
+    # not, and that is how this went unnoticed until spec-check ran against a pack.
+    fresh = [i for i in range(2, len(seq)) if seq[i] not in seq[:i]]
     cases = [("accepted draft, stop id", 1, "eos", False)]
     if text_of(1) and text_of(1) not in text_of(0):
         cases.append(("accepted draft, stop string", 1, "stop", False))
     else:
         log("spec-check: the first two tokens of the fixture decode alike; no stop-string case")
-    cases += [("accepted draft, stop one later", 2, "eos", False),
-              ("every draft rejected", max(2, tokens - 1), "eos", True)]
+    if 2 in fresh:
+        cases.append(("accepted draft, stop one later", 2, "eos", False))
+    else:
+        log("spec-check: token 2 repeats an earlier token; no one-token-later case")
+    if fresh:
+        cases.append(("every draft rejected", max(fresh), "eos", True))
+    else:
+        log("spec-check: every token after the first repeats an earlier one; no rejected-run case")
     ok = True
     log("\n  %-32s %-24s %-6s %-8s %s" % ("case", "stopped", "state", "tokens", "passes"))
     for name, at, kind, wrong in cases:

@@ -8,7 +8,11 @@ matching transform to the activations, using the sign vectors stored in the GGUF
 Float32 tensors are copied verbatim. Vocabulary and BPE merges come from the GGUF tokenizer metadata.
 
 Pack files: bcodes.bin, dpm.bin, f32.bin, signs_2048.f32, signs_6144.f32, vocab.json, merges.txt, index.json,
-bcodes_index.json, kindi_pack.json."""
+bcodes_index.json, kindi_pack.json.
+
+`--paircodes` adds pcodes.bin: every MoE expert matrix in the GEMV pair-code form the CPU engine stages into its
+paging slots, so a paged expert is loaded by memcpy rather than rebuilt from the trits at every miss. It is about 6%
+of the pack for the experts it covers, and only packs with experts get one."""
 import hashlib
 import json
 import os
@@ -17,6 +21,7 @@ import time
 import numpy as np
 
 from . import __version__
+from .cpu import is_expert, pair_bytes
 from .gguf import GGUF
 
 PTQ1_0, F32, BF16 = 143, 0, 30
@@ -71,7 +76,7 @@ def sha256(path, bufsize=1 << 22):
     return h.hexdigest()
 
 
-def convert(gguf_path, out_dir, log=print):
+def convert(gguf_path, out_dir, log=print, paircodes=False):
     t0 = time.time()
     selftest()
     g = GGUF(gguf_path)
@@ -126,9 +131,10 @@ def convert(gguf_path, out_dir, log=print):
     fb = open(os.path.join(out_dir, "bcodes.bin"), "wb")
     fd = open(os.path.join(out_dir, "dpm.bin"), "wb")
     ff = open(os.path.join(out_dir, "f32.bin"), "wb")
+    fp = open(os.path.join(out_dir, "pcodes.bin"), "wb") if paircodes else None
     src = open(gguf_path, "rb")
-    bc_off = dpm_off = f32_off = 0
-    n_t = 0
+    bc_off = dpm_off = f32_off = pc_off = 0
+    n_t = n_pc = 0
     for name, ne, ty, toff in g.tensors:
         ne0 = ne[0]
         rows = 1
@@ -150,6 +156,16 @@ def convert(gguf_path, out_dir, log=print):
             fd.write(np.ascontiguousarray(dm.T).tobytes())           # [phase][row]
             rec.update({"bc_off": bc_off, "dpm_off": dpm_off})
             bindex["tensors"][name] = {"bc_off": bc_off, "dpm_off": dpm_off, "rows": rows, "ne0": ne0}
+            # pair codes need whole 8-row blocks and whole 128-column groups; an expert that has neither stages
+            # through the conversion path instead, so its absence from pcodes.bin is not an error
+            if fp is not None and is_expert(name) and rows % 8 == 0 and ne0 % 128 == 0:
+                Wb, Sb = pair_bytes(np.ascontiguousarray(out.T), np.ascontiguousarray(dm.view(np.float16).T),
+                                    rows, ne0)
+                fp.write(Wb)
+                fp.write(Sb)
+                bindex["tensors"][name]["pc_off"] = pc_off
+                pc_off += len(Wb) + len(Sb)
+                n_pc += 1
             bc_off += rows * bpr * 32
             dpm_off += rows * bpr * 2
         else:
@@ -165,8 +181,9 @@ def convert(gguf_path, out_dir, log=print):
         n_t += 1
         if n_t % 40 == 0:
             log("  %d / %d tensors" % (n_t, len(g.tensors)))
-    for h in (fb, fd, ff, src):
-        h.close()
+    for h in (fb, fd, ff, fp, src):
+        if h is not None:
+            h.close()
     with open(os.path.join(out_dir, "index.json"), "w") as f:
         json.dump(index, f)
     with open(os.path.join(out_dir, "bcodes_index.json"), "w") as f:
@@ -189,7 +206,11 @@ def convert(gguf_path, out_dir, log=print):
                 "head": "output.weight" if any(t[0] == "output.weight" for t in g.tensors) else "token_embd.weight",
                 # the chat template: the 27B's differs from the 2B/4B/9B one (chat.template_variant)
                 "chat_template": g.kv.get("tokenizer.chat_template", "")}
+    if n_pc:
+        manifest["paircodes"] = {"tensors": n_pc, "bytes": pc_off}
     with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    log("pack written to %s (%.0f MB) in %.0fs" % (out_dir, (bc_off + dpm_off + f32_off) / 1e6, time.time() - t0))
+    log("pack written to %s (%.0f MB) in %.0fs%s"
+        % (out_dir, (bc_off + dpm_off + f32_off + pc_off) / 1e6, time.time() - t0,
+           ", %d expert matrices as pair codes (%.1f MB)" % (n_pc, pc_off / 1e6) if n_pc else ""))
     return manifest

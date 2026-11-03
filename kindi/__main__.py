@@ -43,7 +43,7 @@ def cmd_convert(cfg, a):
     out = a.out or cfg["pack"]
     if os.path.exists(os.path.join(out, "kindi_pack.json")) and not a.force:
         raise SystemExit("kindi: %s already holds a pack (use --force to rebuild)" % out)
-    manifest = convert(a.gguf, out, log=log)
+    manifest = convert(a.gguf, out, log=log, paircodes=bool(getattr(a, "paircodes", False)))
     if manifest.get("backend") == "kindi_gemma4":
         log("Gemma 4 model ready for Kindi native CUDA inference")
     else:
@@ -232,6 +232,8 @@ def main(argv=None):
     s.add_argument("gguf", nargs="?")
     s.add_argument("--out", help="pack directory (default: the configured pack)")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--paircodes", action="store_true",
+                   help="also write pcodes.bin: expert matrices staged by memcpy when experts are paged")
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)

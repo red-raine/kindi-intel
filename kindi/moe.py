@@ -115,47 +115,119 @@ def run(a, log=print):
 
 
 def bench_paging(log=print):
-    """resident experts against paged ones on a fixture big enough for the difference to show in RSS and in time"""
+    """The residency curve, with both staging paths: rebuild the pair codes on a miss, or copy them from the pack.
+
+    Two fixture packs with the same weights - one as `kindi convert` writes it, one with `pcodes.bin`
+    (`--paircodes`) - so the same cache size is measured with conversion staging and with memcpy staging. Every row
+    must give the resident engine's tokens; timing is decode only, after a two-token warm-up.
+    """
     import gc
+    import json as _json
     import time
     from . import synthpack
-    from .cpu import Engine
+    from .cpu import Engine, _pair_len, _pair_views, is_expert, pair_mat
     dims = dict(width=1024, ffn=512, layers=6)
     nexp, nact = 12, 2
     tmp = tempfile.mkdtemp(prefix="kindi-moe-page-")
-    synthpack.build(tmp, log=lambda *x: None, experts=nexp, experts_active=nact, **dims)
+    packs = {}
+    for tag, want in (("trit", False), ("pair", True)):
+        p = os.path.join(tmp, tag)
+        synthpack.build(p, log=lambda *x: None, experts=nexp, experts_active=nact, paircodes=want, **dims)
+        packs[tag] = p
     ids = [3, 11, 19, 27, 35, 43, 51, 59]
-    per_expert = 1.5 * (dims["ffn"] // 2) * dims["width"]        # pair codes plus scales, three matrices
-    out = []
-    for keep in (nexp, nexp // 2, 4, 2):
-        label = "all %d" % keep if keep == nexp else "cache %d" % keep
+    # bytes the three matrices of one expert take, read off the indexes rather than estimated:
+    # the pack's own (ternary codes and their scales, the resident form) and the staged form (pcodes.bin)
+    _bi = _json.load(open(os.path.join(packs["trit"], "bcodes_index.json")))["tensors"]
+    trecs = [_bi[n] for n in ("blk.0.moe_gate.e0.weight", "blk.0.moe_up.e0.weight", "blk.0.moe_down.e0.weight")]
+    per_res = sum(r["rows"] * (r["ne0"] // 128) * 34 for r in trecs)
+    per_pool = sum(_pair_len(r) for r in trecs)
+
+    def run(pack, keep, staging="auto"):
         gc.collect()
-        eng = Engine(tmp, ctx=64, log=lambda *x: None, expert_resident=None if keep == nexp else keep)
+        eng = Engine(pack, ctx=64, log=lambda *x: None, expert_resident=None if keep == nexp else keep)
+        calls = [0]
         if keep != nexp:
             eng.enable_paging()
+            if staging == "none":
+                eng.set_fetcher(None)                     # the pool and its Mats, but nothing ever refills them
+            elif staging == "hook":
+                eng.set_fetcher(lambda *a: None)          # the callback crosses, the slots are left stale
+            else:
+                def counted(big, layer, expert):          # the real hook, counting only the cache misses
+                    ins = eng.pager["in_slot"].get(layer)
+                    if ins is not None and expert not in ins:
+                        calls[0] += 1
+                    eng._page_expert(eng._paging_src, layer, expert)
+                eng.set_fetcher(counted)
         eng.generate(ids, 2)                              # warm the cache, as a server would
+        calls[0] = 0
         t0 = time.time()
-        a = eng.generate(ids, 6)
+        got = eng.generate(ids, 6)
         dt = (time.time() - t0) / 6
-        out.append((label, dt, dims["layers"] * keep * per_expert / 2 ** 20, a))
         del eng
         gc.collect()
+        return got, dt, calls[0] / 6.0
+
+    resident, dt_res, _ = run(packs["trit"], nexp)
     log("\n  experts %d, %d active, %d layers, width %d, expert width %d" % (nexp, nact, dims["layers"],
                                                                            dims["width"], dims["ffn"]))
-    log("  %-9s %8s %12s" % ("experts", "ms/token", "code memory"))
-    for label, dt, mb, a in out:
-        log("  %-9s %8.1f %9.0f MB" % (label, dt * 1000, mb))
-    # what a miss costs: one expert's three matrices through the Python pair-code conversion
-    from .cpu import pair_mat
-    import json as _json
-    bi = _json.load(open(os.path.join(tmp, "bcodes_index.json")))["tensors"]
-    bc = np.memmap(os.path.join(tmp, "bcodes.bin"), dtype=np.uint8, mode="r")
-    dp = np.memmap(os.path.join(tmp, "dpm.bin"), dtype=np.float16, mode="r")
+    log("  %-11s %12s %12s %12s %12s %8s %10s" % ("experts", "convert ms/t", "memcpy ms/t", "hook ms/t",
+                                                 "no fetch ms/t", "miss/t", "code memory"))
+    log("  %-11s %12.1f %12s %12s %12s %8s %7.1f MB" % ("all %d" % nexp, dt_res * 1000, "-", "-", "-", "-",
+                                                        dims["layers"] * nexp * per_res / 2 ** 20))
+    same = True
+    for keep in (nexp // 2, 4, 2):
+        a, ta, _ = run(packs["trit"], keep)
+        b, tb, nb = run(packs["pair"], keep)
+        _c, tc, _ = run(packs["pair"], keep, staging="hook")   # output is meaningless: the slots are stale
+        _d, td, _ = run(packs["pair"], keep, staging="none")
+        same = same and a == resident and b == resident
+        log("  %-11s %12.1f %12.1f %12.1f %12.1f %8.1f %7.1f MB"
+            % ("cache %d" % keep, ta * 1000, tb * 1000, tc * 1000, td * 1000, nb,
+               dims["layers"] * keep * per_pool / 2 ** 20))
+
+    # the variant has to be the same bytes as the conversion, not merely the same tokens: every expert matrix
+    _pi = _json.load(open(os.path.join(packs["pair"], "bcodes_index.json")))["tensors"]
+    bc = np.memmap(os.path.join(packs["trit"], "bcodes.bin"), dtype=np.uint8, mode="r")
+    dp = np.memmap(os.path.join(packs["trit"], "dpm.bin"), dtype=np.float16, mode="r")
+    pcm = np.memmap(os.path.join(packs["pair"], "pcodes.bin"), dtype=np.uint8, mode="r")
+    same_bytes, n_cmp = True, 0
+    for name in sorted(n for n in _bi if is_expert(n)):
+        W, S = _pair_views(pcm, _pi[name])
+        W2, S2 = pair_mat(bc, dp, _bi[name])
+        same_bytes = same_bytes and np.array_equal(W, W2) and np.array_equal(S, S2)
+        n_cmp += 1
+    log("  pcodes.bin is byte-identical to the conversion for %d expert matrices: %s"
+        % (n_cmp, "yes" if same_bytes else "NO"))
+    same = same and same_bytes
+    pcm = None
+    gc.collect()
+
+    # what one miss costs, the two ways: three matrices of layer 0, expert 0
+    precs = [_pi[n] for n in ("blk.0.moe_gate.e0.weight", "blk.0.moe_up.e0.weight", "blk.0.moe_down.e0.weight")]
+    reps = 20
     t0 = time.time()
-    for rec in (bi["blk.0.moe_gate.e0.weight"], bi["blk.0.moe_up.e0.weight"], bi["blk.0.moe_down.e0.weight"]):
-        pair_mat(bc, dp, rec)
-    ms = (time.time() - t0) * 1e3
-    log("  one expert's staging (3 matrices, NumPy): %.0f ms   a token using 2 of 12 experts misses often" % ms)
-    same = all(o[3] == out[0][3] for o in out)
-    log("  every cache size gives the resident output: %s" % ("yes" if same else "NO - the tokens must not change"))
+    for _ in range(reps):
+        for rec in trecs:
+            pair_mat(bc, dp, rec)
+    ms_conv = (time.time() - t0) * 1e3 / reps
+    eng = Engine(packs["pair"], ctx=64, log=lambda *x: None, expert_resident=2)
+    eng.enable_paging()
+    pcm = eng.pc
+    t0 = time.time()
+    for _ in range(reps):
+        for j, rec in enumerate(precs):
+            W, S = _pair_views(pcm, rec)
+            dw, ds = eng.pager["slots"][0][0][j]
+            np.copyto(dw, W.reshape(dw.shape))
+            np.copyto(ds, S.reshape(ds.shape))
+    ms_copy = (time.time() - t0) * 1e3 / reps
+    mb = sum(_pair_len(rec) for rec in precs) / 1e6
+    del eng
+    pcm = None
+    gc.collect()
+    log("  one expert staged (3 matrices, %.3f MB): %.3f ms rebuilt from the trits, %.3f ms copied from pcodes.bin"
+        % (mb, ms_conv, ms_copy))
+    log("  every cache size and both packs give the resident output: %s"
+        % ("yes" if same else "NO - the tokens must not change"))
     return same

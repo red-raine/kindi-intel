@@ -127,7 +127,7 @@ of the contaminated runs quoted above, with no other sign that the machine was b
 | 16 | AVX-512 / VNNI / AMX kernels | **no** | Not available on this CPU. Do not port them. |
 | 17 | `I2_S` integer dot (`maddubs`/`madd`) | yes | **Rejected on exactness.** Lossless only for models trained with BitNet's per-tensor int8 activations; Bonsai is PTQ'd, so this would not be token-exact. |
 | 18 | int16 LUT to keep exactness | yes | A constraint on any of the above, not an optimisation: int8 table quantisation is lossy. |
-| 19 | MoE expert paging / hot-expert caching | yes | **Implemented, rejected on cost.** The fetch hook and the per-layer cache are in and bit-identical to residency, but staging one expert through the NumPy pair-code conversion costs 7 ms, so a cache of 6/12 experts reads 140 ms/token against 1.5. Needs pair codes in the pack before it can pay. |
+| 19 | MoE expert paging / hot-expert caching | yes | **Works, now cheap to stage, still off by default.** `convert --paircodes` writes the staged form (`pcodes.bin`), so a miss is two memcpys: 0.05-0.3 ms an expert against 8-12 ms rebuilding it, and a cache of 6/12 reads 23 ms/token against 187-251. What is left is 69 Python callbacks a token at ~0.3 ms - stage in C before paging a model that needs it. |
 | 20 | Ternary MoE (MoTE and follow-ups) | no (GPU kernels) | Design input, not a kernel: **keep a dense shared expert and ternarise only the routed ones.** |
 
 Bonus — **KV cache quantisation**: at ctx 1024 our KV is ~12 MB against 506 MB of weights, and attention is ~2% of a
@@ -151,8 +151,8 @@ contexts and actively harmful at long ones. Keep f16.
    would make possible starts from too far behind.
 
 Done since this list was written: the kernel tiers (scalar / AVX2 / int8) with an exactness gate and a native Windows
-build, the MoE FFN with a NumPy-validated reference, and expert paging - the last two measured above, the paging
-rejected on transfer cost.
+build, the MoE FFN with a NumPy-validated reference, and expert paging - the last two measured above. Paging's
+staging cost is solved by the pair-code pack; its remaining cost is one Python callback per selected expert.
 
 ### Could `vpshufb` replace `vpermps`: the pre-broadcast table, measured
 
@@ -287,13 +287,16 @@ the short version:
   an acceptance rate of 0.35. Measured +1.18x at 0.86 acceptance and +1.53x at 1.00.
 - The ceiling is 1.48x and not 2x because only the products batch. The RMS folds, the GDN recurrence, the attention
   bodies and the embedding still run per token, and they double.
-- **In the serving loop, off by default.** `Runner.spec_begin/spec_next/spec_stop` put the pass in `server.py`'s token
-  loop for greedy requests; a request that stops on the token of an accepted pass rolls back with `kc_state_load`, so
-  the recurrent state and `Runner.tokens` end at what one `step` leaves. `KINDI_CPU_SPEC=1` enables it, and
-  `kindi spec-check` is the test (accepted draft stopped on by token id and by stop string, stopped one token later,
-  all drafts rejected, and the server's own loop with the pass off and on). It is not the default yet because the
-  economics were measured here rather than on the serving host, and because a thinking budget closes the thinking
-  mid-stream with tokens the loop feeds one at a time - those requests do not speculate.
+- **In the serving loop, off by default, and measured there.** `Runner.spec_begin/spec_next/spec_stop` put the pass in
+  `server.py`'s token loop for greedy requests; a request that stops on the token of an accepted pass rolls back with
+  `kc_state_load`, so the recurrent state and `Runner.tokens` end at what one `step` leaves. `KINDI_CPU_SPEC=1`
+  enables it, and `kindi spec-check` is the test (accepted draft stopped on by token id and by stop string, stopped one
+  token later, all drafts rejected, and the server's own loop with the pass off and on). End to end through the server
+  on the real pack it is 0.93-1.02x at 269-273-token prompts and 1.26-1.37x at 65-token prompts. The pass costs ~1.5x
+  a step on this host today rather than 1.351x - `bench-spec` re-run the same day gives 1.05x at 0.764 acceptance, and
+  `step` against `step2` gives 1.49-1.57x - so break-even acceptance is 0.5. `BENCHMARKS.md` has both tables. A
+  thinking budget closes the thinking mid-stream with tokens the loop feeds one at a time - those requests do not
+  speculate.
 
 The earlier reading of this - that batched verification is impossible because 18 of 24 layers are recurrent - was
 wrong, and the mistake is worth recording. The recurrence constrains the *state*, not the *products*: a layer can take
@@ -399,28 +402,53 @@ One limitation is structural rather than a bug: **a MoE layer gives up the two-t
 to different experts, so `kc_step2` runs each token's experts in turn. `verify-tier` shows the two-token path still
 matches two single steps, i.e. it is correct and not faster on those layers.
 
-### Paged experts: correct, and too expensive to keep
+### Paged experts: the pair-code pack makes staging a memcpy
 
 An expert is a `Mat` like any other, so paging it needs no kernel change: the layer's expert table can point into a
 staging buffer, and a fetch hook refills that buffer before the expert's products run (`moe_fetch`, wired from
 `Engine.enable_paging`). The pool is a per-layer cache of `k` experts in pair-code form, loaded on demand from the
 pack's own bytes.
 
-On a fixture of 6 layers, width 1024, 12 experts of width 512 (2 active), 6 tokens after a 2-token warm-up, 8 threads:
+Measured first on the machine that wrote the rest of this file, on a fixture of 6 layers, width 1024, 12 experts of
+width 512 (2 active), 6 tokens after a 2-token warm-up, 8 threads: **1.5 ms/token with all 12 resident, 140.2 with a
+cache of 6, 174.9 with 4, 742.1 with 2** - every size producing the resident engine's tokens exactly. The mechanism
+was right and the staging was not: one expert's three matrices took 7 ms to rebuild through the NumPy pair-code
+conversion, and a token that missed two experts in six layers paid for twelve of them. The conclusion was that **a
+paged expert needs its pair codes on disk**, and that is now a pack variant rather than a note.
 
-| experts resident | ms/token | expert code memory |
-|---|---:|---:|
-| all 12 | **1.5** | 27 MB |
-| cache 6 | 140.2 | 14 MB |
-| cache 4 | 174.9 | 9 MB |
-| cache 2 | 742.1 | 4 MB |
+`kindi convert --paircodes` (and `synthpack(paircodes=True)`) writes `pcodes.bin`: for each routed expert matrix, the
+GEMV words and scales `pair_mat` would build, so a miss is two memcpys instead of a conversion. It costs 0.22 MB for
+the fixture's 256 x 1024 expert - 0.28 bytes a weight against the 0.266 its ternary codes and scales already take, so
+1.06x the pack's expert bytes - and covers the routed matrices only, so a dense pack pays nothing. `Engine.enable_paging` maps it when the file is present, and checks its length against
+every expert it would stage, so a stale file is refused rather than half-filled.
 
-Every cache size produces the resident engine's tokens exactly, so the mechanism is right. What it is not is fast: **one
-expert's three matrices take 7 ms to stage through the NumPy pair-code conversion**, and a token that misses two
-experts in six layers pays for twelve of them. The conversion, not the policy, is the cost - which is the real lesson:
-**a paged expert needs its pair codes on disk, or a C-side converter**, and neither is worth building until a model
-exists whose resident set does not fit. The docs' earlier arithmetic already said that: a 20B-A1B MoE is ~0.21 GB per
-token but ~4.3 GB resident, and Bonsai-2 is 0.43 GB in total.
+Re-measured on the CPU VM in this document, median of three runs, same fixture and 6 tokens after the same warm-up:
+
+| experts resident | convert ms/token | memcpy ms/token | hook only | no fetch | misses/token | expert code memory |
+|---|---:|---:|---:|---:|---:|---:|
+| all 12 | **5.1** | - | - | - | - | 14.3 MB |
+| cache 6 | 251.2 | **23.0** | 30.6 | 3.8 | 13.2 | 7.6 MB |
+| cache 4 | 303.7 | **24.7** | 22.9 | 4.1 | 15.8 | 5.1 MB |
+| cache 2 | 408.3 | **30.6** | 30.2 | 7.3 | 20.8 | 2.5 MB |
+
+The absolutes are not comparable to the paragraph above - this VM is slower than the machine that produced 1.5 - so
+read the columns against each other. The spread is wide: across five runs the memcpy column spanned 19-31 ms and the
+hook column 15-36. Two of the columns are controls that stage nothing at all: `hook only` keeps the fetcher and empties
+it, `no fetch` clears `moe_fetch` so the pool's slots are never refilled. What they show is that **the copy has stopped
+being the cost**: the memcpy and hook columns swap order between runs (23.0 against 30.6 in the table, 21.8 against
+24.2 and 19.3 against 17.9 in others), and 13-21 misses of a 0.2 MB expert at the 0.05-0.3 ms a copy reproduces at add
+up to 1-6 ms of the 15-19 ms paging costs above the resident path.
+
+The rest is the crossing: **69 `moe_fetch` calls a token, ~0.3 ms each.** It is a Python function called from inside
+the OpenMP region, so every selected expert costs a GIL acquire and a thread wake - and the conversion column pays for
+that same crossing before it pays 12 ms a conversion. What keeps experts resident is no longer staging; it is the
+callback. Removing it means staging in C (a `kc_stage(layer, expert)` that reads `pcodes.bin` itself), which hands the
+kernel a file handle and the slot pointers - an ABI change worth making when a model needs paging, not before.
+
+So the default stays `expert_resident=None` (all resident), and the honest summary is that the variant turned paging
+from ~50x the resident cost into ~5x. One caveat: only the MoE fixture exercises it. Bonsai has no experts and no
+shipped GGUF produces `pcodes.bin`, so the first real MoE pack is where 0.28 bytes a weight and the copy throughput
+get their first real test.
 
 ## The element-wise LUT: measured 3.4-4.0x slower than the pair table
 
