@@ -170,6 +170,7 @@ class Layer(ctypes.Structure):
                 ("Kqs", PU16), ("Vqs", PU16),
                 ("K4", PU8), ("V4", PU8), ("K4s", PU16), ("V4s", PU16),
                 ("K2", PU8), ("V2", PU8), ("K2s", PU16), ("V2s", PU16),
+                ("K2b", PU8), ("V2b", PU8), ("K2bs", PU16), ("V2bs", PU16),
                 ("K5", PU8), ("V5", PU8), ("K5s", PU16), ("V5s", PU16),
                 ("ffg", Mat), ("ffu", Mat), ("ffd", Mat)]
 
@@ -341,9 +342,9 @@ class Engine(object):
         # arrays are held here so their lifetime is the engine's, exactly like the fp16 ones.
         def kvq_of(name, dflt):
             v = int(os.environ.get(name) or dflt)
-            return v if v in (1, 2, 3, 4, 5) else dflt
+            return v if v in (1, 2, 3, 4, 5, 6) else dflt
         kvq = int(os.environ.get("KINDI_CPU_KVQ") or 0)
-        kvq = kvq if kvq in (1, 2, 3, 4, 5) else 0
+        kvq = kvq if kvq in (1, 2, 3, 4, 5, 6) else 0
         self.kvq_k = kvq_of("KINDI_CPU_KVQ_K", kvq)
         self.kvq_v = kvq_of("KINDI_CPU_KVQ_V", kvq)
         self.kvq = self.kvq_k                      # the K side, which is what callers and dumps quote
@@ -395,6 +396,12 @@ class Engine(object):
                     L.K2, L.V2 = _p(K2, PU8), _p(V2, PU8)
                     L.K2s, L.V2s = _p(K2s, PU16), _p(V2s, PU16)
                     self.kvq_bufs += [K2, V2, K2s, V2s]
+                if 6 in (self.kvq_k, self.kvq_v):                  # 2-bit four-level, one scale per 32 values
+                    K2b, V2b = z(self.ctx * NHKV * (HD // 4), np.uint8), z(self.ctx * NHKV * (HD // 4), np.uint8)
+                    K2bs, V2bs = z(self.ctx * NHKV * (HD // 32), np.uint16), z(self.ctx * NHKV * (HD // 32), np.uint16)
+                    L.K2b, L.V2b = _p(K2b, PU8), _p(V2b, PU8)
+                    L.K2bs, L.V2bs = _p(K2bs, PU16), _p(V2bs, PU16)
+                    self.kvq_bufs += [K2b, V2b, K2bs, V2bs]
                 if 5 in (self.kvq_k, self.kvq_v):                  # 4 bits as two 4-level passes, one scale a head
                     K5, V5 = z(self.ctx * NHKV * (HD // 2), np.uint8), z(self.ctx * NHKV * (HD // 2), np.uint8)
                     K5s, V5s = z(self.ctx * NHKV, np.uint16), z(self.ctx * NHKV, np.uint16)
@@ -464,7 +471,7 @@ class Engine(object):
         # the cache format is a property of both Models: kc_step2 alternates them over the same Layer state
         self.lib.kc_kv_quant2.argtypes = [ctypes.POINTER(Model), ctypes.c_int, ctypes.c_int]
         self.lib.kc_kv_quant2.restype = ctypes.c_int
-        want = self.kvq_k * 4 + self.kvq_v
+        want = self.kvq_k * 8 + self.kvq_v        # base 8: the formats run 0..6, and base 4 stopped being injective
         for mm in (m, m2):
             got = int(self.lib.kc_kv_quant2(ctypes.byref(mm), self.kvq_k, self.kvq_v))
             if got != want:

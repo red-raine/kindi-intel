@@ -396,7 +396,7 @@ One command runs every check in this repository - module imports, the quantiser 
 suites, the CLI, and the links in these documents:
 
 ```bash
-python -m tools.selftest            # 16 ok, 6 skipped, 0 failed, ~65 s
+python -m tools.selftest            # 17 ok, 6 skipped, 0 failed, ~75 s
 python -m tools.selftest --verbose  # timings, and every skip with its reason
 ```
 

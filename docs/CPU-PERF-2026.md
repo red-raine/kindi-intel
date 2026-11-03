@@ -890,6 +890,24 @@ mean) and keeps the lowest error, ~10k compares per cache write against ~10^8 mu
 2 bits (84 MiB, 16%). **q8_0 K/V is a long-context memory knob, not a speed or quality one**; 4-bit is the smallest
 format that keeps the model, and the 2-bit rungs buy the last 12 MiB at the price of a different model.
 
+**A scale per 32 values does not rescue the 2-bit V rung.** Mode `6` is the same four-level alphabet with one fp16 scale
+per **32-value block** instead of per head: 8 bytes of codes and 2 bytes of scale a block, so 2.5 bits a value against
+2.0625 at a 256-value head. It costs 21% more memory than mode 4 for no extra level. Measured two ways on this host,
+where the model is the synthetic fixture (random weights, no Prism pack):
+
+- **At the codec** the block scale always reconstructs closer, and by more the more the range varies across the head -
+  mean relL2 over 200 vectors, per head vs per block: **0.3835 -> 0.3283 (14.4% closer) when each 32-block's range
+draws from a four-fold spread, 0.3367 -> 0.3303 (1.9%) when they do not**. That is the mechanism the format exists for,
+  and it holds across fixtures.
+- **End to end it is not decided.** KL against the fp16 cache over the same tokens, two 40-token windows averaged: at
+  width 256 / 6 layers the head scale wins (0.2628 vs 0.2960), at width 128 / 4 layers the block scale wins (0.0128 vs
+  0.0107). A random-weight model has no reason to make one of those the true one, so the ranking flips with the fixture
+  and the question stays open until the 48-prompt harness runs against a real pack.
+
+What the variant did turn up is a bug in the selector: `kc_kv_quant2` packed its choice as `K*4 + V`, which stopped
+being injective once `V` could reach 4 - K at 2 bits with V at 4 bits gave 8, the same code as K at 4 bits with V in
+fp16 - so a refused setting could have compared equal to a wanted one. It is `K*8 + V` now, on both sides.
+
 Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh`, `kqkv_asym.sh`, `kqkv_q4.sh`, `kqkv_q2.sh` and `kqkv_q45.sh` run the arms,
 `kqkv_wide.py` is the sweep, `kvq_report.py` scores divergence, KL and cost, `kvq_detail.py` the divergence-step
 distribution, `q2_floor.py` and `q45_floor.py` the alphabet floors, `q2_check.py` the position-0 round trip).

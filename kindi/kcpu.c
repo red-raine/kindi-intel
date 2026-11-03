@@ -55,6 +55,8 @@ typedef struct {
   uint16_t *K4s, *V4s;                   /* [ctx][NHKV] 4-bit scale, fp16 */
   uint8_t *K2, *V2;                      /* [ctx][NHKV][HD/4] four 2-bit codes per byte, levels {-3,-1,1,3} */
   uint16_t *K2s, *V2s;                   /* [ctx][NHKV] 2-bit scale, fp16 */
+  uint8_t *K2b, *V2b;                    /* the same code with one scale per 32 values instead of per head */
+  uint16_t *K2bs, *V2bs;                 /* [ctx][NHKV][HD/32] 2-bit block scales, fp16 */
   uint8_t *K5, *V5;                      /* [ctx][NHKV][HD/2] two 4-bit codes per byte, the 4-level code twice */
   uint16_t *K5s, *V5s;                   /* [ctx][NHKV] 4-bit-as-two-passes scale, fp16 */
   /* FFN */
@@ -77,7 +79,8 @@ typedef struct {
   void (*moe_fetch)(void*, int, int);
   void* moe_ctx;
   int kvq;                               /* K/V cache format: 0 fp16, 1 ternary, 2 q8_0, 3 4-bit, 4 2-bit,
-                                            5 4 bits as two 4-level passes (kc_kv_quant) */
+                                            5 4 bits as two 4-level passes, 6 2 bits with per-32 block scales
+                                            (kc_kv_quant) */
   int kvq_k, kvq_v;                      /* the two sides separately (kc_kv_quant2): K and V need not match */
 } Model;
 
@@ -959,6 +962,55 @@ static float q2_pack(const float* v, uint8_t* out, int n){
 static void q2_unpack(const uint8_t* p, float sc, float* out, int n){
   for(int j = 0; j < n; ++j) out[j] = sc * LT[(p[j >> 2] >> (2 * (j & 3))) & 3];
 }
+/* 2 bits with a scale per 32-value block instead of per head: 8 bytes of codes and one fp16 scale a block, so 2.5 bits
+   a value against 2.0625 for mode 4. The question it answers is whether the four-level alphabet is the limit on the
+   values or the single scale is. Same four-start fit as q2_pack, run per block; a block whose scale came out as zero
+   keeps a zero scale and all-zero codes, which reconstructs exactly. */
+static void q2b_pack(const float* v, uint8_t* out, uint16_t* sc, int n){
+  for(int b = 0; b < n / 32; ++b){
+    const float* x = v + b * 32;
+    float am = 0.f, mn = 0.f;
+    for(int j = 0; j < 32; ++j){ const float f = fabsf(x[j]); if(f > am) am = f; mn += f; }
+    const float starts[4] = {am / 6.0f, am / 9.0f, am / 12.0f, 0.5f * mn / 32.0f};
+    float ba = 1e-8f, best = -1.f;
+    int bc[32], c[32];
+    for(int s = 0; s < 4; ++s){
+      float a = starts[s] > 0.f ? starts[s] : 1e-8f;
+      for(int it = 0; it < 10; ++it){
+        float num = 0.f, den = 0.f;
+        const float bb = 2.0f * a;
+        for(int j = 0; j < 32; ++j){
+          const float y = x[j];
+          const int k = y >= bb ? 3 : (y > 0.f ? 2 : (y > -bb ? 1 : 0));
+          num += y * LT[k]; den += LT[k] * LT[k];
+        }
+        const float na = den > 0.f ? num / den : a;
+        if(!(na > 0.f)) break;
+        a = na;
+      }
+      const float bb = 2.0f * a;
+      float sse = 0.f;
+      for(int j = 0; j < 32; ++j){
+        const float y = x[j];
+        const int k = y >= bb ? 3 : (y > 0.f ? 2 : (y > -bb ? 1 : 0));
+        const float d = y - a * LT[k];
+        c[j] = k; sse += d * d;
+      }
+      if(best < 0.f || sse < best){ best = sse; ba = a; for(int j = 0; j < 32; ++j) bc[j] = c[j]; }
+    }
+    uint8_t* o = out + b * 8;
+    for(int j = 0; j < 32; j += 4)
+      o[j >> 2] = (uint8_t)(bc[j] | (bc[j + 1] << 2) | (bc[j + 2] << 4) | (bc[j + 3] << 6));
+    sc[b] = f2h(ba);
+  }
+}
+static void q2b_unpack(const uint8_t* p, const uint16_t* sc, float* out, int n){
+  for(int b = 0; b < n / 32; ++b){
+    const float s = h2f(sc[b]);
+    const uint8_t* o = p + b * 8;
+    for(int j = 0; j < 32; ++j) out[b * 32 + j] = s * LT[(o[j >> 2] >> (2 * (j & 3))) & 3];
+  }
+}
 static void q8_pack(const float* v, int8_t* out, uint16_t* sc, int n){
   for(int b = 0; b < n / 32; ++b){
     float am = 0.f;
@@ -1100,12 +1152,14 @@ static void attn_mid(Model* m, Layer* L, int pos){
       const float* vv = m->vv + (size_t)kv * HD;
       const size_t ix = (size_t)pos * NKV + kv;
       if(m->kvq_k == 1) L->Ks[ix] = f2h(tern_pack(dst, L->Kt + ix * (HD / 4), HD));
+      else if(m->kvq_k == 6) q2b_pack(dst, L->K2b + ix * (HD / 4), L->K2bs + ix * (HD / 32), HD);
       else if(m->kvq_k == 2) q8_pack(dst, L->Kq + ix * HD, L->Kqs + ix * (HD / 32), HD);
       else if(m->kvq_k == 3) L->K4s[ix] = f2h(q4_pack(dst, L->K4 + ix * (HD / 2), HD));
       else if(m->kvq_k == 4) L->K2s[ix] = f2h(q2_pack(dst, L->K2 + ix * (HD / 4), HD));
       else if(m->kvq_k == 5) L->K5s[ix] = f2h(q5_pack(dst, L->K5 + ix * (HD / 2), HD));
       else { uint16_t* K = L->Kc + ix * HD; for(int j = 0; j < HD; ++j) K[j] = f2h(dst[j]); }
       if(m->kvq_v == 1) L->Vs[ix] = f2h(tern_pack(vv, L->Vt + ix * (HD / 4), HD));
+      else if(m->kvq_v == 6) q2b_pack(vv, L->V2b + ix * (HD / 4), L->V2bs + ix * (HD / 32), HD);
       else if(m->kvq_v == 2) q8_pack(vv, L->Vq + ix * HD, L->Vqs + ix * (HD / 32), HD);
       else if(m->kvq_v == 3) L->V4s[ix] = f2h(q4_pack(vv, L->V4 + ix * (HD / 2), HD));
       else if(m->kvq_v == 4) L->V2s[ix] = f2h(q2_pack(vv, L->V2 + ix * (HD / 4), HD));
@@ -1120,6 +1174,7 @@ static void attn_mid(Model* m, Layer* L, int pos){
       const size_t ix = (size_t)t * NKV + kv;
       float kf[512];
       if(m->kvq_k == 1) tern_unpack(L->Kt + ix * (HD / 4), h2f(L->Ks[ix]), kf, HD);
+      else if(m->kvq_k == 6) q2b_unpack(L->K2b + ix * (HD / 4), L->K2bs + ix * (HD / 32), kf, HD);
       else if(m->kvq_k == 2) q8_unpack(L->Kq + ix * HD, L->Kqs + ix * (HD / 32), kf, HD);
       else if(m->kvq_k == 3) q4_unpack(L->K4 + ix * (HD / 2), h2f(L->K4s[ix]), kf, HD);
       else if(m->kvq_k == 4) q2_unpack(L->K2 + ix * (HD / 4), h2f(L->K2s[ix]), kf, HD);
@@ -1156,6 +1211,7 @@ static void attn_mid(Model* m, Layer* L, int pos){
       if(m->kvq_v){
         float vf[32];
         if(m->kvq_v == 1) tern_unpack(L->Vt + ix * (HD / 4) + (d0 >> 2), h2f(L->Vs[ix]), vf, 32);
+        else if(m->kvq_v == 6) q2b_unpack(L->V2b + ix * (HD / 4) + (d0 >> 2), L->V2bs + ix * (HD / 32) + (d0 >> 5), vf, 32);
         else if(m->kvq_v == 2) q8_unpack(L->Vq + ix * HD + d0, L->Vqs + ix * (HD / 32) + (d0 >> 5), vf, 32);
         else if(m->kvq_v == 3) q4_unpack(L->V4 + ix * (HD / 2) + (d0 >> 1), h2f(L->V4s[ix]), vf, 32);
         else if(m->kvq_v == 4) q2_unpack(L->V2 + ix * (HD / 4) + (d0 >> 2), h2f(L->V2s[ix]), vf, 32);
@@ -1483,13 +1539,14 @@ static int kvq_ok(const Model* m, int mode){
   /* layer 0 is a GDN layer and holds no K/V cache, so look for the first layer that does */
   int il = 0;
   while(il < m->NL && !(m->L + il)->Kc) ++il;
-  if(mode < 0 || mode > 5 || il == m->NL) return 0;
+  if(mode < 0 || mode > 6 || il == m->NL) return 0;
   const Layer* A = m->L + il;
   if(mode == 1 && !A->Ks) return 0;
   if(mode == 2 && !A->Kqs) return 0;
   if(mode == 3 && !A->K4s) return 0;
   if(mode == 4 && !A->K2s) return 0;
   if(mode == 5 && !A->K5s) return 0;
+  if(mode == 6 && !A->K2bs) return 0;
   return 1;
 }
 
@@ -1499,12 +1556,15 @@ KCAPI int kc_kv_quant(Model* m, int mode){
   return m->kvq;
 }
 
-/* the same choice per side, so K can be q8_0 while V is ternary: returns the packed choice k*4+v, which equals the
-   request on success and the previous setting on refusal */
+/* the same choice per side, so K can be q8_0 while V is ternary: returns the packed choice k*8+v, which equals the
+   request on success and the previous setting on refusal.
+
+   The multiplier is 8, not 4: the formats now run 0..6, and k*4+v stopped being injective once v could reach 4 (K=q8_0
+   with V=4-bit gave 8, the same code as K=4-bit with V=fp16), so a refused setting could have matched a wanted one. */
 KCAPI int kc_kv_quant2(Model* m, int k, int v){
-  if(!kvq_ok(m, k) || !kvq_ok(m, v)) return m->kvq_k * 4 + m->kvq_v;
+  if(!kvq_ok(m, k) || !kvq_ok(m, v)) return m->kvq_k * 8 + m->kvq_v;
   m->kvq_k = k; m->kvq_v = v; m->kvq = k;          /* m->kvq stays the K side, which is what callers quote */
-  return m->kvq_k * 4 + m->kvq_v;
+  return m->kvq_k * 8 + m->kvq_v;
 }
 
 KCAPI void kc_dump_close(void){ if(g_dump_f){ fclose(g_dump_f); g_dump_f = NULL; } }
