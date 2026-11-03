@@ -745,6 +745,184 @@ static void gemv2(Model* m, int n, const Mat* const* A, float* const* yA, float*
   TS(prev);
 }
 
+/* ----------------------------------------------------------- the vector LUT: one lookup for N tokens
+   `rows8_b2` spends one vpermps per token per pair position, so a lookup returns 8 rows x 2 columns = 16 weights no
+   matter how many tokens are in flight. The form below makes the table entry itself carry the whole token batch:
+
+       TT[p][c] = (int16: token A's sum for pair code c) | (int16: token B's sum) << 16
+
+   Eight codes of int16 pairs is eight int32 - exactly one vpermd source - so one lookup fetches 8 rows x 2 columns x 2
+   tokens = 32 weights, twice the fp32 form. At N = 4 two tables (A,B) and (C,D) are permuted per pair position, so 64
+   weights over 2 lookups: still 32 a lookup, and the codes are decoded once for four tokens instead of once per token.
+
+   This is an int8 kernel, not an exact one: an entry is an int16 partial sum of int8 activations, so the values differ
+   from the fp32 tables the production kernel builds - the same trade rows8_q8 makes. int16 is enough for one 128-column
+   group (64 pairs of two int8 values, each pair at most 254), and the group's activation scale multiplies in when the
+   sum is widened to int32 and fp32.
+
+   The table is built per group into 2 KiB of stack and consumed by every row block before the next group replaces it.
+   That is the tiling the Vec-LUT paper (arXiv 2512.06443) reaches from the other end - its entry is an N-element int16
+   token vector selected by a scalar index, this one is a per-row int16 vector selected by vpermd, and both win by
+   making a lookup's output wider than one token. It costs a read and a write of y per group, and reads the table once
+   per row block.
+
+   Measurement surface only: kc_vlut_gemv and kc_b2_gemv are exports for tools/vlut. Neither is wired into the forward
+   pass, and the forward pass does not change. */
+KCAPI int kc_vlut_ok(void){
+#if defined(__AVX2__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+/* int8 activations in the vector LUT's form: one fp32 scale per 128-column group, the granularity of the row scale, so
+   a group is where the int16 sum ends and the fp32 multiply starts. Same arithmetic as quant_x, written serially: this
+   entry is called outside a parallel region and quant_x's `#pragma omp for` is only well defined inside one. */
+KCAPI void kc_q8_quant(const float* x, int C, signed char* Q, float* QS){
+  const int GS = 128;
+  for(int g = 0; g < C / GS; ++g){
+    const float* xg = x + (size_t)g * GS;
+    float mx = 0.0f;
+    for(int i = 0; i < GS; ++i){ const float av = fabsf(xg[i]); if(av > mx) mx = av; }
+    const float s = mx > 0.0f ? mx / 127.0f : 1.0f;
+    QS[g] = s;
+    for(int i = 0; i < GS; ++i){
+      long v = lrintf(xg[i] / s);
+      if(v > 127) v = 127; else if(v < -127) v = -127;
+      Q[(size_t)g * GS + i] = (signed char)v;
+    }
+  }
+}
+
+/* the production two-token kernel, single-threaded over every row block, so the comparison is the same arithmetic on
+   the same pack with none of the thread pool. gemv2 builds the pair tables and then calls rows8_b2, and both steps are
+   inside this call, exactly as the vector LUT's table build is inside its own. */
+KCAPI void kc_b2_gemv(const Mat* A, int nt, const float* const* X, float* const* Y, float* T, float* U){
+  const int P = A->C / 2;
+  for(int t = 0; t + 1 < nt; t += 2){
+    pair_tables(X[t], T, 0, P);
+    pair_tables(X[t + 1], U, 0, P);
+#if defined(__AVX2__)
+    rows8_b2(A, Y[t], Y[t + 1], T, U, 0, A->R / 8);
+#else
+    rows8_b2_ref(A, Y[t], Y[t + 1], T, U, 0, A->R / 8);
+#endif
+  }
+}
+
+#if defined(__AVX2__)
+/* the eight pair codes' two weight signs as int16 lanes: code c of the pack is the pair (even column, odd column), the
+   same map pair_tables writes t[0..7] from */
+static const short VLUT_EVEN[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+static const short VLUT_ODD[8]  = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+/* one group's table for one token pair, 64 pairs x 8 codes of (A,B) int16. `p` is the pair position inside the group
+   and `c` the code, so the layout is TT[8*p + c] and a vpermd over it is indexed by the eight rows' codes. */
+static void vlut_table(const signed char* xA, const signed char* xB, int32_t* TT){
+  const __m128i ve = _mm_loadu_si128((const __m128i*)VLUT_EVEN);
+  const __m128i vo = _mm_loadu_si128((const __m128i*)VLUT_ODD);
+  for(int p = 0; p < 64; ++p){
+    const __m128i ea = _mm_add_epi16(_mm_mullo_epi16(ve, _mm_set1_epi16((short)xA[2 * p])),
+                                     _mm_mullo_epi16(vo, _mm_set1_epi16((short)xA[2 * p + 1])));
+    const __m128i eb = _mm_add_epi16(_mm_mullo_epi16(ve, _mm_set1_epi16((short)xB[2 * p])),
+                                     _mm_mullo_epi16(vo, _mm_set1_epi16((short)xB[2 * p + 1])));
+    _mm_storeu_si128((__m128i*)(TT + 8 * p), _mm_unpacklo_epi16(ea, eb));         /* codes 0..3, A in the low half */
+    _mm_storeu_si128((__m128i*)(TT + 8 * p + 4), _mm_unpackhi_epi16(ea, eb));     /* codes 4..7 */
+  }
+}
+
+/* the two int16 halves of an accumulator lane as sign-extended int32: token A in the low half, B in the high */
+#define VLUT_LO(v) _mm256_srai_epi32(_mm256_slli_epi32((v), 16), 16)
+#define VLUT_HI(v) _mm256_srai_epi32((v), 16)
+
+static void vlut2(const Mat* A, const signed char* xA, const signed char* xB, const float* qsA, const float* qsB,
+                  float* yA, float* yB){
+  const int G = A->C / 128, U = A->R / 8;
+  const uint32_t* P = (const uint32_t*)A->W;
+  const __m256i sh = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+  const __m256i f = _mm256_set1_epi32(15);
+  const __m256i eight = _mm256_set1_epi32(8);
+  int32_t TT[64 * 8];
+  for(int g = 0; g < G; ++g){
+    vlut_table(xA + (size_t)g * 128, xB + (size_t)g * 128, TT);
+    const float qa = qsA[g], qb = qsB[g];
+    for(int u = 0; u < U; ++u){
+      const uint32_t* q = P + ((size_t)u * G + g) * 64;
+      if(g + 4 < G) for(int k = 0; k < 64; k += 16) _mm_prefetch((const char*)(q + 256 + k), _MM_HINT_T0);
+      __m256i acc = _mm256_setzero_si256();
+      for(int p = 0; p < 64; ++p){
+        const __m256i c = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int)q[p]), sh), f);
+        const __m256i z = _mm256_cmpeq_epi32(c, eight);              /* code 8 is the pair 0*0: no contribution */
+        const __m256i v = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)(TT + 8 * p)), c);
+        acc = _mm256_add_epi16(acc, _mm256_andnot_si256(z, v));
+      }
+      const __m256 s = _mm256_loadu_ps(A->S + ((size_t)u * G + g) * 8);
+      __m256 X0 = g ? _mm256_loadu_ps(yA + u * 8) : _mm256_setzero_ps();
+      __m256 X1 = g ? _mm256_loadu_ps(yB + u * 8) : _mm256_setzero_ps();
+      X0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(VLUT_LO(acc)), _mm256_mul_ps(_mm256_set1_ps(qa), s), X0);
+      X1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(VLUT_HI(acc)), _mm256_mul_ps(_mm256_set1_ps(qb), s), X1);
+      _mm256_storeu_ps(yA + u * 8, X0);
+      _mm256_storeu_ps(yB + u * 8, X1);
+    }
+  }
+}
+
+static void vlut4(const Mat* A, const signed char* const* X, const float* const* QS, float* const* Y){
+  const int G = A->C / 128, U = A->R / 8;
+  const uint32_t* P = (const uint32_t*)A->W;
+  const __m256i sh = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+  const __m256i f = _mm256_set1_epi32(15);
+  const __m256i eight = _mm256_set1_epi32(8);
+  int32_t T0[64 * 8], T1[64 * 8];
+  for(int g = 0; g < G; ++g){
+    vlut_table(X[0] + (size_t)g * 128, X[1] + (size_t)g * 128, T0);
+    vlut_table(X[2] + (size_t)g * 128, X[3] + (size_t)g * 128, T1);
+    const __m256 q0 = _mm256_set1_ps(QS[0][g]), q1 = _mm256_set1_ps(QS[1][g]);
+    const __m256 q2 = _mm256_set1_ps(QS[2][g]), q3 = _mm256_set1_ps(QS[3][g]);
+    for(int u = 0; u < U; ++u){
+      const uint32_t* q = P + ((size_t)u * G + g) * 64;
+      if(g + 4 < G) for(int k = 0; k < 64; k += 16) _mm_prefetch((const char*)(q + 256 + k), _MM_HINT_T0);
+      __m256i ab = _mm256_setzero_si256(), cd = _mm256_setzero_si256();
+      for(int p = 0; p < 64; ++p){
+        const __m256i c = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int)q[p]), sh), f);
+        const __m256i z = _mm256_cmpeq_epi32(c, eight);
+        const __m256i v0 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)(T0 + 8 * p)), c);
+        const __m256i v1 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)(T1 + 8 * p)), c);
+        ab = _mm256_add_epi16(ab, _mm256_andnot_si256(z, v0));
+        cd = _mm256_add_epi16(cd, _mm256_andnot_si256(z, v1));
+      }
+      const __m256 s = _mm256_loadu_ps(A->S + ((size_t)u * G + g) * 8);
+      __m256 Y0 = g ? _mm256_loadu_ps(Y[0] + u * 8) : _mm256_setzero_ps();
+      __m256 Y1 = g ? _mm256_loadu_ps(Y[1] + u * 8) : _mm256_setzero_ps();
+      __m256 Y2 = g ? _mm256_loadu_ps(Y[2] + u * 8) : _mm256_setzero_ps();
+      __m256 Y3 = g ? _mm256_loadu_ps(Y[3] + u * 8) : _mm256_setzero_ps();
+      Y0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(VLUT_LO(ab)), _mm256_mul_ps(q0, s), Y0);
+      Y1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(VLUT_HI(ab)), _mm256_mul_ps(q1, s), Y1);
+      Y2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(VLUT_LO(cd)), _mm256_mul_ps(q2, s), Y2);
+      Y3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(VLUT_HI(cd)), _mm256_mul_ps(q3, s), Y3);
+      _mm256_storeu_ps(Y[0] + u * 8, Y0);
+      _mm256_storeu_ps(Y[1] + u * 8, Y1);
+      _mm256_storeu_ps(Y[2] + u * 8, Y2);
+      _mm256_storeu_ps(Y[3] + u * 8, Y3);
+    }
+  }
+}
+#endif /* __AVX2__ */
+
+KCAPI int kc_vlut_gemv(const Mat* A, int nt, const signed char* const* X, const float* const* QS, float* const* Y){
+#if defined(__AVX2__)
+  if(A->C % 128 || A->R % 8) return -2;
+  if(nt == 2){ vlut2(A, X[0], X[1], QS[0], QS[1], Y[0], Y[1]); return 0; }
+  if(nt == 4){ vlut4(A, X, QS, Y); return 0; }
+  (void)Y;
+  return -1;
+#else
+  (void)A; (void)nt; (void)X; (void)QS; (void)Y;
+  return -1;
+#endif
+}
+
 /* --------------------------------------------------------------------------------- activation dump
    Diagnostic, off unless KINDI_CPU_DUMP names a file: the FFN input of every layer is appended once per layer
    per token as 2*D floats - the normalised residual m->xn, then its fold m->xp, the exact vector the ternary GEMV

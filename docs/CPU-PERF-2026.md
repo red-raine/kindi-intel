@@ -343,6 +343,75 @@ the 26 GB/s this host can stream, so no row here is waiting on data supply.
 1.32x and 1.43x, against 1.345x / 1.346x / 1.465x earlier - the absolute times move with the host, the ordering does
 not.)
 
+## The vector LUT: one lookup, N tokens
+
+The element-wise LUT above failed because it changed the *selection*: an 81-entry table needs a gather, and a gather is
+several uops where `vpermps` is one. The vector LUT changes the other end - it keeps the pair table and the `vpermps`,
+and makes the thing a lookup returns wider:
+
+```
+  rows8_b2  one token a table     TT[p][c] = fp32 (8 rows x 2 columns)     16 weights / vpermps
+
+  vector LUT  the batch in the entry
+            TT[p][c] = int16 A | int16 B << 16   in one int32 lane
+                      |         |
+                      |         +-- token B's partial sum for code c
+                      +------------ token A's partial sum for code c
+
+            8 codes = 8 int32 = one vpermd source, so one lookup returns
+            8 rows x 2 columns x 2 tokens = 32 weights / vpermd
+            and at N = 4 two tables (A,B) and (C,D) return 64 over 2 lookups
+```
+
+The int16 half is the price and it is not optional: two tokens fit in one 32-bit lane only because the sums are int16,
+so this is an int8-activation kernel - the trade `rows8_q8` already makes, one lookup wider. int16 is enough for one
+128-column group exactly: the worst case is 128 activations of 127 against all-+1 weights, 16256 against 32767, a
+measured 2.0x headroom (the selftest builds that pack and checks it). The table is built per group into 2 KiB of stack
+and consumed by every row block before the next group replaces it, which is the tiling the Vec-LUT paper
+([arXiv 2512.06443](https://arxiv.org/abs/2512.06443)) reaches from the other end: its entry is an N-element int16
+vector chosen by a scalar index, this one is a per-row int16 vector chosen by `vpermd`, and both win by making a
+lookup's output wider than one token.
+
+`kindi/kcpu.c` (`vlut2`, `vlut4`, exported as `kc_vlut_gemv`; `kc_b2_gemv` is the same `rows8_b2` for the other arm),
+measured by `python -m tools.vlut.measure` - both kernels single-threaded on the same pack and the same tokens, table
+build inside each arm's timing, ratios from interleaved A/B (median of per-round ratios, IQR around it):
+
+| matrix | N | `rows8_b2` (min) | vector LUT (min) | LUT time / b2 | GMAC/s b2 -> LUT |
+|---|---:|---:|---:|---:|---:|
+| 6144 x 2048 (12.6 M weights) | 2 | 1.20 ms | 0.95 ms | **0.88x [0.85-0.94]** | 21.0 -> 26.4 |
+| 6144 x 2048 | 4 | 2.41 ms | 1.24 ms | **0.58x [0.56-0.62]** | 20.8 -> 40.6 |
+| 1024 x 2048 (2.1 M) | 2 | 0.22 ms | 0.18 ms | **0.85x [0.81-0.86]** | 19.3 -> 23.1 |
+| 1024 x 2048 | 4 | 0.38 ms | 0.23 ms | **0.55x [0.52-0.57]** | 22.0 -> 36.7 |
+| 256 x 512 (0.13 M) | 2 | 0.022 ms | 0.012 ms | **0.53x [0.52-0.54]** | 11.3 -> 21.8 |
+| 256 x 512 | 4 | 0.040 ms | 0.020 ms | **0.49x [0.46-0.49]** | 15.0 -> 31.2 |
+
+Read the N = 2 rows for the lookup width - both arms make one pass over the weights there, so the ratio is the
+`vpermd` returning two tokens instead of one. Read N = 4 for batching: `rows8_b2` walks the weights twice, the LUT once.
+
+What the numbers say, including the part that is not a win:
+
+- **The lookup width pays at every size here, and most where everything is in cache.** 1.9x at 0.13 M weights, 1.18x
+  at 2.1 M, 1.14x at 12.6 M (3 MB of pair codes, past this host's L2) - this run's spreads were tight (2-8%).
+- **The N = 2 size of that win does not survive repeats, only its sign.** Four runs of the same code on this host gave
+  0.53-0.55 at 0.13 M, 0.70-0.85 at 2.1 M and 0.88-0.95 at 12.6 M, and one of them put the large-matrix row inside its
+  own noise ([0.87-1.08]). The LUT was faster at N = 2 in every run and faster still at N = 4 in every run; how much is ±0.1 and
+  the large-matrix column should be read as "the lookup is no longer the thing being waited on". 32 weights a lookup
+  buys 14-18% once the weight stream shares the budget, not 2x, because at N = 2 this kernel is front-end-bound on the
+  decode and the table stream rather than on `vpermd` alone.
+- **At N = 4 it is 1.7x, and half of that is not the lookup.** `rows8_b2` at N = 4 is two passes (2.41 ms against
+  1.20), the LUT is one, so the shared weight stream and the shared decode are part of the win. 24.3 GMAC/s at N = 2
+  against 40.6 at N = 4 is what a wider batch buys even at a fixed lookup width - and it is the number that matters
+  for a prefill, where the batch is real.
+- **It is not exact.** Against the fp32 kernel on the same tokens the int8 activations cost 6.4-6.6e-3 relative L2, and
+  against an int64 evaluation of its own quantised input the kernel is good to 5e-8 - so the kernel is exact and the
+  quantiser is the error. That is `rows8_q8`'s trade, and the exactness gate in this repo would refuse it as the
+  default tier for the same reason it refuses q8.
+
+It is **not wired into the forward pass**. Doing that needs int8 activations for two or four tokens inside `gemv2` (a
+second `Q`/`QS` pair), and it changes the numerics of the two-token pass, which is the path speculative decode leans
+on for bit-exactness with a single-token run. The measurement surface is there (`kc_vlut_gemv`), the decision the gate
+would have to make is separate, and this section is the number that decision needs.
+
 ## Column tiling is blocked on the pack layout
 
 Column-outer tiling would make the table L1-resident, but each thread would then read 256 B every 4 KB of the weight
@@ -476,6 +545,10 @@ L1) and 5x the build work compound it.
 That settles the family, and settles `3^5` without building it: a 243-entry table needs a different pack (5 trits per
 byte, the GGUF's 26-byte block layout) *and* more table per column, so it would be strictly worse than the 81-entry
 form measured here. The 4-trit pack's 81 entries are the most favourable case the gather could have had.
+
+What it does not settle is a vector LUT, which is a different family: it keeps the pair table and the `vpermps` and
+makes the *output* wider instead of the index, so nothing is gathered. That one is measured further down - see
+[the vector LUT](#the-vector-lut-one-lookup-n-tokens): 1.7x at N = 4, 1.1-1.9x at N = 2.
 
 ## Kernel tiers, and the native Windows build
 
