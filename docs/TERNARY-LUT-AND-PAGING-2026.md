@@ -177,6 +177,40 @@ a wasted read costs 9.5 ms of *link time* and directly displaces a useful one. A
 speculated token to an expert as `token_id % num_experts` is not a prediction - it is a hash, with an expected hit rate
 of 1/num_experts.
 
+### The distillation objective is sound; the over-fetch is not
+
+The follow-up proposed training the early heads properly - KL against the temperature-softened teacher router plus a
+Top-K margin-ranking term - and then raising prefetch recall from ~82% to >96% by fetching K+1 candidates, on the
+argument that the extra expert is "a negligible margin" of bus utilisation. The first half is reasonable. The second
+half is where it breaks, and it is arithmetic rather than opinion:
+
+```bash
+python -m tools.bitnet_gemm.prefetch_budget        # --recall / --overfetch to test other numbers
+```
+
+| policy | GB/token | B=1 | B=4 | B=6 | B=8 | B=16 |
+|---|---:|---:|---:|---:|---:|---:|
+| no prefetch (serial) | 0.92 | 723 | 1069 | 1299 | 1530 | 2451 |
+| exact fetch, 82% recall | 0.92 | 717 | 717 | 801 | 1031 | 1953 |
+| exact fetch, perfect recall | 0.92 | **608** | **608** | **691** | 922 | 1843 |
+| over-fetch 3, 96% recall | 1.38 | 936 | 936 | 936 | 946 | 1868 |
+| over-fetch 4, 99% recall | 1.84 | 1222 | 1222 | 1222 | 1222 | 1849 |
+
+ms per token, from the measured 9.5 ms read and 1.8 ms GEMV. At batch 1 the over-fetch is **29% slower than no prefetch
+at all** - it fetches 1.38 GB a token instead of 0.92 and the link has no spare time to absorb that. Raising recall by
+fetching more is counterproductive on a bandwidth-bound stream; raising it *at the same fetch count* is the only useful
+direction, and that is what a better head does. Over-fetch only overtakes the 82% exact arm at **B = 8**, and never
+overtakes exact fetch with perfect recall at any batch in the table.
+
+Note also what the columns say about the whole idea: prefetching is worth most at **B = 4-6** (43-47%), precisely where
+compute rises to meet the link - the same batching conclusion as above, reached from the scheduling side.
+
+Three defects in the training harness as written, beyond the model: the recall it prints is computed on the **training
+batches it is fitting**, with no held-out split, so 82% and 96% are upper bounds; the recall metric counts hits against a
+K+1 candidate set and divides by K, so over-fetching inflates the score by construction - the very comparison being drawn;
+and the calibration section takes the hidden state at the *start* of layer L while the runtime integration evaluates the
+head on layer L's post-attention output, so a head trained as specified is being used out of distribution.
+
 What does move the floor is changing the bytes or the work per byte, which is what the earlier sections already found:
 a **batch of 5-6 tokens** puts one expert's 9.5 ms under its own compute, and **smaller experts** (clustering 64 experts
 into 12, or a rank cut) divide the read by five and drop the break-even batch to about one. Both are model-side changes;
