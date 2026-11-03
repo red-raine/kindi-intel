@@ -89,6 +89,7 @@ SUITES = [
     ("suite:exodus", [sys.executable, "-m", "tools.exodus"], "check groups passed"),
     ("suite:datahub", [sys.executable, "-m", "tools.datahub.selftest"], "checks passed"),
     ("suite:fingerprint", [sys.executable, "-m", "tools.fingerprint.router", "--selftest"], "checks passed"),
+    ("suite:fingerprint_cell", [sys.executable, "-m", "tools.fingerprint.cell", "--selftest"], "checks passed"),
 ]
 
 

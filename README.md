@@ -330,11 +330,11 @@ the results of our runs with Kindi on the K420. kbench works with any OpenAI-com
 
 ## Testing
 
-One command runs every check in this repository - module imports, the quantiser and converter self-tests, the seven tool
+One command runs every check in this repository - module imports, the quantiser and converter self-tests, the eight tool
 suites, the CLI, and the links in these documents:
 
 ```bash
-python -m tools.selftest            # 13 ok, 6 skipped, 0 failed, ~35 s
+python -m tools.selftest            # 14 ok, 6 skipped, 0 failed, ~40 s
 python -m tools.selftest --verbose  # timings, and every skip with its reason
 ```
 

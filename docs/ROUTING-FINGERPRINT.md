@@ -48,6 +48,12 @@ Two negative results are worth as much as that one:
   codebook at k = 64/256/1024, lands at 0.29-0.35 hit1 against 0.46-0.54 for the full 20-NN, and the cheapest variant
   that keeps 20-NN inside a cell is still 0.02-0.04 behind it (`sweep.log`, with intervals in `ci.log`, both in
   `~/kt_route`). The distance over all 2,048 bits is what carries the class information.
+
+  `tools/fingerprint/cell.py` now sweeps probe bits x candidate budget on a corpus with known answers and reaches the same
+  verdict from the cost side: the cheapest setting that keeps **95%** of the full router's hit1 scans **94-95%** of the
+  corpus on three separate signal strengths (probe 12, budget 256: 98.4% retention for 93.8% of the scan). Below 95% the
+  curve is no kinder - 88.9% of the scan buys 94.5% of the hit rate. A cell index is not worth a second data structure
+  here, which is what the sentence above says in one line and this table says in seven.
 - **Which bits you pick barely matters.** Random bit selection scores 0.2911 against 0.2928 for the learned selection
   at layer 15 (`ablate.log`), so the "learned" table was measuring the table, not the bit choice.
 
@@ -91,6 +97,10 @@ It does **not** reproduce the tables above, and it cannot: the corpus those numb
 reads a `~/kt_route/corpus`-style directory if one reappears; until then the numbers in this note remain unverifiable from
 this tree for the same reason the rotation conclusion does, and for a different reason the router itself is now
 testable - the arithmetic and the protocol are checked, the measurement is not.
+
+The sweep also exposes an ordering mistake worth not making twice: **the budget binds only when the probe key is wide
+enough that cells exceed it.** At 4 probe bits a cell holds about N/16 candidates, so every budget from 16 upward gives
+the same hit rate - the budget is never consulted, and the table reads as if the budget did nothing.
 
 One thing the component already shows about method: on a planted corpus with clean codes (0.92 agreement) the tuner picks
 **k = 1** and 1-NN scores 0.9875 against 0.8750 for 20-NN, while on the real corpus above 1-NN scored 0.2946 against

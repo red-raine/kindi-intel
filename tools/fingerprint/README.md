@@ -56,6 +56,35 @@ be tuned per corpus rather than fixed at 20.
 | previous-token table | 0.5813 | [0.5125, 0.6562] |
 | global majority | 0.4875 | [0.4062, 0.5687] |
 
+## cell-plus-NN: what the sweep says (`cell.py`)
+
+```bash
+python -m tools.fingerprint.cell --selftest      # 12 checks
+python -m tools.fingerprint.cell                 # the sweep and the selected setting
+```
+
+Cell = exact match on `p` probe bits under one fixed coordinate permutation; candidates = that cell, **split on 4 more bits
+whenever it exceeds the budget** rather than truncated at random, because a random drop would make the miss rate an
+artifact of insertion order. Cost = mean candidates scanned x D + p.
+
+On the named corpus the answer is a **no**, and it is the note's conclusion reached from the other side:
+
+| setting | hit1 | retention | scanned |
+|---|---:|---:|---:|
+| full 20-NN | 0.8000 | 100% | 144 of 144 |
+| **cheapest >=95%**: probe 12, budget 256 | 0.7875 | **98.4%** | **135.1 (93.8%)** |
+| probe 16, budget 128 | 0.7562 | 94.5% | 128.0 (88.9%) |
+| probe 8, budget 128 | 0.6375 | 79.7% | 86.9 (60.3%) |
+
+Two more corpora at weaker signal land in the same place: cheapest >=95% scans **94%** (reference hit1 0.7865) and
+**95%** (0.8438). So a cell index saves about 5% of a scan to keep 95% of the hit rate - not a trade worth a second data
+structure.
+
+One structural fact falls out of the table and is easy to get wrong: **the budget only binds when the probe key is wide
+enough that cells exceed it.** At probe 4 a cell holds about N/16 candidates, so every budget from 16 to unbounded yields
+the same 0.34 - the budget is never consulted. The frontier is therefore not "few probe bits, large budget" but "probe
+wide enough that the budget is the binding constraint".
+
 ## To re-derive the real numbers
 
 The index needs fingerprints, which need a pack and a forward pass. `route_dump.py` in the temp directory is the script
