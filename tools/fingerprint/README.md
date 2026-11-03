@@ -163,6 +163,11 @@ python -m tools.fingerprint.index               # the crossover table: same sett
 A candidate count is not a clock. Gathering cells costs a search and a gather; the full arm costs one matmul of `N x D`.
 `index.py` builds the keys once and times both arms on the same queries, and the outcome is a **crossover**, not a win.
 
+Every timing here is a **median of repeated rounds with its spread**, printed beside the ratio, and `tools/bench` says when
+a ratio is inside the spread and should be read as noise rather than a win. On this host the floor is 4-6% for a fixed
+workload; the per-query spreads in these tables run 11-30%, because a 100-3000 us query is mostly scheduler on a shared
+machine. The ratios quoted are outside their spread, which is the only reason they are quoted.
+
 The first version searched the keys one at a time - 93 `searchsorted` calls at radius 3, `p=8` - which made the gather,
 not the distance work, the expensive part:
 

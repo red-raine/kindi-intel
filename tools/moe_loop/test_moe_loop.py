@@ -11,6 +11,7 @@ import time
 
 import torch
 
+from ..bench import bench, compare as bench_cmp
 from . import layers
 
 PASS = []
@@ -100,19 +101,17 @@ def test_dispatch_work():
         with torch.no_grad():
             y = b(x)                                # warm-up, also allocates the cached tensors
             b.calls = b.rows = 0
-            best = float("inf")
-            for _ in range(5):
-                t0 = time.perf_counter()
-                y = b(x)
-                best = min(best, time.perf_counter() - t0)
-            times[dispatch] = best
-            out[dispatch] = y
+            times[dispatch] = bench(lambda: b(x), rounds=7, warmup=1)
+            out[dispatch] = b(x)
         rows[dispatch] = b.rows
     assert rows["mask"] == 8 * rows["index_add"], \
         "the mask dispatch should do 8x the rows for 8 experts: %r" % rows
     assert torch.allclose(out["mask"], out["index_add"], atol=1e-5, rtol=1e-4), \
         "the two dispatches disagree: max |diff| %.2e" % float((out["mask"] - out["index_add"]).abs().max())
-    print("     measured (not asserted): mask %.1f ms, index_add %.1f ms" % (1e3 * times["mask"], 1e3 * times["index_add"]))
+    c = bench_cmp(times["mask"], times["index_add"], "mask", "index_add")
+    print("     measured, not asserted: mask %.1f ms (%.0f%% spread), index_add %.1f ms (%.0f%% spread) -> %s"
+          % (1e3 * times["mask"]["median"], 100 * times["mask"]["rel"],
+             1e3 * times["index_add"]["median"], 100 * times["index_add"]["rel"], c["text"]))
 
 
 def test_logit_average_flattens():

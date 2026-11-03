@@ -92,6 +92,7 @@ SUITES = [
     ("suite:fingerprint_cell", [sys.executable, "-m", "tools.fingerprint.cell", "--selftest"], "checks passed"),
     ("suite:fingerprint_probe", [sys.executable, "-m", "tools.fingerprint.probe", "--selftest"], "checks passed"),
     ("suite:fingerprint_index", [sys.executable, "-m", "tools.fingerprint.index", "--selftest"], "checks passed"),
+    ("suite:bench", [sys.executable, "-m", "tools.bench", "--selftest"], "checks passed"),
     ("suite:kvq", [sys.executable, "-m", "tools.kvq.measure", "--selftest"], "checks passed"),
 ]
 

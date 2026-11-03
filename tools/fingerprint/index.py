@@ -18,6 +18,7 @@ import time
 
 import numpy as np
 
+from ..bench import compare
 from . import cell as C
 from . import probe as P
 from . import router as R
@@ -94,12 +95,13 @@ def answer(bits, ref_bits, ref_cls, q, rows, k=TOPK):
     return R.predict(votes)[0]
 
 
-def timed_fold(corpus, layer, p, radius, budget, repeats=3, seed=0):
+def timed_fold(corpus, layer, p, radius, budget, repeats=3, seed=0, stats=None):
     """One leave-one-document-out pass with both arms timed on identical queries.
 
-    Returns per-position records of (full prediction, index prediction, candidates scanned) and the mean seconds per
-    query for each arm. `repeats` takes the best of several rounds, because a 40 microsecond measurement on a shared
-    machine is mostly scheduler noise otherwise.
+    Returns per-position records of (full prediction, index prediction, candidates scanned) and the **median** seconds per
+    query for each arm. `repeats` takes the best of several rounds per query, because a single sample of a
+    tens-of-microseconds call is mostly scheduler noise; `stats` collects the per-query sample vectors so the caller can
+    report the spread too, rather than a median with nothing beside it.
     """
     bits = corpus.layer(layer)
     recs, t_full, t_idx, build_s = [], [], [], []
@@ -123,7 +125,11 @@ def timed_fold(corpus, layer, p, radius, budget, repeats=3, seed=0):
             t_full.append(best_full)
             t_idx.append(best_idx)
             recs.append((q, full, got, scanned))
-    return recs, float(np.mean(t_full)), float(np.mean(t_idx)), float(np.mean(build_s))
+    if stats is not None:
+        stats["full"] = t_full
+        stats["idx"] = t_idx
+        stats["build"] = build_s
+    return recs, float(np.median(t_full)), float(np.median(t_idx)), float(np.median(build_s))
 
 
 def hits(recs, corpus, k=TOPK):
@@ -285,11 +291,19 @@ def report(corpus, layer):
     print("\n  %-14s %8s %10s %10s %8s %8s %9s" % ("setting", "hit1", "us/query", "full us", "scan%", "build ms",
                                                    "identical"))
     for p, radius, budget in ((0, 0, None), (8, 2, 96), (8, 3, 96), (8, 3, None)):
-        recs, t_full, t_idx, build = timed_fold(corpus, layer, p, radius, budget, repeats=3)
+        stats = {}
+        recs, t_full, t_idx, build = timed_fold(corpus, layer, p, radius, budget, repeats=3, stats=stats)
         s = hits(recs, corpus)
-        print("  p%-2d r%d b%-6s %8.4f %10.1f %10.1f %8.1f %8.1f %9.0f%%"
+        def spread(v):
+            return float(np.std(v) / max(np.mean(v), 1e-12))
+        print("  p%-2d r%d b%-6s %8.4f %8.1f %10.1f %8.1f %8.1f %9.0f%%"
               % (p, radius, "all" if budget is None else budget, s["idx_hit1"], 1e6 * t_idx, 1e6 * t_full,
                  100 * s["mean_scan"] / len(corpus.cls), 1e3 * build, 100 * s["identical"]))
+        if p or radius or budget is not None:
+            c2 = compare(dict(median=t_full, rel=spread(stats["full"])), dict(median=t_idx, rel=spread(stats["idx"])),
+                         "full", "index")
+            print("  %-14s %8s spread %.0f%% full / %.0f%% index -> %s"
+                  % ("", "", 100 * spread(stats["full"]), 100 * spread(stats["idx"]), c2["text"]))
     print("\nThe p=0 row is the router itself, so its 'speedup' is 1.0 by construction: it exists to show the timed arm\n"
           "computes the same predictions. Anything above it is an approximation, and cheap only counts if it holds up.")
     return 0
@@ -364,14 +378,20 @@ def main(argv):
     print("  %-18s %6s %10s %10s %8s %8s" % ("corpus", "N", "full us", "index us", "ratio", "scan%"))
     for dim, pos in ((192, 16), (1024, 16), (2048, 16), (2048, 32)):
         c = R.synth_corpus(docs=12, positions=pos, dim=dim, nclass=40, seed=61, layer_signal=(0.5, 0.92))
-        recs, t_full, t_idx, build = timed_fold(c, 1, 8, 3, 96, repeats=3)
+        stats = {}
+        recs, t_full, t_idx, build = timed_fold(c, 1, 8, 3, 96, repeats=3, stats=stats)
         s = hits(recs, c)
         n_train = len(c.cls) - pos
         print("  %-18s %6d %10.1f %10.1f %8.2fx %7.0f%%"
               % ("%d bits, %d pos" % (dim, pos), n_train, 1e6 * t_full, 1e6 * t_idx, t_idx / t_full,
                  100 * s["mean_scan"] / n_train))
+        sp = (float(np.std(stats["full"]) / max(np.mean(stats["full"]), 1e-12)),
+              float(np.std(stats["idx"]) / max(np.mean(stats["idx"]), 1e-12)))
+        verdict = compare(dict(median=t_full, rel=sp[0]), dict(median=t_idx, rel=sp[1]), "full", "index")
         print("  %-18s %6s hit1 %.3f (index) vs %.3f (full), %.0f%% of predictions identical, build %.1f ms"
               % ("", "", s["idx_hit1"], s["full_hit1"], 100 * s["identical"], 1e3 * build))
+        print("  %-18s %6s spread %.0f%% full / %.0f%% index -> %s"
+              % ("", "", 100 * sp[0], 100 * sp[1], verdict["text"]))
     print("\nBelow the crossover the probe's fixed cost (~93 key lookups and a gather) is larger than the matmul it replaces;\n"
           "above it the saved multiply-adds win, and the saving grows with N because the full arm's cost is O(N x D).")
     return 0
