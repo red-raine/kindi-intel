@@ -96,6 +96,8 @@ def cmd_bench(cfg, a):
 
 def cmd_recipes(cfg, a):
     from . import recipes
+    if a.scan:
+        return recipes.scan(a.scan, role=a.role, log=log)
     if not a.src:
         return recipes.listing(log=log)
     det = recipes.detect(a.src)
@@ -306,6 +308,8 @@ def main(argv=None):
     s.add_argument("--prompts", type=int, default=3, help="prompts (default 3)")
     s = sub.add_parser("recipes", help="what a model is, and the conversion plan for a job (coder, rag, search, ...)")
     s.add_argument("src", nargs="?", help="a GGUF file or a pack directory (default: list the recipes)")
+    s.add_argument("--scan", metavar="DIR",
+                   help="detect every .gguf under DIR (headers only) and print the recipe each one would get")
     s.add_argument("--for", dest="src2", help="same as the positional argument")
     s.add_argument("--role", choices=("coder", "agent", "rag", "search", "science", "chat"),
                    help="the job to plan for (default: inferred from the file's name and shape)")

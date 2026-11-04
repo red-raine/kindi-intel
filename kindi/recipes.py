@@ -22,9 +22,13 @@ tell you it does not guess - a file with no `*.expert_count` is not assumed to b
   kindi recipes                          # the recipes, and what each one changes
   kindi recipes --for MODEL.gguf         # detect the file, then the plan for the best-matching recipe
   kindi recipes --for MODEL.gguf --role rag --json
+  kindi recipes --scan B:/models          # every model under a directory, and the recipe each would get
 """
 import json
 import os
+import re
+import shutil
+import tempfile
 
 # --- detection --------------------------------------------------------------------------------------------------------
 
@@ -239,6 +243,49 @@ def listing(log=print):
     return 0
 
 
+def _ggufs(root):
+    """every first-part GGUF under root: later shards of a split file and partial downloads are skipped"""
+    out = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for n in sorted(files):
+            if not n.lower().endswith(".gguf"):
+                continue
+            m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", n)
+            if m and int(m.group(1)) != 1:
+                continue
+            out.append(os.path.join(dirpath, n))
+    return out
+
+
+def scan(root, role=None, log=print):
+    """Detect every model under a directory and print the recipe each would get.
+
+    Headers only, so this is cheap across a folder of sharded 30 GB files, and it is the way to triage a model folder:
+    the last column names the first thing a conversion would refuse, or `ready`.
+    """
+    files = _ggufs(root)
+    if not files:
+        log("no .gguf files under %s" % root)
+        return 1
+    log("%d model file(s) under %s" % (len(files), root))
+    for p in files:
+        try:
+            d = detect(p)
+        except Exception as e:                                  # a truncated or foreign file is reported, not skipped
+            log("  %-44s cannot read the header: %s" % (os.path.basename(p), str(e) or type(e).__name__))
+            continue
+        r = plan(d, role)
+        geo = "%s %sL w%s %s ctx%s" % (d.get("family") or "?", d.get("layers") or "?", d.get("width") or "?",
+                                       "%dx%d" % (d["experts"], d["active_experts"]) if d.get("moe") else "dense",
+                                       d.get("ctx") or "?")
+        log("  %-44s %-38s %-7s %s" % (os.path.basename(p), geo, r["role"],
+                                       ("%d warning(s): %s" % (len(r["warnings"]), r["warnings"][0]))
+                                       if r["warnings"] else "ready"))
+    log("kindi recipes --for FILE --role ROLE  is the full plan for one file")
+    return 0
+
+
 def selftest():
     """Detection on headers this repository has seen, and the plan rules that follow from them."""
     def check(name, ok, detail=""):
@@ -304,6 +351,20 @@ def selftest():
         pass
     else:
         raise AssertionError("an unknown role must be refused")
+
+    # a scan lists a model once: shards 2..N of a split file are the same model's tail, not four more models
+    td = tempfile.mkdtemp(prefix="kindi-recipes-")
+    try:
+        for n in ("m-00001-of-00003.gguf", "m-00002-of-00003.gguf", "m-00003-of-00003.gguf", "solo.gguf",
+                  "half.gguf.part"):
+            open(os.path.join(td, n), "wb").close()
+        os.makedirs(os.path.join(td, ".cache"))
+        open(os.path.join(td, ".cache", "hidden.gguf"), "wb").close()
+        got = sorted(os.path.basename(p) for p in _ggufs(td))
+        check("scan: one entry per model, no partials, no dot directories",
+              got == ["m-00001-of-00003.gguf", "solo.gguf"], str(got))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
     return 0
 
 

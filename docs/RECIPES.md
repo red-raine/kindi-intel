@@ -29,6 +29,30 @@ Measured on this machine, as a check that the reader agrees with real files:
 | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | `qwen35`, 64 layers, width 5120, no experts, context 262144, 248320 tokens | `PTQ1_0 x402`, `F32 x353`, `BF16 x96` |
 | `Qwen3-Coder-30B-A3B-Instruct-Q2_K.gguf` | `qwen3moe`, 48 layers, width 2048, **128 experts, 8 active**, context 262144 | mixed `Q2_K/Q3_K/Q4_K/Q6_K`: not a ternary source, so the pack path refuses it with that reason |
 
+A whole folder at once, headers only, which is how the table above was checked against every model on this machine:
+
+```
+kindi recipes --scan B:/models
+  14 model file(s) under B:/models
+  Mixtral-8x22B-v0.1.Q8_0-00001-of-00005.gguf  llama 56L w6144 8x2 ctx65536       agent   2 warning(s): llama has no conversion path ...
+  Qwen3-Coder-30B-A3B-Instruct-Q2_K.gguf       qwen3moe 48L w2048 128x8 ctx262144 coder   1 warning(s): the file is not ternary ...
+  Ternary-Bonsai-2-27B-PTQ1_0.gguf             qwen35 64L w5120 dense ctx262144    chat    ready
+  model_gsq.gguf                               cannot read the header: truncated or corrupt: a tensor name
+                                               (2670395422995916235 bytes) needs ... but the file has 79681 left
+```
+
+Only the first part of a split file is listed, partial downloads and dot directories are skipped, and a file whose
+header cannot be read is reported with the reason. Running it found one: `qwen-0.5b-pilot/quantized/model_gsq.gguf`
+is 79 KB and its header claims a 2.6-exabyte tensor name. The reader used to accept the length and ask for the memory,
+which is why it exited with a bare `MemoryError` naming nothing; `kindi.gguf` now checks every stated length - a
+string, an array's count, a rank's dimensions, the tensor and metadata counts - against the bytes the file actually
+has, and says which field at which offset is impossible. `kindi.gguf.selftest` keeps that fixed with a tiny valid
+file, a file cut three bytes short, and an array claiming 2^40 elements.
+
+A header is metadata, not integrity: a file whose header parses can still carry a truncated tensor. The check that
+covers that is loading the pack (`kindi serve` reads every tensor it is asked for) or the sha256 `kindi fetch`
+verifies at download.
+
 ## Recipes
 
 A recipe is the set of conversion decisions this engine can actually execute, plus the gate the result must pass. It
