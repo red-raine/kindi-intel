@@ -70,7 +70,7 @@ def check_imports():
 def check_engine_selftests():
     results = []
     for mod, fn in (("kindi.quant", "selftest"), ("kindi.convert", "selftest"), ("kindi.gguf", "selftest"),
-                    ("kindi.catalog", "selftest")):
+                    ("kindi.catalog", "selftest"), ("kindi.cpu", "selftest")):
         try:
             m = importlib.import_module(mod)
             getattr(m, fn)()

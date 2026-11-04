@@ -154,6 +154,77 @@ class Mat(ctypes.Structure):
     _fields_ = [("W", PU8), ("S", PF), ("R", ctypes.c_int), ("C", ctypes.c_int)]
 
 
+BLOCK = 32                  # the column block every kernel walks a row in (kcpu.c: `for b < n / 32`)
+GROUP = 128                 # the columns one fp16 scale covers, and the pair-code staging group
+PAGE = 8                    # the rows the pair-code layout stages together
+
+
+def _check_pack_bytes(pack, d, bi, idx):
+    """Does every tensor the loader will point at fit in its file, at a geometry the kernels can walk?
+
+    The loader hands the C side raw pointers into `bcodes.bin`, `f32.bin` and `pcodes.bin`. A truncated file does not
+    fail at that moment: the slice comes back short, the pointer is taken anyway, and the kernel reads past the end -
+    a wrong answer, or a segfault that names neither the file nor the tensor. A geometry the layouts cannot represent
+    fails the same way but earlier: a row length that is not a whole number of 32-column blocks is walked as `n / 32`
+    blocks and its tail is dropped, a row that is not a whole number of 128-column groups has no scale for its last
+    columns, and a row count that is not a multiple of 8 cannot be staged in pair-code blocks at all.
+
+    So this is the check that has to run before the first pointer exists. It reports every problem it finds, names the
+    tensor ("the MoE router" for the router, since that is the one a reader looks for), and says which file and which
+    bytes are involved rather than a number from inside a reshape.
+    """
+    D = int(d["width"])
+    bad = []
+    if D % BLOCK:
+        bad.append("the model width is %d, which is not a multiple of %d: %d columns are left over, and every kernel "
+                   "walks a row in %d-column blocks, so that tail would be dropped or read past the row's end"
+                   % (D, BLOCK, D % BLOCK, BLOCK))
+    size = {}
+    for n in ("bcodes.bin", "f32.bin", "pcodes.bin"):
+        p = os.path.join(pack, n)
+        if os.path.isfile(p):
+            size[n] = os.path.getsize(p)
+    for name, rec in bi.items():
+        R, C = int(rec["rows"]), int(rec["ne0"])
+        what = "the MoE router" if name.endswith(".moe_router.weight") else "tensor %s" % name
+        if C % BLOCK:
+            bad.append("%s: its rows are %d wide, which is not a multiple of %d - the kernel's last block would read "
+                       "%d columns past the row's end" % (what, C, BLOCK, C % BLOCK))
+        elif C % GROUP:
+            bad.append("%s: its rows are %d wide, and one scale covers %d columns, so the last %d would have no "
+                       "scale (the pack stores one fp16 a group)" % (what, C, GROUP, C % GROUP))
+        if R % PAGE:
+            bad.append("%s: it has %d rows, and the pair-code layout stages rows in blocks of %d" % (what, R, PAGE))
+        off, need = int(rec["bc_off"]), R * (C // 4)
+        if off + need > size.get("bcodes.bin", 0):
+            bad.append("%s: bytes %d..%d of bcodes.bin, which holds %d - the file is truncated, or its index belongs "
+                       "to another pack" % (what, off, off + need, size.get("bcodes.bin", 0)))
+        if "pc_off" in rec:
+            po = int(rec["pc_off"])
+            if po % 4:
+                bad.append("%s: pcodes.bin offset %d is not a multiple of 4, and the staged pair codes are read as "
+                           "32-bit words" % (what, po))
+            elif po + _pair_len(rec) > size.get("pcodes.bin", 0):
+                bad.append("%s: bytes %d..%d of pcodes.bin, which holds %d - the staged form is incomplete"
+                           % (what, po, po + _pair_len(rec), size.get("pcodes.bin", 0)))
+    for name, rec in idx.items():
+        if "f32_off" not in rec:            # index.json lists the ternary tensors too; their bytes are bcodes.bin
+            continue
+        R, C, off = int(rec["rows"]), int(rec["ne0"]), int(rec["f32_off"])
+        if off % 4:
+            bad.append("tensor %s: f32.bin offset %d is not a multiple of 4, and the file is read as float32"
+                       % (name, off))
+        elif off + 4 * R * C > size.get("f32.bin", 0):
+            bad.append("tensor %s: bytes %d..%d of f32.bin, which holds %d - the file is truncated"
+                       % (name, off, off + 4 * R * C, size.get("f32.bin", 0)))
+    if bad:
+        more = "" if len(bad) <= 8 else "\n  and %d more" % (len(bad) - 8)
+        raise SystemExit("kindi-cpu: %s cannot be loaded as it stands.\n  %s%s\n"
+                         "  The pack's bytes and its index disagree; convert the model again "
+                         "(`kindi convert MODEL.gguf DIR`), and `kindi info --pack DIR` shows the geometry it records."
+                         % (pack, "\n  ".join(bad[:8]), more))
+
+
 class Moe(ctypes.Structure):
     """the router and the expert table of a Mixture-of-experts FFN (nexp == 0 on a dense layer)"""
     _fields_ = [("router", Mat), ("nexp", ctypes.c_int), ("nact", ctypes.c_int), ("staged", ctypes.c_int),
@@ -315,6 +386,9 @@ class Engine(object):
         interval = d["full_attention_interval"]
         idx = json.load(open(os.path.join(pack, "index.json")))["tensors"]
         bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        # the bytes and the geometry first: a width no kernel can walk is the root cause of the missing-signs
+        # message below, and a short file must stop before the names are checked against a pack that cannot be read
+        _check_pack_bytes(pack, d, bi, idx)
         problem = _layout_problem(pack, man, d, bi, idx, self.head_name,
                                   [D, NV * HK, NH * HD, NFF] + ([NFF // 2] if d.get("experts") else []))
         if problem:
@@ -841,3 +915,104 @@ def generate_spec(eng, ids, n, k=1, stats=None):
         pos += len(a)
         last = a[-1]
     return out[:n]
+
+
+# --- checks -----------------------------------------------------------------------------------------------------------
+
+def selftest():
+    """A good pack loads; a truncated file, a width no kernel can walk and a misaligned offset each stop by name.
+
+    The three failures used to be a short slice, a reshape error and a pointer past the end of a buffer, none of which
+    names the file the reader has to fix. This builds one synthetic MoE pack and breaks it one way at a time.
+    """
+    import json
+    import shutil
+    import tempfile
+
+    from . import synthpack
+    from .cpu import _check_pack_bytes
+
+    def check(name, ok, detail=""):            # silent: tools.selftest runs this in process and prints the summary
+        if not ok:
+            raise AssertionError("%s%s" % (name, (": " + detail) if detail else ""))
+
+    def refuses(name, want, fn):
+        """fn must stop with a SystemExit that contains every string in `want`"""
+        try:
+            fn()
+        except SystemExit as e:
+            msg = str(e)
+            check(name, all(w in msg for w in want), msg)
+        else:
+            check(name, False, "it did not refuse")
+
+    td = tempfile.mkdtemp(prefix="kindi-cpu-check-")
+    try:
+        pack, _, _ = synthpack.build(td, log=lambda *x: None, experts=4, experts_active=2, paircodes=True)
+        man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+        d = man["dimensions"]
+        bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+        idx = json.load(open(os.path.join(pack, "index.json")))["tensors"]
+
+        eng = Engine(pack, ctx=64, log=lambda *x: None)      # the check is wired in, and a whole pack passes it
+        check("a complete pack loads, so the checks are not refusing good packs", eng.dims["width"] == d["width"])
+        check("the pack has a router to check", any(n.endswith(".moe_router.weight") for n in bi))
+
+        router = next(n for n in bi if n.endswith(".moe_router.weight"))
+        broken = json.loads(json.dumps(bi))
+        broken[router]["ne0"] = 250                          # the router's row length, one kernel block short
+        refuses("a router whose width is not a multiple of 32 is refused and named",
+                ["the MoE router", "not a multiple of 32"], lambda: _check_pack_bytes(pack, d, broken, idx))
+
+        broken = json.loads(json.dumps(bi))
+        broken[router]["ne0"] = 256 + 64                     # 320: a multiple of 32, not of the 128-column group
+        refuses("a row length that loses a scale group is refused",
+                ["no scale", "128"], lambda: _check_pack_bytes(pack, d, broken, idx))
+
+        broken = json.loads(json.dumps(bi))
+        broken[router]["rows"] = 5                           # 4 experts + 1: cannot be staged in 8-row blocks
+        refuses("a row count that is not a multiple of 8 is refused",
+                ["blocks of 8"], lambda: _check_pack_bytes(pack, d, broken, idx))
+
+        staged = [n for n in bi if "pc_off" in bi[n]]       # only the paged expert matrices are staged
+        check("the pack stages some tensors in pcodes.bin", bool(staged))
+        broken = json.loads(json.dumps(bi))
+        broken[staged[0]]["pc_off"] += 2                     # the staged form is read as 32-bit words
+        refuses("a pcodes offset that is not word-aligned is refused",
+                ["multiple of 4"], lambda: _check_pack_bytes(pack, d, broken, idx))
+
+        bad = dict(d, width=250)
+        refuses("a model width that is not a multiple of 32 is refused before a pointer exists",
+                ["width is 250", "not a multiple of 32"], lambda: _check_pack_bytes(pack, bad, bi, idx))
+        man_bad = os.path.join(td, "width250")
+        shutil.copytree(pack, man_bad)
+        mp = os.path.join(man_bad, "kindi_pack.json")
+        m2 = json.load(open(mp))
+        m2["dimensions"]["width"] = 250
+        json.dump(m2, open(mp, "w"))
+        refuses("the engine itself refuses that manifest", ["not a multiple of 32"],
+                lambda: Engine(man_bad, ctx=64, log=lambda *x: None))
+
+        def cut(name, n):
+            p = os.path.join(pack, name)
+            with open(p, "r+b") as f:
+                f.truncate(os.path.getsize(p) - n)
+
+        cut("bcodes.bin", 4096)
+        refuses("a truncated bcodes.bin is refused with the file and the tensor",
+                ["bcodes.bin", "truncated"], lambda: Engine(pack, ctx=64, log=lambda *x: None))
+        cut("f32.bin", 4)
+        refuses("a truncated f32.bin is refused", ["f32.bin", "truncated"],
+                lambda: Engine(pack, ctx=64, log=lambda *x: None))
+        cut("pcodes.bin", 4096)
+        refuses("a truncated pcodes.bin is refused", ["pcodes.bin"],
+                lambda: Engine(pack, ctx=64, log=lambda *x: None))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    selftest()
+    print("checks passed")
+    raise SystemExit(0)

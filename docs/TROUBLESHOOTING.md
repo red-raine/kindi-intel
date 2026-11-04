@@ -17,6 +17,15 @@ matching GGUF again: `kindi convert MODEL.gguf DIR`. A pack missing whole files 
 `bcodes_index.json`, `bcodes.bin`) is not a CPU pack at all: a Gemma 4 or Nemotron pack holds `model_path` and is
 served by the GPU backend.
 
+**`kindi-cpu: ... cannot be loaded as it stands`.** The loader points the C side straight into `bcodes.bin`, `f32.bin`
+and `pcodes.bin`, so before the first pointer exists it checks every tensor's bytes against the size of its file and
+every geometry against what the kernels walk. A truncated file is named with the tensor and the byte range ("bytes
+434176..442368 of bcodes.bin, which holds 438272"). A model width that is not a multiple of 32, a row length that
+loses a 128-column scale group, a row count that is not a multiple of 8, and a staged `pcodes` offset that is not a
+multiple of 4 are refused the same way, because each of those is read past the row's end or dropped silently by a
+kernel instead of failing where the reader can see it (the router is called "the MoE router" in the message). Convert
+the model again: `kindi convert MODEL.gguf DIR`; `kindi info --pack DIR` shows the geometry the pack records.
+
 **CUDA errors such as `no kernel image is available` or `CUDA driver version is insufficient`.** Use the NVIDIA 470
 driver and the CUDA 10.2 stack in the Docker image.
 

@@ -17,6 +17,11 @@
 
 ### Fixed
 
+- **A CPU pack is checked against its own bytes before a pointer is taken.** A truncated `bcodes.bin`, `f32.bin` or
+  `pcodes.bin` used to hand the kernel a short buffer; a model width that is not a multiple of 32, a row length that
+  loses a 128-column scale group, a row count that is not a multiple of 8 or a staged offset that is not word-aligned
+  used to be read past the row's end or dropped silently. All six are now refused at load, naming the file, the tensor
+  ("the MoE router") and the bytes.
 - **A GGUF header length the file cannot back is refused by name.** A 79 KB file whose header claims a 2.6-exabyte
   tensor name used to end in a bare `MemoryError`; every stated length is now checked against the bytes that remain.
 
