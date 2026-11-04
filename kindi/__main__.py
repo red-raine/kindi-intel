@@ -226,9 +226,10 @@ def cmd_use(cfg, a):
 def cmd_fetch(cfg, a):
     from .catalog import fetch, model_dir
     out = a.out or model_dir(cfg)
-    fetch(a.spec, out, log=log, revision=a.revision, allow_unverified=a.allow_unverified)
-    log("next: kindi recipes --for %s --role %s" % (os.path.join(out, os.path.basename(a.spec.split("/")[-1])),
-                                                    a.role or "coder"))
+    got = fetch(a.spec, out, log=log, revision=a.revision, allow_unverified=a.allow_unverified,
+                member=a.member, keep_zip=a.keep_zip)
+    first = got[0] if isinstance(got, list) else got
+    log("next: kindi recipes --for %s --role %s" % (first, a.role or "coder"))
     return 0
 
 
@@ -357,13 +358,16 @@ def main(argv=None):
     s = sub.add_parser("use", help="download a model, build its pack and select it")
     s.add_argument("model")
     s.add_argument("--gguf", help="use this GGUF file instead of downloading it")
-    s = sub.add_parser("fetch", help="fetch one file from any Hugging Face repo, verified against its LFS sha256")
+    s = sub.add_parser("fetch", help="fetch a model file from Hugging Face (sha256-verified) or Kaggle (dataset zip)")
     s.add_argument("spec", help="hf:OWNER/REPO/PATH, e.g. hf:prism-ml/Ternary-Bonsai-2-2B-gguf/"
-                                "Ternary-Bonsai-2-2B-PTQ1_0.gguf")
+                                "Ternary-Bonsai-2-2B-PTQ1_0.gguf - or kaggle:OWNER/DATASET[/MEMBER]")
     s.add_argument("--out", help="directory to write into (default: the configured models directory)")
     s.add_argument("--revision", default="main")
     s.add_argument("--allow-unverified", dest="allow_unverified", action="store_true",
                    help="fetch a file whose repo entry carries no sha256 (only its length is checked)")
+    s.add_argument("--member", help="for kaggle:, the file inside the dataset to extract (default: all of them)")
+    s.add_argument("--keep-zip", dest="keep_zip", action="store_true",
+                   help="for kaggle:, keep the downloaded dataset archive after extracting")
     s.add_argument("--role", help="the recipe to suggest for it afterwards")
     a = p.parse_args(argv)
     if not a.cmd:

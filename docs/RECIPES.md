@@ -9,6 +9,7 @@ so the gap is written down rather than implied.
 kindi recipes                                # the plans, and what each one changes
 kindi recipes --for MODEL.gguf --role rag    # detect a file, print its plan and what the file cannot support
 kindi fetch hf:OWNER/REPO/FILE.gguf          # any Hugging Face file, verified against its LFS sha256
+kindi fetch kaggle:OWNER/DATASET[/MEMBER]    # any Kaggle dataset, one member extracted or all of them
 kindi qat-pack MODEL.pt --scheme gsq         # fit codes and scale together
 kindi qat-pack MODEL.pt --budget 900000000   # choose which tensors stay f32 under a byte budget
 kindi convert MODEL.gguf --recipe coder      # apply a plan's conversion steps to a GGUF pack
@@ -116,6 +117,30 @@ Two limits belong here: the errors are measured on the weights, not on the model
 objective it is given, not for perplexity), and a budget below the all-ternary floor is refused rather than silently
 exceeded.
 
+## Importing a model from either place
+
+**Hugging Face** (`hf:OWNER/REPO/PATH`) is verified: the repo's tree API carries each file's LFS oid, which *is* its
+sha256, so a downloaded file is checked against what the publisher stored, and a file with no LFS entry is refused
+unless `--allow-unverified`. `HF_TOKEN` is sent when set, for gated repos.
+
+**Kaggle** (`kaggle:OWNER/DATASET[/MEMBER]`) works differently and the difference is stated rather than smoothed over:
+Kaggle has no per-file endpoint and publishes no sha256, so the unit is the dataset archive. It is downloaded with the
+account's credentials (`KAGGLE_USERNAME`/`KAGGLE_KEY`, or `~/.kaggle/kaggle.json`), the named member is extracted, and
+the archive is removed unless `--keep-zip`. Nothing is checked against a publisher hash; the checks are the file's
+length and whether `kindi recipes` can read its header. Two limits: the download is not resumable (Kaggle's zip
+endpoint ignores a range), and a member name that occurs twice in the archive is refused rather than guessed.
+
+Exercised here against a live account: `kaggle:igalbronshtein/hugging-face-gguf` downloaded, extracted one member and
+removed the archive; `kaggle:me/gguf` (no such dataset) is a `kindi fetch: ... returned HTTP 403 - this account may not
+download it: accept the dataset's terms on its Kaggle page`. A bad spec, a member that is not in the archive, and an
+archive with two members of the same name are all covered by `kindi.catalog.selftest`, which builds its zips locally
+and needs no credentials.
+
+What the search turned up for the models this project is aiming at: `rahim3/glm53-flash-iq3xxs-1` and `-2` hold
+GLM-5.3-Flash as a two-part UD-IQ3_XXS GGUF (49 GB + 71 GB) on Kaggle. That is a 3-bit source, so the conversion path
+is `kindi qat-pack` on float weights, not the ternary pack reader - the reader needs the family, and `kindi.recipes`
+currently names `glm4`/`glm5` as having no path rather than guessing.
+
 ## The two releases this work started from
 
 Both cards are built on [`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF),
@@ -147,7 +172,6 @@ this release covers them.
 
 | piece | what it needs | why it is not here |
 |---|---|---|
-| Kaggle import | a Kaggle API token, and the same verified fetch `kindi fetch` does for HF | credentials are the user's; the fetch path is shared |
 | MoE expert pruning under a budget | routing statistics over a calibration set, then a per-layer exact choice | `tools.expert_merge/routes.py` already records routes; the selection is the next step |
 | Distillation into a smaller model | a training loop and a teacher runtime | the specification's arithmetic is in `tools/exodus/`; the loop is not written |
 | MiniMax M3 / GLM5.3-Flash conversion | a reader per architecture, and a ternary/1-bit source | `kindi.recipes` names them as having no path yet rather than mis-reading them |

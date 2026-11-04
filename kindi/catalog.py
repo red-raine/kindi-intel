@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 HF = "https://huggingface.co"
@@ -159,7 +160,7 @@ def hf_tree(repo, revision="main"):
     return out
 
 
-def fetch(spec, out_dir, log=print, revision="main", allow_unverified=False):
+def fetch(spec, out_dir, log=print, revision="main", allow_unverified=False, member=None, keep_zip=False):
     """`hr:repo/path/in/repo` -> a verified local file.
 
     The size and sha256 come from the repo's own LFS metadata, so the download is checked against what the publisher
@@ -167,8 +168,10 @@ def fetch(spec, out_dir, log=print, revision="main", allow_unverified=False):
     without a sha and says so. `--allow-unverified` is for a file whose LFS entry is missing on a very large download
     where the risk is accepted; without it such a file is refused rather than written unverified.
     """
+    if spec.startswith("kaggle:"):
+        return fetch_kaggle("%s%s" % (spec, "/" + member if member else ""), out_dir, log=log, keep_zip=keep_zip)
     if not spec.startswith("hf:"):
-        raise SystemExit("kindi fetch: give hf:REPO/PATH (a Kaggle or HTTP URL is not supported yet)")
+        raise SystemExit("kindi fetch: give hf:REPO/PATH or kaggle:OWNER/DATASET[/MEMBER] (a bare URL is not supported)")
     # the repo id is the first two segments, the file is the rest: a repo id without an owner is not a repo id
     parts = spec[3:].split("/")
     if len(parts) < 3:
@@ -198,6 +201,203 @@ def fetch(spec, out_dir, log=print, revision="main", allow_unverified=False):
 
 def size_ok(path, size):
     return size and os.path.getsize(path) == size
+
+
+# --- Kaggle -----------------------------------------------------------------------------------------------------------
+
+KAGGLE = "https://www.kaggle.com/api/v1"
+
+
+def kaggle_auth():
+    """(username, key) from KAGGLE_USERNAME/KAGGLE_KEY or ~/.kaggle/kaggle.json; (None, None) when absent.
+
+    Kaggle has no anonymous download, so this is the one credential the fetch path needs. The environment wins over the
+    file, and neither value is logged or written anywhere.
+    """
+    u, k = os.environ.get("KAGGLE_USERNAME"), os.environ.get("KAGGLE_KEY")
+    if u and k:
+        return u, k
+    d = os.environ.get("KAGGLE_CONFIG_DIR") or "~/.kaggle"
+    p = os.path.join(os.path.expanduser(d), "kaggle.json")
+    if os.path.isfile(p):
+        try:
+            c = json.load(open(p))
+        except ValueError:
+            return None, None
+        return c.get("username"), c.get("key")
+    return None, None
+
+
+def _basic(u, k):
+    import base64
+    return "Basic " + base64.b64encode(("%s:%s" % (u, k)).encode()).decode()
+
+
+def kaggle_spec(spec):
+    """`kaggle:OWNER/DATASET[/PATH/IN/DATASET]` -> (dataset, member or None). A member may contain slashes."""
+    parts = spec[len("kaggle:"):].split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise SystemExit("kindi fetch: kaggle: needs OWNER/DATASET[/PATH/IN/DATASET], e.g. "
+                         "kaggle:someone/gguf-models/qwen-0.5b.gguf")
+    return "/".join(parts[:2]), ("/".join(parts[2:]) or None)
+
+
+def extract_member(archive, member, out_dir, log=print):
+    """copy a zip's members out to out_dir and return what was written.
+
+    Kaggle hands back a zip of the whole dataset. A named `member` is matched on a path suffix, so a caller can name the
+    file it wants without the dataset's internal directory; two members with that suffix are an error rather than a
+    guess. No member means every file, each at its own path under out_dir.
+    """
+    import shutil
+    import zipfile
+    written = []
+    with zipfile.ZipFile(archive) as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        if member:
+            hits = [n for n in names if n == member or n.endswith("/" + member)]
+            if not hits:
+                low = member.lower()
+                near = [n for n in names if low in n.lower()][:5]
+                raise SystemExit("kindi fetch: %s is not in %s%s" % (member, os.path.basename(archive),
+                                                                     ("; close: " + ", ".join(near)) if near else ""))
+            if len(hits) > 1:
+                raise SystemExit("kindi fetch: %s matches %d members (%s); name the one you want with its directory"
+                                 % (member, len(hits), ", ".join(hits[:4])))
+            names = hits
+        for name in names:
+            dest = os.path.join(out_dir, *[p for p in name.split("/") if p not in ("", ".", "..")])
+            if not os.path.abspath(dest).startswith(os.path.abspath(out_dir) + os.sep):
+                raise SystemExit("kindi fetch: %s would be written outside %s" % (name, out_dir))
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            with z.open(name) as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 22)
+            written.append(dest)
+            log("  extracted %s (%.2f GB)" % (name, os.path.getsize(dest) / 1e9))
+    return written
+
+
+def fetch_kaggle(spec, out_dir, log=print, keep_zip=False):
+    """`kaggle:OWNER/DATASET[/MEMBER]` -> the file(s) extracted from the dataset archive.
+
+    Kaggle publishes no per-file endpoint and no publisher sha256, so the archive is the unit: it is downloaded with the
+    account's credentials, the named member is extracted, and the archive is removed unless `keep_zip`. Two limits are
+    honest here: the download is not resumable (Kaggle's zip endpoint does not honour a range), and nothing is verified
+    against a publisher hash - the checks are the file's length and whether its header parses, which `kindi recipes`
+    does.
+    """
+    dataset, member = kaggle_spec(spec)
+    u, k = kaggle_auth()
+    if not u or not k:
+        raise SystemExit("kindi fetch: Kaggle needs credentials: set KAGGLE_USERNAME and KAGGLE_KEY, or put kaggle.json "
+                         "from https://www.kaggle.com/settings at ~/.kaggle/kaggle.json")
+    os.makedirs(out_dir, exist_ok=True)
+    archive = os.path.join(out_dir, dataset.replace("/", "-") + ".zip")
+    if os.path.isfile(archive):
+        log("kaggle: using the archive already at %s" % archive)
+    else:
+        req = urllib.request.Request("%s/datasets/download/%s" % (KAGGLE, dataset),
+                                     headers={"Authorization": _basic(u, k), "User-Agent": "kindi"})
+        log("kaggle: downloading %s" % dataset)
+        part = archive + ".part"
+        try:
+            r = urllib.request.urlopen(req, timeout=120)
+        except urllib.error.HTTPError as e:
+            hint = {401: "the credentials in kaggle.json are not valid",
+                    403: "this account may not download it: accept the dataset's terms on its Kaggle page",
+                    404: "no such dataset"}.get(e.code, "Kaggle refused the download")
+            raise SystemExit("kindi fetch: %s returned HTTP %d - %s" % (dataset, e.code, hint))
+        except urllib.error.URLError as e:
+            raise SystemExit("kindi fetch: cannot reach Kaggle (%s)" % (e.reason,))
+        with r, open(part, "wb") as f:
+            got = 0
+            while True:
+                b = r.read(1 << 22)
+                if not b:
+                    break
+                f.write(b)
+                got += len(b)
+                if got // (1 << 30) != (got - len(b)) // (1 << 30):
+                    log("  %.1f GB" % (got / 1e9))
+        os.replace(part, archive)
+        log("kaggle: %.2f GB archive" % (os.path.getsize(archive) / 1e9))
+    written = extract_member(archive, member, out_dir, log=log)
+    if not keep_zip:
+        os.remove(archive)
+    return written
+
+
+def selftest():
+    """The Kaggle path's parsing and extraction, against a zip built in the test - no network, no credentials."""
+    import tempfile
+    import zipfile
+
+    def check(name, ok, detail=""):
+        if not ok:
+            raise AssertionError("%s%s" % (name, (": " + detail) if detail else ""))
+
+    check("spec: owner/dataset", kaggle_spec("kaggle:me/gguf") == ("me/gguf", None))
+    check("spec: owner/dataset/member", kaggle_spec("kaggle:me/gguf/sub/m.gguf") == ("me/gguf", "sub/m.gguf"))
+    for bad in ("kaggle:me", "kaggle:/gguf"):
+        try:
+            kaggle_spec(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("%r must be refused" % bad)
+
+    td = tempfile.mkdtemp(prefix="kindi-kaggle-")
+    try:
+        arc = os.path.join(td, "ds.zip")
+        with zipfile.ZipFile(arc, "w") as z:
+            z.writestr("qwen/model.gguf", b"GGUF" + b"\0" * 60)
+            z.writestr("qwen/README.md", b"hi")
+        out = os.path.join(td, "out")
+        os.makedirs(out)
+        got = extract_member(arc, "model.gguf", out, log=lambda *_: None)
+        check("extract: a suffix match finds the nested member and keeps its path under out_dir",
+              got == [os.path.join(out, "qwen", "model.gguf")] and open(got[0], "rb").read(4) == b"GGUF", str(got))
+        every = extract_member(arc, None, out, log=lambda *_: None)
+        got_paths = sorted(os.path.relpath(p, out).replace(os.sep, "/") for p in every)
+        check("extract: no member writes every file at its own path",
+              got_paths == ["qwen/README.md", "qwen/model.gguf"], str(got_paths))
+        # two members with the same name in different directories: the caller must name the directory, not get a guess
+        dup = os.path.join(td, "dup.zip")
+        with zipfile.ZipFile(dup, "w") as z:
+            for d in ("x", "y"):
+                z.writestr("%s/model.gguf" % d, b"GGUF")
+        for arc2, bad, expect in ((arc, "nope.gguf", "not in"), (dup, "model.gguf", "matches 2 members")):
+            try:
+                extract_member(arc2, bad, os.path.join(out, "x"), log=lambda *_: None)
+            except SystemExit as e:
+                check("extract: %r refused" % bad, expect in str(e), str(e))
+            else:
+                check("extract: %r refused" % bad, False)
+
+        # with no credentials the fetch refuses before it opens a socket
+        saved = dict((k, os.environ.pop(k, None)) for k in ("KAGGLE_USERNAME", "KAGGLE_KEY"))
+        os.environ["KAGGLE_CONFIG_DIR"] = os.path.join(td, "none")
+        try:
+            fetch_kaggle("kaggle:me/gguf", out, log=lambda *_: None)
+        except SystemExit as e:
+            check("fetch: no credentials is a refusal that says what to set", "KAGGLE_USERNAME" in str(e), str(e))
+        else:
+            check("fetch: no credentials is a refusal that says what to set", False)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop("KAGGLE_CONFIG_DIR", None)
+                if v is not None:
+                    os.environ[k] = v
+    finally:
+        import shutil
+        shutil.rmtree(td, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    selftest()
+    print("checks passed")
+    raise SystemExit(0)
 
 
 def _select(cfg, pack, log):
