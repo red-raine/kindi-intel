@@ -72,6 +72,9 @@ on, rather than passing on a GPU machine and breaking for everyone else.
   measurement of a real pack on a real disk. The overlap those models take as input is measured
   (`tools/bitnet_gemm/cluster_budget.py` reads a captured router log), but the log is of one model on four documents,
   and the read and GEMV rates behind both tools are one machine's.
+* **The batched paging pipeline and the two GEMV kernels against each other.** `tools/bitnet_gemm/batch_stream.py` and
+  `libcompare.py` drive the real kernels but need a C++ toolchain (and torch, for the LUT arm) and a scratch directory,
+  so neither is in the gate; run them by hand when the read rate or the batch regime is what is being claimed.
 * **The two GEMV kernels against each other.** `tools/bitnet_gemm/libcompare.py` runs the pair table and the LUT in one
   process, but it needs a C++ toolchain and torch, so the gate does not run it. What the gate checks is that `kcpu.c`
   still builds and that its own tiers agree with its reference - not that a second kernel agrees with it.

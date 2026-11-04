@@ -14,6 +14,10 @@
   fractional bound reported when the table is too large to solve exactly.
 - **`kindi fetch kaggle:OWNER/DATASET[/MEMBER]`.** Kaggle has no per-file endpoint and no hash, so the dataset archive
   is downloaded, the named member is extracted, and the limits are stated.
+- **`tools.bitnet_gemm.batch_stream`.** Runs the batched expert-paging pipeline instead of modelling it: a reader thread
+  fills the next 15.8 MB expert while the production kernel multiplies the current one into the batch. At batch 8
+  streaming is 2.3-7x worse than residency on this host - a read costs ~20 ms with the batch computing rather than the
+  9.5 ms it costs alone, and the captured router fetches 4.4 experts per token at that size. [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 - **`tools.bitnet_gemm.libcompare`, and `kc_rows8_gemv` in the CPU library.** Puts the pair-table kernel and the T-MAC
   LUT on one matrix in one process, which is the comparison the paging note had been making across sources. The two
   agree to 1.9e-07 of their largest output, so parity holds; at one thread the LUT is 1.8x faster (0.219 against

@@ -327,6 +327,54 @@ matrices at B=1 is the favourable end, not the likely one - the 24-cluster run m
 break-even B=16. What is *not* measured here at all is quality: whether the experts the router groups together are one
 function is `docs/EXPERT-MERGE.md`'s question, and it has to be paid before any of this table can be spent.
 
+### B=8, run as a pipeline instead of predicted
+
+Two sections above predicted this from two rates: "at 5-6 tokens one expert's 9 ms read sits under 5-6 x 1.8 ms of
+compute and the pipeline is level", so by B=8 streaming experts should cost no more than keeping them in RAM. That was
+arithmetic. `tools/bitnet_gemm/batch_stream.py` executes it - a reader thread fills the next expert's bytes while the
+production `rows8` multiplies the current one into the batch, and the identical batch is timed resident (preloaded, no
+reads at all). Experts are the shape the budget assumes, 14336 x 4096 = 58.7 M weights, 15.8 MB packed.
+
+```bash
+python -m tools.bitnet_gemm.batch_stream          # --batches B:fetched, --pool, --reps, --threads
+```
+
+| batch | experts fetched | read, ms | streamed ms/token | resident ms/token | ratio |
+|---|---:|---:|---:|---:|---:|
+| 1 | 8 (as routed) | 19.2 | 148.5 | 13.9 | 10.65 |
+| 8 | 35 (as routed) | 19.4 | 85.7 | 12.2 | 7.01 |
+| 8 | 10 (12 clusters) | 21.4 | 27.5 | 11.1 | 2.47 |
+| 8 | 8 (whole batch shares) | 19.8 | 22.1 | 9.5 | 2.33 |
+| 16 | 8 (whole batch shares) | 21.1 | 14.7 | 11.2 | 1.31 |
+| 32 | 11 (12 clusters) | 20.8 | 14.2 | 9.3 | 1.52 |
+| 64 | 86 (as routed) | 24.5 | 30.5 | 10.7 | 2.86 |
+
+**Streaming does not beat residency at B=8 in any arm, and the best B=8 arm is still 2.3x behind.** Two inputs to the
+prediction do not survive the pipeline:
+
+- **A read costs ~20 ms while the batch is computing, not 9.5 ms.** Measured alone, 14.7 MB came back in 9.25-9.99 ms.
+  Here the reader shares memory bandwidth with 16 threads of GEMV and the same 15.8 MB takes 19-25 ms. Nothing about
+  the medium changed; the compute is what happened to it. A pipeline budget that adds a rate measured in isolation to
+  work measured in isolation will be optimistic by exactly this factor.
+- **A batch of 8 does not route to one expert's worth of weights.** The captured router fetches **35 experts for 8
+tokens** - 4.4 per token, not 1 - so the sharing the prediction leans on is not there at this batch size. Only a
+  12-cluster table, whose union is capped by construction, gets near it (10 experts for 8 tokens).
+
+The parity condition is `fetched <= batch * k * c / r`, and it can be evaluated for whatever the host measures: with
+c = 1.4 ms and r = 20 ms that is `0.56 * batch`, so even a batch that fetches a constant 8 experts crosses at B = 14,
+not B = 8 - and it arrives there only slightly ahead (1.31x behind, in fact, because the reader still steals
+bandwidth from the compute it is supposed to be hiding behind).
+
+So the batched-regime prediction is **falsified as stated** on this machine: at B=8 streaming is 2.3x to 7x worse than
+residency, and residency stays the design at every batch measured. What would rescue it is not a better pipeline but
+the two model-side changes: a table small enough to be resident (12 clusters, 5.5 GB), and experts small enough that
+k of them cost what k multiplies cost.
+
+Caveats: the expert pool is 32 matrices, so a batch fetching more than 32 re-reads experts that are already in the page
+cache; the GEMVs run at the machine's 16 threads, and the streamed arm's timing therefore includes the reader's
+contention, which is the point of the measurement rather than an artifact of it; and this host's reads come from behind
+a cache the note's own probe could not bypass.
+
 ### The disk claims are the least trustworthy numbers here
 
 Every figure in that section is what a process sees when it asks for these bytes, not a device characteristic. The HDD
@@ -358,5 +406,7 @@ machine's threads. Paging is a batched design and this engine decodes at batch 1
   at 8-16 threads, which its extension does not offer - until that exists, the threaded comparison stays one-armed.
 - **The device needs a bare-metal run.** The same probe on a machine without a virtual block layer would say whether
   1.6 GB/s at 14.7 MB and 3.3 GB/s at 200 MB is the KIOXIA or the host.
-- **The batched-regime prediction is untested.** The 5-6 token break-even is arithmetic from two measured rates, not a
-  pipeline; a real double-buffered run at batch 8 would confirm or kill it.
+- **The batched-regime prediction has been run and it did not hold** (`tools/bitnet_gemm/batch_stream.py`, above):
+  at B=8 streaming is 2.3-7x worse than residency, because a read costs ~20 ms under a computing batch and the router
+  fetches 4.4 experts per token at that size. What remains open is the same pipeline on a host whose isolated read
+  really is 9.5 ms without contention.
