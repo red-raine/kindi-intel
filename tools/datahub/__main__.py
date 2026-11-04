@@ -11,19 +11,26 @@ existing output and is the check to run before training on it.
 The reference sets for decontamination are the shared ones at `B:/datasets/data-miner/decontam/reference_sets.json`
 (HumanEval, MBPP); `--reference` can point elsewhere. With `--no-decontam` the gate runs without them, and the report
 says so, because an unflagged corpus is not the same thing as a clean one.
+
+Every reference set is checked for coverage before it is used, and a set that holds fewer benchmark ids than it
+claims is a hard failure: 874 of MBPP's 974 problems leaves 100 problems whose leaked solutions pass as clean, with no
+sign in the report. The claim is the published size of each family the set mentions (HumanEval 0-163, MBPP 1-974),
+restated with `--expect FAMILY=N` or `FAMILY=LO:HI`; `--allow-short-reference` proceeds anyway and records the gap, so
+an incomplete reference is a decision rather than an oversight. The coverage goes into the manifest and the `--report`
+JSON, so a corpus built against a short reference says so afterwards.
 """
 import argparse
 import json
 import os
 import sys
 
-from . import gate, shard, text
+from . import coverage, gate, shard, text
 
 REFERENCE = r"B:\datasets\data-miner\decontam\reference_sets.json"
 
 
 def _reference_grams(path, n):
-    """13-grams of the HumanEval/MBPP reference records, built once."""
+    """13-grams of the HumanEval/MBPP reference records, built once, and the records for the coverage check."""
     grams = set()
     with open(path, encoding="utf-8") as fh:
         blob = json.load(fh)
@@ -34,20 +41,46 @@ def _reference_grams(path, n):
                 v = r.get(key)
                 if isinstance(v, str):
                     grams |= text.ngrams(v, n)
-    return grams, len(recs)
+    return grams, recs
+
+
+def _reference(a, log=print):
+    """Load the reference set and check that it holds the benchmark ids it claims.
+
+    Returns `(grams, coverage)`, or `(None, coverage)` when the set is short and the caller did not allow it: a
+    reference missing ids cannot detect contamination of the missing tasks, so it is a hard failure like a missing file
+    rather than a warning to scroll past.
+    """
+    grams, recs = _reference_grams(a.reference, a.ngram)
+    expected, named = coverage.claims(getattr(a, "expect", None))
+    cov = coverage.check(recs, expected, named)
+    log(cov.report())
+    if not cov.ok:
+        if getattr(a, "allow_short_reference", False):
+            log("WARNING: %s - --allow-short-reference, so the gate proceeds; a corpus can carry one of those tasks "
+                "verbatim and be reported clean" % cov.failure())
+        else:
+            log("FAIL: %s" % cov.failure())
+            log("  the gate cannot detect what the reference does not hold; fill the set, restate what it really "
+                "claims with --expect, or pass --allow-short-reference to proceed with the gap on the record")
+            return None, cov
+    return grams, cov
 
 
 def cmd_audit(a):
     cfg = gate.Config(field=a.field, min_chars=a.min_chars, max_chars=a.max_chars, ngram=a.ngram,
                       near_dup=a.near_dup, decontam=a.decontam, max_per_source=a.max_records)
     g = gate.Gate(cfg)
+    cov = None
     if a.decontam:
         if not os.path.exists(a.reference):
             print("no reference sets at %s - auditing without decontamination" % a.reference)
         else:
-            grams, n = _reference_grams(a.reference, a.ngram)
+            grams, cov = _reference(a)
+            if grams is None:
+                return 2
             g.set_reference(grams, "humaneval+mbpp")
-            print("reference: %d records, %d %d-grams" % (n, len(grams), a.ngram))
+            print("reference: %d records, %d %d-grams" % (cov.records, len(grams), a.ngram))
     total = dict(lines=0, accepted=0, bytes=0)
     reports = []
     for path in a.files:
@@ -71,7 +104,8 @@ def cmd_audit(a):
     if a.report:
         os.makedirs(os.path.dirname(a.report) or ".", exist_ok=True)
         with open(a.report, "w", encoding="utf-8") as fh:
-            json.dump(dict(total=total, files=reports), fh, indent=1)
+            json.dump(dict(total=total, files=reports,
+                           reference=dict(path=a.reference, coverage=cov.as_dict()) if cov else None), fh, indent=1)
         print("report: %s" % a.report)
     return 0
 
@@ -80,11 +114,14 @@ def cmd_build(a):
     cfg = gate.Config(field=a.field, min_chars=a.min_chars, max_chars=a.max_chars, ngram=a.ngram,
                       near_dup=a.near_dup, decontam=a.decontam, max_per_source=a.max_records)
     g = gate.Gate(cfg)
+    cov = None
     if a.decontam:
         if not os.path.exists(a.reference):
             print("FAIL: --decontam asked for but no reference sets at %s" % a.reference)
             return 2
-        grams, n = _reference_grams(a.reference, a.ngram)
+        grams, cov = _reference(a)
+        if grams is None:
+            return 2
         g.set_reference(grams, "humaneval+mbpp")
     with shard.ShardWriter(a.out, shard_bytes=a.shard_bytes, prefix=a.prefix) as w:
         reports = []
@@ -93,7 +130,8 @@ def cmd_build(a):
             reports.append(rep.as_dict())
             print("%-58s %7d lines  %7d kept" % (os.path.basename(path), rep.lines, rep.accepted))
         meta = dict(gate=dict(field=a.field, min_chars=a.min_chars, max_chars=a.max_chars, ngram=a.ngram,
-                              near_dup=a.near_dup, decontam=a.decontam, reference=a.reference if a.decontam else None),
+                              near_dup=a.near_dup, decontam=a.decontam, reference=a.reference if a.decontam else None,
+                              reference_coverage=cov.as_dict() if cov else None),
                     sources=reports)
         mpath, man = w.close(meta)
     if man["records"] == 0:
@@ -130,6 +168,12 @@ def main(argv):
         sp.add_argument("--near-dup", action="store_true", help="LSH near-duplicate detection (slower)")
         sp.add_argument("--max-records", type=int, default=None, help="per file, for a bounded run")
         sp.add_argument("--reference", default=REFERENCE)
+        sp.add_argument("--expect", action="append", default=None, metavar="FAMILY=N|LO:HI",
+                        help="the ids a reference set claims, e.g. mbpp=974 or humaneval=0:163 (repeatable); by default "
+                             "the published sizes, HumanEval 164 from 0 and MBPP 974 from 1")
+        sp.add_argument("--allow-short-reference", dest="allow_short_reference", action="store_true",
+                        help="proceed when the reference holds fewer ids than it claims; the gap is recorded in the "
+                             "report and the manifest")
 
     ap = sub.add_parser("audit")
     common(ap)
