@@ -86,6 +86,22 @@ miner to bring it closer to Qwen3.8-27B" - and it is the reason a subnet can ran
 codes are frozen, so the only free variables are the magnitudes. Every block scale in the sampled windows was
 re-fitted (99.6% to 100% of them, and the ones that survive are within 1e-3), and the norms move with them.
 
+**What the re-fit did to the distribution.** The two files' `blocks` are the same ternary codes, so every behavioural
+difference between Bonsai and Ingot is the re-fitted scales and norms. 79 tokens of prose through both converted packs
+on the same positions (`tools.kl logits`, one pass each):
+
+| | Bonsai | Ingot |
+|---|---|---|
+| NLL on the next token | 2.506888 | 2.513293 (**+0.006405** nats/token) |
+
+`KL(Bonsai || Ingot)` is **0.026373** nats (median 0.021214 per position, max 0.100221 at position 64) and
+`KL(Ingot || Bonsai)` **0.025880**, so neither distribution sits inside the other - the re-fit is not a rescaling of one
+into the other, it is a different model that agrees on the top token 88.5% of the time. Two things follow, and neither
+is a verdict on Ingot: re-deriving every scale is a change of this size, not a no-op; and on this window it is 0.0064
+nats *worse* at predicting prose than the build it came from. The card's own claim is `KL(teacher || model) 0.08276`
+against the king's `0.08409`, which needs Qwen3.8-27B to check and is not checkable here - a smaller distance from the
+file it was derived from is the miner's lever, not evidence that the lever pointed the right way.
+
 ## Why this belongs next to the K/V measurements
 
 The 2-bit V experiment found one thing that helps a 2-bit container: a scale per 32 values instead of per head -
@@ -116,6 +132,14 @@ To convert one (the 27B profile is supported, PTQ1_0 only):
 
 ```bash
 python -m kindi convert Ternary-Bonsai-2-27B-PTQ1_0.gguf --out /b/models/packs/bonsai-27b
+```
+
+The distribution comparison is one command on the two converted packs (about 15 minutes here, most of it loading a
+27B pack twice; the walk itself is 47 s a pack):
+
+```bash
+python -m tools.kl logits --a packs/bonsai-27b --b packs/ingot-27b --tokens 96 --ctx 256 \
+  --json packs/kl-logits-bonsai-ingot.json
 ```
 
 ## Maple-Preview is a different engine's problem
