@@ -70,7 +70,7 @@ def ref_ffn(x, t, il, dims, hb):
 
 
 def run(a, log=print):
-    from . import synthpack
+    from . import packio, synthpack
     from .cpu import Engine
     from . import quant
     for _ in range(1):
@@ -124,7 +124,7 @@ def bench_paging(log=print):
     import gc
     import json as _json
     import time
-    from . import synthpack
+    from . import packio, synthpack
     from .cpu import Engine, _pair_len, _pair_views, is_expert, pair_mat
     dims = dict(width=1024, ffn=512, layers=6)
     nexp, nact = 12, 2
@@ -189,7 +189,7 @@ def bench_paging(log=print):
     # the variant has to be the same bytes as the conversion, not merely the same tokens: every expert matrix
     _pi = _json.load(open(os.path.join(packs["pair"], "bcodes_index.json")))["tensors"]
     bc = np.memmap(os.path.join(packs["trit"], "bcodes.bin"), dtype=np.uint8, mode="r")
-    dp = np.memmap(os.path.join(packs["trit"], "dpm.bin"), dtype=np.float16, mode="r")
+    dp = packio.load_scales(packs["trit"])
     pcm = np.memmap(os.path.join(packs["pair"], "pcodes.bin"), dtype=np.uint8, mode="r")
     same_bytes, n_cmp = True, 0
     for name in sorted(n for n in _bi if is_expert(n)):

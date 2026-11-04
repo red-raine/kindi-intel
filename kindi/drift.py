@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 
-from . import ptload, quant
+from . import packio, ptload, quant
 
 PROBES = 32
 
@@ -159,13 +159,13 @@ def verify_pack(sd, pack_dir, scheme="lsq", log=print):
     import json
     idx = json.load(open(os.path.join(pack_dir, "bcodes_index.json")))["tensors"]
     bc = np.memmap(os.path.join(pack_dir, "bcodes.bin"), dtype=np.uint8, mode="r")
-    dp = np.memmap(os.path.join(pack_dir, "dpm.bin"), dtype=np.float16, mode="r")
+    dp = packio.load_scales(pack_dir)
     bad = 0
     for name, rec in idx.items():
         R, C = rec["rows"], rec["ne0"]
-        o, q = rec["bc_off"], rec["dpm_off"] // 2
+        o = rec["bc_off"]
         got = quant.dequantise(bc[o:o + (C // 4) * R].reshape(C // 4, R),
-                               dp[q:q + (C // 128) * R].reshape(C // 128, R), R, C)
+                               packio.tensor_scales(dp, rec).reshape(C // 128, R), R, C)
         w = np.ascontiguousarray(sd[name][:R], dtype=np.float32)
         want = quantise_at(w, 128, scheme)
         if not np.array_equal(got[:w.shape[0], :w.shape[1]], want):

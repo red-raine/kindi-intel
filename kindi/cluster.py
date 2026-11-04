@@ -10,6 +10,8 @@ import time
 
 import numpy as np
 
+from . import packio
+
 DEQ_SRC = r'''
 extern "C" __global__ void deq(const unsigned char* __restrict__ b, const unsigned short* __restrict__ s,
                                float* __restrict__ out, int n, int C){
@@ -33,8 +35,7 @@ def build(pack, K=1024, iters=12, log=print):
     ns, P = C // 4, C // 128
     bc = np.fromfile(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, count=ns * R,
                      offset=rec["bc_off"]).reshape(ns, R)
-    dp = np.fromfile(os.path.join(pack, "dpm.bin"), dtype=np.uint16, count=P * R,
-                     offset=rec["dpm_off"]).reshape(P, R)
+    dp = np.ascontiguousarray(packio.tensor_scales(packio.load_scales(pack), rec)).view(np.uint16).reshape(P, R)
     deq = cp.RawKernel(DEQ_SRC, "deq")
     CH = 16384
 
