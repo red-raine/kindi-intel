@@ -130,6 +130,32 @@ def union_per_batch(groups, B, samples=120, seed=0, adjacent=False):
     return total / count
 
 
+def merged_mass(groups, wts, k=None):
+    """Share of a token's routing weight that lands in a group it shares with another of its slots.
+
+    Two slots in one cluster are computed once, by the cluster's averaged matrix. So this is the share of a token's
+    expert arithmetic that is not the arithmetic the unmerged model would have done - the exposure a merge creates,
+    expressed in the router's own weights. It is not an accuracy figure: whether the average is a good stand-in for
+    both members is a question about the weights (`docs/EXPERT-MERGE.md`), and this log carries none.
+    """
+    g = groups[..., :k] if k else groups
+    w = wts[..., :k] if k else wts
+    out = []
+    for layer in range(g.shape[0]):
+        for t in range(g.shape[1]):
+            gid, wt = g[layer, t], w[layer, t]
+            if len(set(gid.tolist())) == len(gid):          # every slot in its own group: nothing is averaged
+                out.append(0.0)
+                continue
+            shared = 0.0
+            for c in set(gid.tolist()):
+                m = gid == c
+                if m.sum() > 1:
+                    shared += float(wt[m].sum())
+            out.append(shared / max(float(wt.sum()), 1e-9))
+    return float(np.mean(out))
+
+
 def revised_ms(B, fetched, k):
     """Per-token ms when the batch's fetches are overlapped with its compute. Honest about which is bigger."""
     return max(fetched * R_MS, k * B * C_MS) / B
@@ -222,6 +248,12 @@ def report(routes, clusters, k, log=print):
     log("table size (what has to be resident to avoid paging at all):")
     for n in sorted({n_experts, clusters}):
         log("  %3d experts x %d layers x %.1f MB = %5.2f GB" % (n, LAYERS, EXPERT_MB, table_gb(n)))
+    log("")
+    log("what the merge replaces, in the router's own weights (the accuracy price itself is not in this log):")
+    for name, g in arms.items():
+        gm = g[:, test_idx]
+        log("  %-28s %5.1f%% of a token's routing weight lands in a group it shares with another slot"
+            % (name, 100.0 * merged_mass(gm, wts[:, test_idx], k=k)))
     log("")
     need = k * C_MS / R_MS
     log("the group cap sets the crossover with no measurement at all: %d groups / (k*c/r = %.2f) = B=%d predicted,"
@@ -340,6 +372,18 @@ def selftest():
           str(cap_break_even(24, 8)))
     check("a table small enough to be one group would cross at B=1 only for k=1",
           cap_break_even(1, 8) == 1 and cap_break_even(1, 1) == 6)
+
+    # merged mass: two slots in one group are averaged into one, and its weight is what the merge replaces
+    g_two = np.array([[[0, 0]]], dtype=np.int16)          # both slots in group 0
+    w_two = np.array([[[0.6, 0.4]]], dtype=np.float32)
+    check("two slots in one group put all of the token's weight into an averaged matrix",
+          abs(merged_mass(g_two, w_two) - 1.0) < 1e-9, str(merged_mass(g_two, w_two)))
+    g_apart = np.array([[[0, 1]]], dtype=np.int16)
+    check("slots in different groups average nothing", abs(merged_mass(g_apart, w_two)) < 1e-12)
+    g_three = np.array([[[0, 0, 2]]], dtype=np.int16)
+    w_three = np.array([[[0.5, 0.3, 0.2]]], dtype=np.float32)
+    check("only the shared group's weight counts, not the whole token's",
+          abs(merged_mass(g_three, w_three) - 0.8) < 1e-6, str(merged_mass(g_three, w_three)))
 
     # a random partition is a partition: every expert in exactly one group, all groups used
     p = random_partition(32, 8)

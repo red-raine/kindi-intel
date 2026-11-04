@@ -17,7 +17,9 @@
 - **`tools.bitnet_gemm.cluster_budget`.** Measures whether clustering experts cuts paged bytes enough to stream at
   batch 1, from a captured router log rather than from an assumption about overlap: 12 clusters take the streaming
   crossover from B=64 to B=8 and the table from 58.8 GB to 5.5 GB, but a random partition of the same size reaches
-  B=8 too, and batch 1 still reads 5.24 matrices against the 1.52 it would need. [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
+  B=8 too, and batch 1 still reads 5.24 matrices against the 1.52 it would need. It also reports what the merge
+  replaces: 59.5% of a token's routing weight at 12 clusters would be computed by an averaged matrix.
+  [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 
 ### Fixed
 

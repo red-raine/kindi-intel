@@ -273,6 +273,11 @@ What the columns say:
 - **Picking the groups buys about a sixth of the bytes, not a step of batch.** Co-activation beats the random partition
   at every batch (5.24 vs 6.13 distinct at B=1; 9.57 vs 11.50 at B=8, which is 0.55 vs 0.66 GB) and never changes the
   crossover. Worth having, not worth a design.
+- **The merge is not free, and the log prices the exposure but not the loss.** At 12 clusters **59.5% of a token's
+  routing weight** lands in a group it shares with another slot, i.e. is computed by an averaged matrix instead of the
+  expert the router chose. A random partition averages 43.5% and saves fewer bytes - so the better clustering merges
+  *more* of the weight, because the experts it groups are the ones that carry weight together. Whether the average is a
+  good stand-in for both members is a question about the weights, and this log has none of them.
 - **The honest route to batch 1 is residency, not paging.** 5.5 GB at 12 clusters fits in VRAM on a 16 GB card, and then
   there is nothing to page and no break-even to reach: batch 1 runs at the 14 ms compute floor. "Break-even at one"
   comes true through the table fitting in memory - which is what merging experts actually delivers - not through
