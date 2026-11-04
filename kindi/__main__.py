@@ -43,7 +43,9 @@ def cmd_convert(cfg, a):
     out = a.out or cfg["pack"]
     if os.path.exists(os.path.join(out, "kindi_pack.json")) and not a.force:
         raise SystemExit("kindi: %s already holds a pack (use --force to rebuild)" % out)
-    manifest = convert(a.gguf, out, log=log, paircodes=bool(getattr(a, "paircodes", False)))
+    manifest = convert(a.gguf, out, log=log, paircodes=bool(getattr(a, "paircodes", False)),
+                       rope_factor=getattr(a, "rope_factor", None),
+                       rope_window=getattr(a, "rope_window", None))
     if manifest.get("backend") == "kindi_gemma4":
         log("Gemma 4 model ready for Kindi native CUDA inference")
     else:
@@ -234,6 +236,12 @@ def main(argv=None):
     s.add_argument("--force", action="store_true")
     s.add_argument("--paircodes", action="store_true",
                    help="also write pcodes.bin: expert matrices staged by memcpy when experts are paged")
+    s.add_argument("--rope-factor", dest="rope_factor", type=float, metavar="F",
+                   help="build the pack's rotary table at factor F (2 stretches an 8k window to 16k; 1 is the plain "
+                        "table); default: whatever the GGUF asks for")
+    s.add_argument("--rope-window", dest="rope_window", type=int, metavar="N",
+                   help="the window the factor scales from (YaRN's original_context_length); default: the file's own, "
+                        "else the model's declared context length")
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)

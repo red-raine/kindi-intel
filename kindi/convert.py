@@ -18,7 +18,11 @@ index.json, bcodes_index.json, kindi_pack.json.
 `--paircodes` adds pcodes.bin: every MoE expert matrix in the GEMV pair-code form the CPU engine stages into its
 paging slots, so a paged expert is loaded by memcpy rather than rebuilt from the trits at every miss. It is about 6%
 of the pack for the experts it covers, and only packs with experts get one.
-"""
+
+`--rope-factor F --rope-window N` builds a pack whose rotary table uses factor F (2 stretches an 8k window to 16k; 1
+is the plain table, and drops a block the file declares). What the GGUF asks for is recorded verbatim by
+default; `rope_override` is the only place the manifest's `rope_scaling` block is decided, and `kindi.rope` reads it,
+so an override is the same key every reader already goes through rather than a second path."""
 import hashlib
 import json
 import os
@@ -101,6 +105,42 @@ def selftest():
     # and the two codes mean -d and +d through the same path a PTQ1_0 code takes: (t - 1) * d
     assert np.array_equal(np.unique(q1.astype(np.int16) - 1), [-1, 1]), "Q1_0 codes are not the outer pair"
 
+    # the rope factor a pack is built with. These are checks on the block `kindi.rope` reads, not on a copy of its
+    # arithmetic: what matters is that the override composes with a file's block instead of replacing it wholesale, and
+    # that the cases which cannot mean anything are refused rather than defaulted.
+    from . import rope
+    y4 = {"type": "yarn", "factor": 4.0, "original_context_length": 8192,
+          "beta_fast": 32.0, "beta_slow": 1.0}
+    assert rope_override(y4, None, None) is y4, "no override must leave the file's block untouched"
+    assert rope_override(None, None, None) is None, "a file with no block and no override stays plain"
+    b2 = rope_override(y4, 2, None, default_window=4096)
+    assert b2["factor"] == 2.0, "the override is not applied"
+    assert b2["original_context_length"] == 8192, "the file's own window must win over the default"
+    assert b2["type"] == "yarn" and b2["beta_fast"] == 32.0, "an override must keep the file's scheme and ramp"
+    assert rope_override(None, 2, None, default_window=8192) == {
+        "type": "yarn", "factor": 2.0, "original_context_length": 8192,
+        "beta_fast": 32.0, "beta_slow": 1.0}, "a file with no block must get yarn from the declared context"
+    assert rope_override(None, 1, None, default_window=8192) is None, "factor 1 is the plain table"
+    assert rope_override(y4, 1) is None, "factor 1 must drop a block the file declares"
+    assert rope_override({"type": "linear", "factor": 4.0}, 2)["type"] == "linear", "linear stays linear"
+    w = rope_override(y4, None, 16384)
+    assert w["factor"] == 4.0 and w["original_context_length"] == 16384, "a window alone re-scales from it"
+    # and the block is the table's input, so the factor reaches cos/sin rather than only the JSON
+    assert abs(float(rope.tables(64, 128, 1e6, b2)[0][0, 0]) - (1.0 + 0.1 * np.log(2.0))) < 1e-6, \
+        "the override's block is not the table the kernel is given"
+    for bad in (0.0, -2.0, float("nan"), float("inf")):
+        try:
+            rope_override(None, bad, None, default_window=8192)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a factor of %r must be refused" % (bad,))
+    try:                                    # a window with no block is not a scaling to apply it to
+        rope_override(None, None, 8192)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("a window alone over no block must be refused")
 
 
 def sha256(path, bufsize=1 << 22):
@@ -137,7 +177,49 @@ def rope_scaling(g, arch):
     return out
 
 
-def convert(gguf_path, out_dir, log=print, paircodes=False):
+def rope_override(base, factor=None, window=None, default_window=None):
+    """the manifest's `rope_scaling` block for a factor the caller names, over what the file declares
+
+    `base` is `rope_scaling(g, arch)`, or None when the file asks for none. The type, the ramp parameters and (unless
+    `window` names another) the window stay the file's own; a file with no block gets `yarn`, the scheme whose
+    interpolation is what a factor beyond the trained window is for. A factor of 1 is the plain table - exactly what
+    `kindi.rope` reads from a missing block - so the block is dropped rather than written, which is how a pack is
+    built plain over a file that asks for YaRN. YaRN's crossover is computed *from* the window, so a factor with no
+    window anywhere (the file names none and `--rope-window` was not given) is refused: a table built against a
+    guessed window is silently the wrong table, and the runtime context is not a substitute for it.
+    """
+    if factor is None and window is None:
+        return base
+    if factor is None:                      # a window alone still has to re-scale something
+        if not base:
+            raise SystemExit("kindi convert: --rope-window needs a scaling to apply it to; the file declares none, "
+                             "so give --rope-factor too")
+        out = dict(base)
+        out["original_context_length"] = int(window)
+        return out
+    f = float(factor)
+    if not np.isfinite(f) or f <= 0.0:
+        raise SystemExit("kindi convert: --rope-factor must be positive and finite (got %r)" % (factor,))
+    if f == 1.0:
+        return None
+    out = dict(base or {})
+    kind = str(out.get("type") or "none").lower()
+    out["type"] = kind if kind in ("yarn", "linear") else "yarn"
+    out["factor"] = f
+    win = window or out.get("original_context_length") or default_window
+    if out["type"] == "yarn":
+        if not win:                         # yarn's crossover is a function of the window; linear's is not
+            raise SystemExit("kindi convert: --rope-factor %g needs a window to scale from - the file names none, "
+                             "so give --rope-window N" % f)
+        out["original_context_length"] = int(win)
+    elif win:
+        out["original_context_length"] = int(win)
+    out.setdefault("beta_fast", 32.0)
+    out.setdefault("beta_slow", 1.0)
+    return out
+
+
+def convert(gguf_path, out_dir, log=print, paircodes=False, rope_factor=None, rope_window=None):
     t0 = time.time()
     selftest()
     g = GGUF(gguf_path)
@@ -199,9 +281,22 @@ def convert(gguf_path, out_dir, log=print, paircodes=False):
     # The rotary scaling a file asks for (the retired 1-bit Qwen3 checkpoints ask for YaRN, factor 4, from 8192
     # positions in the 1.7B and 16384 in the 8B). It is recorded verbatim so the engine can build the same table
     # llama.cpp would; `kindi.rope` owns the arithmetic, and a file that names none keeps the plain table.
+    # `--rope-factor` / `--rope-window` are the way to build a pack that asks for a different stretch: the block they
+    # write is the same key every reader already goes through, so serving 2 is a one-command pack rather than an edit.
     n_ctx_file = g.kv.get("%s.context_length" % arch)
-    scaling = rope_scaling(g, arch)
-    if scaling:
+    file_scaling = rope_scaling(g, arch)
+    scaling = rope_override(file_scaling, rope_factor, rope_window, default_window=n_ctx_file)
+    if rope_factor is not None or rope_window is not None:
+        asked = " ".join(x for x in ("--rope-factor %g" % rope_factor if rope_factor is not None else "",
+                                     "--rope-window %d" % rope_window if rope_window is not None else "") if x)
+        mine = ("asks for %s, factor %.4g, from %d positions"
+                % (file_scaling["type"], file_scaling["factor"], file_scaling["original_context_length"])
+                if file_scaling else "asks for none")
+        log("rope scaling: %s (%s; the file %s)"
+            % ("%s, factor %.4g, from %d positions" % (scaling["type"], scaling["factor"],
+                                                       scaling["original_context_length"])
+               if scaling else "none, plain table", asked, mine))
+    elif scaling:
         log("rope scaling: %s, factor %.4g, from %d positions"
             % (scaling["type"], scaling["factor"], scaling["original_context_length"]))
     hd = {k.split("prism.hadamard.")[-1]: v for k, v in g.kv.items() if k.startswith("prism.hadamard.")}
@@ -342,6 +437,11 @@ def convert(gguf_path, out_dir, log=print, paircodes=False):
     # every pack that asks for none has always been written, so a pack built plain over a YaRN file carries no key.
     if scaling:
         manifest["rope_scaling"] = scaling
+    if rope_factor is not None or rope_window is not None:
+        # the file's own block is kept beside the one built, so a pack that disagrees with its checkpoint says so
+        # rather than looking like a file that asked for the factor
+        manifest["rope_scaling_source"] = {"rope_factor": rope_factor, "rope_window": rope_window,
+                                           "file": file_scaling}
     if n_pc:
         manifest["paircodes"] = {"tensors": n_pc, "bytes": pc_off}
     with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:

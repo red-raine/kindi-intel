@@ -1008,6 +1008,125 @@ them in the environment that launches the process.
 Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh`, `kqkv_asym.sh`, `kqkv_q4.sh`, `kqkv_q2.sh` and `kqkv_q45.sh` run the arms,
 `kqkv_wide.py` is the sweep, `kvq_report.py` scores divergence, KL and cost, `kvq_detail.py` the divergence-step
 distribution, `q2_floor.py` and `q45_floor.py` the alphabet floors, `q2_check.py` the position-0 round trip).
+## Positional encoding: what the retired files ask for, and what it does past 8k
+
+The two retired Bonsai Q1_0 GGUFs do not ask for the plain rotary table. Both declare `qwen3.rope.scaling` as
+**yarn, factor 4**, and they differ in the window they scale from: `original_context_length` is **8192 in the 1.7B and
+16384 in the 8B**. The converter records that block verbatim in `kindi_pack.json` as `rope_scaling`, `kindi.rope`
+turns it into the table the kernels read, and every engine takes the table from there - the CPU one, the CUDA one and
+the two-card plan engine - so a pack cannot be served with a different positional encoding from the file it came from.
+A manifest with no `rope_scaling` (every other pack here) produces the table it always did, bit for bit.
+
+`kindi.rope` is llama.cpp's arithmetic and not a re-derivation: `rope_yarn_ramp` and `ggml_rope_yarn_corr_dims` decide,
+per rotary dimension pair, whether the angle is interpolated (divided by the factor) or extrapolated (left alone), and
+`mscale = 1 + 0.1 ln(factor)` multiplies both tables. For the 1.7B the crossover is dimensions 17 to 34 of 64; for the
+8B, 20 to 37 - the same `mscale` of 1.138629, because the factor is the same. The kernel needed no change: the table is
+data it already reads. The one thing that did need re-deriving was the 8B *pack*: it was converted before the manifest
+carried the key, so its block was rebuilt from its own GGUF (`kindi.convert.rope_scaling`) without touching a weight.
+
+**Protocol.** A walk is one tokenisation and one window, scored one forward pass a token, so the comparison has to be
+paired: the same tokens at the same positions through the two tables, subtracted token by token, with a moving-block
+bootstrap (32-token blocks, 2,000 resamples, fixed seed) for the interval - positions inside a window share
+activations, so a token-level interval here would be far too narrow to be a gate. `scripts/rope-longctx.py` does the
+walk and the join, writes each scored token as it lands, and its 112-token window reproduces `tools/nll`'s own NLL to
+the last digit (3.1648 both ways), which is the check that the two paths compute the same quantity.
+
+**At 9-10k, on a real 7,680-token history, the two tables are indistinguishable.** Corpus: this machine's prose corpus
+(21,223 tokens, sha256 in the JSONs), positions 7,680 to 10,239, 2,560 scored tokens, 61 minutes an arm:
+
+| positions | tokens | plain RoPE | YaRN f4 from 8192 | delta (yarn - plain) | 95% interval |
+|---|---:|---:|---:|---:|---|
+| 7,680-8,192 (inside) | 512 | 1.2410 | 1.2094 | -0.0316 | [-0.0773, +0.0195] |
+| 8,192-8,704 | 512 | 1.2223 | 1.2573 | +0.0350 | [-0.0066, +0.0860] |
+| 8,704-9,216 | 512 | 1.3936 | 1.4403 | +0.0466 | [-0.0099, +0.1026] |
+| 9,216-9,728 | 512 | 1.2977 | 1.3231 | +0.0254 | [-0.0442, +0.0828] |
+| 9,728-10,240 | 512 | 1.1315 | 1.0867 | -0.0448 | [-0.0996, -0.0047] |
+| **whole walk** | **2,560** | **1.2572** | **1.2633** | **+0.0061** | **[-0.0203, +0.0315]** |
+
+The per-band levels move more between bands than between tables, because they are different text as well as
+different positions - which is why the paired delta and not the level is the number to read. The delta changes sign
+once in each direction and the whole-walk interval covers zero: on this corpus, at 1.25x the window, applying the
+file's own YaRN is neither a gain nor a loss.
+
+**At 1.5x it is a gain**, and a large one. The same two tables, scored at positions 12,288-12,799 over a 256-token
+history (the cheap way to reach a deep position: 1,536 forward passes instead of 12,800, 11 minutes an arm):
+
+| positions | tokens | plain RoPE | YaRN f4 from 8192 | delta | 95% interval | tokens where yarn is closer |
+|---|---:|---:|---:|---:|---|---:|
+| 12,288-12,416 | 128 | 3.9236 | 3.6020 | -0.3215 | [-0.5100, -0.0331] | 84 of 128 |
+| 12,416-12,544 | 128 | 2.4171 | 2.1652 | -0.2520 | [-0.4163, -0.1155] | 87 of 128 |
+| 12,544-12,672 | 128 | 2.4754 | 2.1519 | -0.3235 | [-0.6570, -0.2161] | 71 of 128 |
+| 12,672-12,800 | 128 | 2.1419 | 2.0557 | -0.0862 | [-0.2359, +0.0720] | 68 of 128 |
+| **whole walk** | **512** | **2.7395** | **2.4937** | **-0.2458** | **[-0.3544, -0.1276]** | **310 of 512** |
+
+**What that pair of results says.** Factor 4 is a fourfold stretch: it is the amount of interpolation that makes 32,768
+positions look like 8,192, and 8,192 is the number the file trained on. At 9k the window needs roughly 1.2x, so YaRN
+is applying four times the compression the position calls for, and the two errors - plain RoPE extrapolating a little,
+YaRN interpolating a lot - happen to cost the same. At 12.3k plain RoPE is far outside what the training positions
+covered and the same table is worth a quarter of a nat, about 9% of the loss, on 310 of 512 tokens. So "apply the
+YaRN the file asks for" is not a win at the boundary of the window; it is a win where the file was designed to be used,
+and at 9k it is at worst free. For 9-10k the parameter to want is somewhere between 1.25x and 2x, not 4x, and the
+section below measures the range: both ends beat plain RoPE and both beat the file's own factor 4.
+
+**Does the factor matter, and should it match the depth?** The obvious follow-up - and the thing
+[LongRoPE](https://arxiv.org/abs/2402.13753) does properly, with per-dimension factors found by search and a re-fit at
+8k so the original window still works - is whether the factor should match the depth being served.
+`scripts/rope-longctx.py --rope-factor F --rope-window 8192` rebuilds the kernel's table with a factor the manifest
+does not name (and reads it back), so one pack answers that.
+
+**Yes: 1.25 and 2 both beat plain, and the file's own 4 does not.** Same corpus, same 2,560-token walk, only the table
+changed, so every row is paired token by token against plain RoPE:
+
+| positions | plain | f 1.25 | f 2 | f 4 |
+|---|---:|---:|---:|---:|
+| 7,680-8,192 (inside) | 1.2410 | -0.0189 [-0.0412, +0.0000] | -0.0489 [-0.0946, -0.0091] | -0.0316 [-0.0773, +0.0195] |
+| 8,192-8,704 | 1.2223 | -0.0211 [-0.0348, -0.0085] | -0.0238 [-0.0560, +0.0044] | +0.0350 [-0.0066, +0.0860] |
+| 8,704-9,216 | 1.3936 | -0.0063 [-0.0266, +0.0116] | -0.0014 [-0.0335, +0.0346] | +0.0466 [-0.0099, +0.1026] |
+| 9,216-9,728 | 1.2977 | -0.0061 [-0.0310, +0.0114] | -0.0122 [-0.0577, +0.0187] | +0.0254 [-0.0442, +0.0828] |
+| 9,728-10,240 | 1.1315 | -0.0490 [-0.0891, -0.0206] | -0.0676 [-0.1218, -0.0327] | -0.0448 [-0.0996, -0.0047] |
+| **whole walk** | **1.2572** | **-0.0203 [-0.0325, -0.0103]** | **-0.0308 [-0.0506, -0.0139]** | **+0.0061 [-0.0203, +0.0315]** |
+
+Four arms, three verdicts. Factors 1.25 and 2 are negative in every band and their whole-walk intervals exclude zero;
+factor 4's covers zero, so the table the file declares is the one that buys nothing measurable here. Head to head both
+are real wins against 4 - 2 by 0.0369 [0.0215, 0.0536], 1.25 by 0.0264 [0.0040, 0.0498] - and 1.25 against 2 is -0.0105
+[-0.0230, +0.0010], which is a tie. So "which factor wins" has a range for an answer, not a point: **anything from
+about 1.25x to 2x of the 8,192 window beats both plain RoPE and the 4x the file declares, and this walk cannot separate
+the ends of that range.** 1.25x-2x is what 9-10k positions actually ask for; 4x is sized for 32,768. It is not a free
+change either way - the file says 4, and serving 1.25 or 2 means `kindi convert MODEL.gguf --rope-factor 2`, which is a
+decision to disagree with the checkpoint rather than to implement it. (The flag writes the manifest's `rope_scaling`
+block and keeps the file's own block beside it as `rope_scaling_source`, so a pack built this way says which file it
+disagrees with.)
+
+**The cheap depth probe, for what it is worth.** With a 256-token history (512 scored tokens, ~8-12 min an arm) the
+same comparisons are:
+
+| depth | plain | f 1.25 | f 2 | f 4 |
+|---|---:|---:|---:|---:|
+| 8,960-9,472 | 2.1588 | 2.1260 (-0.033 [-0.061, +0.002]) | 2.0524 (-0.106 [-0.168, -0.036]) | - |
+| 12,288-12,799 | 2.7395 | 2.6098 (-0.130 [-0.178, -0.065]) | 2.4632 (-0.276 [-0.384, -0.168]) | 2.4937 (-0.246 [-0.354, -0.128]) |
+
+The effect of the encoding grows with the distance from the trained window - the same factor 1.25 is worth 0.033 at 9k
+and 0.130 at 12.3k - which is what a positional encoding running out of range looks like, and it is why the best factor
+is not one number: at 12.3k factor 1.25 trails 2 and 4 by 0.13-0.15, while at 9-10k it is level with 2 and ahead of 4.
+The probe also ranks factor 2 above plain at 9k, which the full walk confirms, so it preserves the ordering there; what
+it does not do is size the effect, which it overstates by 3.4x (0.106 against 0.031). Two cautions follow. It is an instrument for direction, not
+magnitude, and at 12.3k it puts factors 2 and 4 level within their intervals, so a factor choice between them cannot be
+settled from it. And a protocol that helps everything by compressing distances among a few hundred tokens is not
+measuring extrapolation, which is why the full-context walk stays the gate. That is also why LongRoPE's search stage
+cannot be approximated by trying a handful of scalars - it searches per dimension, and its second stage re-fits the
+model at 8k precisely because a fixed factor, whatever it is, perturbs the window the model was trained on.
+
+**Limits.** One corpus and one model: the probes above are the 1.7B, and the 8B's block is recorded and applied but
+not walked, because its cost law on this host puts one 16k arm at hours. The deep point carries a 256-token history, so
+its *levels* are not comparable with the 8-10k walk's - only the plain/yarn difference within it is. A genuine 16k
+context is 2.6 hours an arm at the measured `0.024 + 6.7e-5 x position` seconds a token, and was not run. The
+intervals are bootstrap intervals over one corpus's positions, not over corpora.**Harness.** `python -u scripts/rope-longctx.py walk --pack PACK --out W.jsonl [--ctx N --prefill P --offset O]
+[--rope-factor F --rope-window N]` for an arm, `... join --a plain.jsonl --b yarn.jsonl --bands a,b,c` for the table.
+The walker's factor is for the values no pack was built at (1.25); a factor a pack should keep is `kindi convert
+--rope-factor F`, which is the same block the walker overwrites.
+JSONs beside the packs: `rope-factor-sweep-1.7b-10k.json` (all four factors on the 9-10k walk, per band),
+`rope-f2-1.7b-10k.json` (factor 2 alone) and `rope-yarn-1.7b-deep.json` (the deep point).
+
 ## Evaluated and rejected (advice from outside this repo)
 
 Three generic "how to speed up CPU inference" lists were triaged against this engine. Almost all of it was written for
