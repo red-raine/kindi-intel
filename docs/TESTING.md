@@ -28,6 +28,7 @@ CPU-only host, which is the case it most needs to cover.
 | `suite:packfetch` | the verified fetch, against a local server that misbehaves: a `Content-Range` starting at a different byte than the range asked for is refused instead of written, a body one byte shorter than its range is refused, a resume continues at the partial file's own length, a partial file longer than the target is discarded, and a wrong sha256 removes the partial file so a bad prefix cannot poison the next attempt | 8 checks |
 | `suite:expert_perm` | the permutation test on experts: a planted signed permutation is recovered exactly, with the planted mapping; an exact copy is `identical` rather than `permutation`; a noisy copy and unrelated experts are neither; merging a permutation is exact after alignment and merging similar experts is lossy with and without it; and the shipped merge's unsigned alignment collapses on a signed permutation while its 0.85 gate catches it | 9 checks |
 | `suite:prefetch_budget` | the paging byte/time model, and that over-fetching beats exact fetch at the proposal's own recall | table |
+| `suite:cluster_budget` | expert clustering against a log whose overlap is known: a batch of like-routed tokens touching more matrices than one of them does, the batch-1 read being the distinct matrices its slots land in (k when they are all distinct, one when they all merge), one group meaning one fetch per batch so per-token bytes fall with the batch, a read that grows with the batch never breaking even while a fixed one does at B=8, a random partition covering every expert exactly once, and co-activation counting exactly the co-routed pairs | 12 checks |
 | `suite:exodus` | the distillation specification's arithmetic: rotation identity and direction, ternary SQNR, top-k renormalisation against the engine, per-sequence halting masks, KL loss scaling, head slicing | 37 checks |
 | `suite:datahub` | the data gate and shard writer: every rejection reason fires, dedup across files, contamination through the CLI path, shard round-trip and tamper detection, and reference coverage - a complete set, the 100 missing MBPP ids reported as ranges, duplicates that do not pad coverage, `--expect` parsing, and the CLI refusing a short reference while recording an allowed one | 47 checks |
 | `suite:fingerprint` | the 20-NN routing index: distance against brute force, folds that leak nothing, a planted layer recovered by tuning, interior k, baselines that must lose, and a `--corpus` path with no corpus exiting 2 | 18 checks |
@@ -68,7 +69,9 @@ on, rather than passing on a GPU machine and breaking for everyone else.
 * **Model quality.** Every check is structural or arithmetic - packing, routing, layout, link targets. None of them says
   whether output text got better or worse. The agent benchmark in the README is the tool for that, and it needs a model.
 * **Long-context and paging behaviour.** Covered by `tools/bitnet_gemm/prefetch_budget.py` as a model, not as a
-  measurement of a real pack on a real disk.
+  measurement of a real pack on a real disk. The overlap those models take as input is measured
+  (`tools/bitnet_gemm/cluster_budget.py` reads a captured router log), but the log is of one model on four documents,
+  and the read and GEMV rates behind both tools are one machine's.
 * **Windows-specific code paths** beyond what the CPU suite happens to exercise, and no check covers the Docker images.
 
 ## Adding a check

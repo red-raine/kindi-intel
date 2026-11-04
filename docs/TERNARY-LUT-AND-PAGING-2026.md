@@ -228,9 +228,61 @@ pre-attention normalisation - so whichever is trained, the other integration is 
 the better predictor (less drift to bridge) and should be the one written down.
 
 What does move the floor is changing the bytes or the work per byte, which is what the earlier sections already found:
-a **batch of 5-6 tokens** puts one expert's 9.5 ms under its own compute, and **smaller experts** (clustering 64 experts
-into 12, or a rank cut) divide the read by five and drop the break-even batch to about one. Both are model-side changes;
-no amount of queue depth substitutes for them.
+a **batch of 5-6 tokens** puts one expert's 9.5 ms under its own compute, and a **rank cut** divides the read itself.
+Clustering 64 experts into 12 is the case that does not work that way - it divides the *table*, not the read a token
+issues - and it is measured in the next section.
+
+### Clustering 64 experts into 12 divides the table, not the read
+
+The proposal: merge each group of experts into one averaged expert, taking 64 down to 12, so the expert table is 18.75%
+of its size and - the claim - the break-even batch falls to about one. The two halves of that are different questions.
+Merging does shrink the table, by definition. It does not shrink an expert: a cluster is still one 14.7 MB matrix, and
+a token still routes to k of them. What changes per *token* is only that two of its slots may now land in the same
+cluster, and what changes per *batch* is that the union of a batch's experts is capped by the number of clusters.
+
+Both are properties of the router's real overlap, so they are measured from a captured log of one: 48 layers, 128
+experts, top-8, 384 tokens over 4 documents, three documents fitting the clustering and the fourth scoring it.
+
+```bash
+python -m tools.bitnet_gemm.cluster_budget --clusters 12      # the proposal's shape, on a 128-expert log
+python -m tools.bitnet_gemm.cluster_budget --clusters 24      # the same 18.75% ratio
+python -m tools.bitnet_gemm.cluster_budget --selftest
+```
+
+| arm | distinct(B=1) | GB/token B=1 | ms/token B=1 | GB/token B=8 | ms/token B=8 | break-even |
+|---|---:|---:|---:|---:|---:|---:|
+| as routed, 128 experts | 8.00 | 3.67 | 76 | 2.01 | 42 | B=64 |
+| 12 clusters, co-activation | 5.24 | 2.41 | 50 | 0.55 | 14 | **B=8** |
+| 12 clusters, random partition | 6.13 | 2.82 | 58 | 0.66 | 14 | **B=8** |
+
+resident arm for comparison: 14 ms/token at every batch (8 slots x 1.8 ms, no read at all). Table size at 32 layers:
+58.8 GB as shipped, **5.5 GB at 12 clusters**.
+
+What the columns say:
+
+- **Batch 1 improves, and not for the reason given.** 5.24 distinct matrices instead of 8 is a 35% cut in the read, and
+  it is real - but it is exactly the tokens whose k experts were merged into one matrix, i.e. the tokens that now compute
+  fewer expert functions. It is the quality cost of the merge showing up as a bandwidth saving, not a free lunch.
+- **Batch 1 still does not break even.** One token's compute is 8 x 1.8 = 14.4 ms and a read is 9.5 ms, so break-even
+  at B=1 needs the slots in **1.52 distinct matrices or fewer**. At 12 clusters a token touches 5.24 - still 3.5x over.
+- **The crossover moves from B=64 to B=8, and the number of groups is what moves it.** A batch's union cannot exceed the
+  cluster count, so with 12 clusters the read per token falls as 12/B; it drops under the k/5.28 compute ratio at B=8.
+  That is arithmetic on the group count. A **random** partition of the same 12 reaches B=8 as well, which is the
+  control that matters: if the crossover were the win being claimed, clustering quality would not be needed for it.
+- **Picking the groups buys about a sixth of the bytes, not a step of batch.** Co-activation beats the random partition
+  at every batch (5.24 vs 6.13 distinct at B=1; 9.57 vs 11.50 at B=8, which is 0.55 vs 0.66 GB) and never changes the
+  crossover. Worth having, not worth a design.
+- **The honest route to batch 1 is residency, not paging.** 5.5 GB at 12 clusters fits in VRAM on a 16 GB card, and then
+  there is nothing to page and no break-even to reach: batch 1 runs at the 14 ms compute floor. "Break-even at one"
+  comes true through the table fitting in memory - which is what merging experts actually delivers - not through
+  streaming the merged table off disk.
+
+Caveat on the shape: the model in the proposal has 64 experts and the capture has 128, so 12-of-128 (9.4%) is a coarser
+merge than 12-of-64 (18.75%) and gives more slot collisions - the more generous case for the proposal. The 24-cluster
+run, which matches the ratio, lands at break-even B=16 with 6.46 distinct at B=1, so moving to the real geometry makes
+the batch-1 answer slightly worse, not better. What is *not* measured here is quality: whether the experts the router
+groups together are one function is `docs/EXPERT-MERGE.md`'s question, and it has to be paid before any of this table
+can be spent.
 
 ### The disk claims are the least trustworthy numbers here
 
@@ -238,7 +290,7 @@ Every figure in that section is what a process sees when it asks for these bytes
 control proves an intermediate cache exists that `FILE_FLAG_NO_BUFFERING` does not bypass, and I cannot reach it from
 inside the guest to characterise it. Anyone re-running this on bare metal should expect the NVMe row to move.
 
-## Two corrections
+## Three corrections
 
 1. **"Cache blocking wins 1.58x."** Withdrawn: one sample against one sample, on a baseline that moves ±45% run to run.
    Re-measured with matched sampling, the wide shape is indistinguishable from the untiled kernel and the narrow shape
@@ -246,8 +298,12 @@ inside the guest to characterise it. Anyone re-running this on bare metal should
 2. **"1.67 GB/s is the device."** Withdrawn: it is the throughput of 14.7 MB unbuffered reads on this host, behind a
    cache the flag does not bypass. The 4 TB HDD reporting 3 GB/s is the proof. What survives is the expert-sized read
    cost, and the ceiling derived from it (17% at batch 1, level at 5-6 tokens).
+3. **"Clustering 64 experts into 12 divides the read by five and drops the break-even batch to about one."** Half wrong.
+   It divides the table by five, to 5.5 GB, which is a residency win and does reach batch 1 that way. The read is
+   divided by 1.5 at best (8 -> 5.24 distinct matrices at batch 1), and the streaming crossover lands at B=8, not B=1 -
+   and a random partition of the same size lands there too.
 
-Neither correction changes the operating recommendation, which is the useful part: **do not port either kernel.** The
+None of these change the operating recommendation, which is the useful part: **do not port either kernel.** The
 LUT matches the shipped pair table at parity, so a repack of the weight layout would buy nothing; paging is a batched
 design and this engine decodes at batch 1.
 

@@ -89,6 +89,8 @@ SUITES = [
     ("suite:expert_perm", [sys.executable, "-m", "tools.expert_merge.permtest"], "checks passed"),
     ("suite:packfetch", [sys.executable, "-m", "tools.expert_merge.fetch", "--selftest"], "checks passed"),
     ("suite:prefetch_budget", [sys.executable, "-m", "tools.bitnet_gemm.prefetch_budget"], "over-fetch"),
+    ("suite:cluster_budget", [sys.executable, "-m", "tools.bitnet_gemm.cluster_budget", "--selftest"],
+     "checks passed"),
     ("suite:exodus", [sys.executable, "-m", "tools.exodus"], "check groups passed"),
     ("suite:datahub", [sys.executable, "-m", "tools.datahub.selftest"], "checks passed"),
     ("suite:fingerprint", [sys.executable, "-m", "tools.fingerprint.router", "--selftest"], "checks passed"),
