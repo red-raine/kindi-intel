@@ -82,6 +82,7 @@ def check_engine_selftests():
 SUITES = [
     ("suite:astvalid", [sys.executable, "-m", "tools.astvalid", "selftest"], "checks passed"),
     ("suite:moe_loop", [sys.executable, "-m", "tools.moe_loop.test_moe_loop"], "checks passed"),
+    ("suite:loop_halt", [sys.executable, "-m", "tools.moe_loop.halt", "--selftest"], "checks passed"),
     ("suite:bitnet_gemm", [sys.executable, "-m", "tools.bitnet_gemm.test_bitnet"], "checks passed"),
     ("suite:expert_merge", [sys.executable, "-m", "tools.expert_merge.merge"], "permutation logic verified"),
     ("suite:expert_perm", [sys.executable, "-m", "tools.expert_merge.permtest"], "checks passed"),
@@ -208,8 +209,8 @@ def main(argv):
 
     print("\n%d ok, %d skipped, %d failed in %.1fs"
           % (len(oks), len(skips) + len(SKIPPED), len(fails), time.perf_counter() - t0))
-    if not verbose and skips:
-        print("(the skipped modules are the CUDA path; --verbose lists them)")
+    if not verbose and (skips or SKIPPED):
+        print("(--verbose lists what was skipped, and why)")
     return 0 if not fails else 1
 
 

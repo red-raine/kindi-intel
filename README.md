@@ -334,7 +334,7 @@ of 295 agent turns were the same). The details are in [docs/PROMPT-CACHE.md](doc
 
 | | |
 |---|---|
-| `kindi convert MODEL.gguf [--out DIR] [--force] [--paircodes]` | build the weight pack (default: the configured `pack`); `--paircodes` adds `pcodes.bin`, the expert staging file a paged MoE pack copies from |
+| `kindi convert MODEL.gguf [--out DIR] [--force] [--paircodes] [--rope-factor F]` | build the weight pack (default: the configured `pack`); `--paircodes` adds `pcodes.bin`, the expert staging file a paged MoE pack copies from; `--rope-factor` builds the pack's rotary table at F instead of the factor the file declares (2 for a 16k stretch of an 8k window, 1 for the plain table) |
 | `kindi fast-head [--clusters N]` | build the fast-head cluster file (stop the server first: needs ~300 MB of GPU memory) |
 | `kindi verify` | check greedy output against llama.cpp's reference |
 | `kindi bench` | speed at several context positions, prompt read speed, GPU memory |
@@ -386,7 +386,9 @@ Whether the experts the router groups together are one function relabelled, meas
 What a ternary LUT kernel and expert paging actually cost on an AVX2 i9, including two claims withdrawn: [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 What the 27B ternary packs differ in - identical codes, re-fitted scales, and one derivative that is the base file
 repacked: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).
+What the retired 1-bit files' YaRN rope scaling does past their trained window, measured: [docs/CPU-PERF-2026.md](docs/CPU-PERF-2026.md).
 Whether Marlin's INT4 tensor-core kernel can be used here, and the one layout idea in it that can: [docs/INT4-MARLIN.md](docs/INT4-MARLIN.md).
+Where the remaining bits in a ternary pack are, with what this repository measured on real weights against each lever: [docs/TERNARY-OPTIMIZATION-MATRIX.md](docs/TERNARY-OPTIMIZATION-MATRIX.md).
 The settings for each tested card (K420, K1200, K6000, GTX 1080, RTX 3080, Radeon 780M, CPU): [docs/CARDS.md](docs/CARDS.md).
 
 ## Agent benchmark
@@ -400,7 +402,7 @@ One command runs every check in this repository - module imports, the quantiser 
 suites, the CLI, and the links in these documents:
 
 ```bash
-python -m tools.selftest            # 0 failed is the pass; the exit status is the answer
+python -m tools.selftest            # 80 ok, 1 skipped, 0 failed, ~62 s
 python -m tools.selftest --verbose  # timings, and every skip with its reason
 ```
 
