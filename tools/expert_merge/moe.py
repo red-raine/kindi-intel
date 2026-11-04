@@ -13,6 +13,9 @@ be judged on.
 
 Costs, measured on this host: ~80M dequantised values/s, so one 48-layer pass over 128 tokens is a few minutes,
 and only the experts a token actually routes to are unpacked.
+
+A plan from `tools.expert_merge.prune` is applied with `set_prune`: the router's logits are masked and the top-k
+renormalised, so the weights are untouched and the two arms of an NLL gate can share one loaded pack.
 """
 import numpy as np
 
@@ -51,6 +54,41 @@ def softmax(z, axis=-1):
     return e / e.sum(axis=axis, keepdims=True)
 
 
+def mask_logits(logits, keep):
+    """The router's scores with every expert outside `keep` at -inf. Unchanged when `keep` is None.
+
+    Masking here rather than after the top-k is what makes a pruned model *this* model with fewer options: the
+    softmax is over the kept set, so the probabilities the surviving experts are applied with are the ones the
+    router would have given them, renormalised - not the old weights with some of them zeroed.
+    """
+    if keep is None:
+        return logits
+    keep = np.asarray(sorted(int(e) for e in keep), dtype=np.int64)
+    n = logits.shape[-1]
+    if keep.size == 0:
+        raise ValueError("a layer with no experts kept has nothing to route to")
+    if keep.min() < 0 or keep.max() >= n:
+        raise ValueError("kept expert %d is outside the %d this router has" % (keep.max(), n))
+    out = np.full(logits.shape, -np.inf, dtype=np.float32)
+    out[:, keep] = logits[:, keep]
+    return out
+
+
+def masked_route(logits, k):
+    """Top-`k` of the masked scores with Qwen3's renormalisation, `k` clamped to the experts that exist.
+
+    A budget below the model's active count leaves fewer slots than the model was trained to fill, and taking the
+    top-k of a vector holding four finite values and 124 `-inf` ones would spend slots on experts at probability
+    zero. The clamp is what keeps a pruned layer well-defined; `prune` reports when it happens.
+    """
+    finite = int(np.isfinite(logits).sum(axis=-1).min())
+    k = max(1, int(min(int(k), finite)))
+    probs = softmax(logits)
+    idx = np.argsort(-probs, axis=-1)[:, :k]
+    w = np.take_along_axis(probs, idx, axis=1)
+    return idx, w / w.sum(axis=1, keepdims=True)
+
+
 class Qwen3Moe(object):
     def __init__(self, path, log=print, allow_partial=False):
         self.pack = Moepack(path)
@@ -68,6 +106,24 @@ class Qwen3Moe(object):
         self.n_layers = p.n_layer if rep["ok"] else rep["layers_ok"]
         self.truncated = self.n_layers < p.n_layer
         self._attn = {}
+        self.prune = None                                    # None: every expert available, as the pack shipped
+
+    def set_prune(self, keep_per_layer):
+        """Restrict each layer to a set of experts and leave everything else alone; `None` restores the model.
+
+        The plan is one list of expert ids a layer, in layer order - what `tools.expert_merge.prune` writes. Applying
+        it here rather than rewriting the pack is what lets the two arms of an NLL gate run in one process over the
+        same weights: a pruned pack would have to be re-read, and a re-quantised one would differ in more than the
+        experts that were dropped.
+        """
+        if keep_per_layer is None:
+            self.prune = None
+            return self
+        keep = [None if k is None else sorted(int(e) for e in k) for k in keep_per_layer]
+        if len(keep) != self.n_layers:
+            raise ValueError("a plan for %d layers cannot be applied to %d" % (len(keep), self.n_layers))
+        self.prune = keep
+        return self
 
     # --- pieces -----------------------------------------------------------------------------------------------
     def attn_weights(self, il):
@@ -104,10 +160,9 @@ class Qwen3Moe(object):
     def route(self, h, il):
         p = self.pack
         logits = h @ self.attn_weights(il)["router"].T
-        probs = softmax(logits)
-        idx = np.argsort(-probs, axis=-1)[:, :p.n_expert_used]
-        w = np.take_along_axis(probs, idx, axis=1)
-        return logits, idx, w / w.sum(axis=1, keepdims=True)
+        logits = mask_logits(logits, None if self.prune is None else self.prune[il])
+        idx, wts = masked_route(logits, p.n_expert_used)
+        return logits, idx, wts
 
     def moe(self, x, il, capture=None):
         """Sparse block: only the experts some token in this batch chose are unpacked."""

@@ -18,6 +18,7 @@ measures a different design.
 | `test_bitnet.py` | the checks and the host benchmark |
 | `tmac.cpp`, `tmac.py` | the T-MAC LUT GEMV and its cache-blocked variant, built and measured (below) |
 | `stream_probe.py` | what a cold expert read costs on this device, unbuffered - the ceiling on any paging pipeline |
+| `copytest.py` | whether a read rate is the medium, the path or a cache: one file through `ReadFile` unbuffered, `ReadFile` buffered, `CopyFileExW` and 4 KB random, plus the read-during-commit curve that retired the 9 ms figure |
 
 ## What was verified, and how
 
@@ -185,37 +186,42 @@ order so `assert cur_id == active_expert_id` fails whenever the next token flips
 sub-millisecond GEMV cannot hide a 14.7 MB NVMe read - the prefetch has to be issued during the *previous token's whole
 decode*, into a double buffer sized for the union of the next token's top-k experts, with the pack streamed as packed.
 
-## Paging experts from disk: measured, with the measurement's own limits stated
+## Paging experts from disk: 3.3-4.0 ms a read, and the 9 ms number was a read racing a write
 
 The next note streams cold experts with `io_uring` + `O_DIRECT` + `mlock`, double-buffered against the GEMV. That is a
-Linux mechanism and this box is Windows, so it is not built here; but the number it rests on is measurable.
-`stream_probe.py` reads with `FILE_FLAG_NO_BUFFERING` (the POSIX arm uses `O_DIRECT`), and the flag is enforced - an
-unaligned `ReadFile` under it fails with `ERROR_INVALID_PARAMETER` (87), checked rather than assumed.
+Linux mechanism and this box is Windows, so it is not built here; but the number it rests on is measurable, and it took
+two probes and three wrong answers to measure. `stream_probe.py` reads with `FILE_FLAG_NO_BUFFERING` (the POSIX arm uses
+`O_DIRECT`), and the flag is enforced - an unaligned `ReadFile` under it fails with `ERROR_INVALID_PARAMETER` (87),
+checked rather than assumed. `copytest.py` is the second opinion: one file, the same bytes through `ReadFile` unbuffered,
+`ReadFile` buffered, `CopyFileExW`, and 4 KB random, so a rate can be attributed to the medium, the path or the cache.
 
-| read | C: (KIOXIA NVMe) | B: (WDC 4 TB HDD) | E: (Seagate USB) |
+| arm | C: | B: | E: (USB spindle) |
 |---|---:|---:|---:|
-| 14.7 MB, one call | 9.25 ms, 1.6 GB/s | 4.3 ms, 3.6 GB/s | 175 ms, 0.09 GB/s |
-| 200 MB, one call | 3.3 GB/s | 2.5-3.0 GB/s | 32 MB/s |
-| write 2 GB | 69 MB/s | 57 MB/s | - |
+| 14.7 MB unbuffered, whole file | 3.10-3.47 GB/s (3.3-4.0 ms) | 2.64 | 0.14 |
+| buffered `ReadFile`, cold / warm | 2.80 / 3.29 | 3.29 / 2.95 | 0.12 / 3.88-4.03 |
+| `CopyFileExW`, one-way share | 1.95 (3.89 both ways) | 1.48 (2.97) | 0.11 |
+| 4 KB random | 3.9-5.7 k IOPS | 24.8 k IOPS | 110 IOPS |
+| buffered write: into cache, then commit | 1.84, then 0.068 GB/s | - | - |
 
-**A 4 TB spinning disk cannot read at 2.5-3 GB/s, so this table is not a device measurement.** Whatever serves these
-reads sits outside the guest's page cache: in this virtualised environment, freshly written data comes back faster than
-the medium could deliver it, and both disks write at ~60 MB/s. An earlier version of this probe reported 1.67 GB/s and I
-called it "the device" - that was wrong, and the HDD control is what exposed it. Two other artifacts had to be fixed
-before the probe gave even these numbers: a file smaller than the drive's own cache reads from that cache (a *spinning*
-HDD reported 4 GB/s), and a repeated 1 MB block compresses to nothing under NTFS compression, measuring the decompressor.
+**The 1.6 GB/s and the ~9 ms read came from reading a file the probe had just written.** A drive with a write-back cache
+takes writes at 1.84 GB/s and commits them at 68 MB/s, so 2 GB takes 30 s to reach the medium - and for those 30 s,
+reads of the file being committed run at 0.14 GB/s. Measured on a timer: 3.80 GB/s at 0.1 s, **0.14 GB/s from 4 to 30 s**,
+3.68 GB/s at 37 s. With the drive idle the same 14.7 MB reads run at 3.1-3.5 GB/s.
 
-The one number here that does not depend on the medium's identity is the **expert-sized read: ~9 ms for 14.7 MB**, and it
-is stable at queue depths 1, 4 and 8 (1.61, 1.37, 1.65 GB/s - no gain from depth). Against 1.8 ms of GEMV that is a
-ceiling of `1.8 / (1.8 + 9) = 17%` for a pipeline that hides one expert read behind one expert multiply, per expert, per
-layer, per token. Reading a 200 MB batch instead does reach 3.3 GB/s, i.e. larger transfers amortise the per-call cost -
-that is the same "more work per read" conclusion from the other direction.
+Two corrections came with that. The B: arm is **not** a spinning disk - 24,820 random 4 KB IOPS over 33.9 GB against the
+USB spindle's 110 - so its 2.6-3.3 GB/s are its own, and the "a 4 TB HDD cannot do 3 GB/s" argument that retired the old
+table was sound in form and wrong about the hardware. The control that does the work is E:, 0.12-0.14 GB/s cold against
+3.9-4.0 warm. And a **copy cannot settle a read rate**: it is read *and* write on one medium, so its one-way share is
+bounded by the slower side and is a floor on the device, never a ceiling on reads. Measured copies ran 0.37-2.32 GB/s on
+C: in one afternoon, tracking commit state rather than the drive.
 
 The arithmetic that decides when streaming is worth building: the kernel digests 58.7 M weights in 1.8 ms = **32.6 G
-weights/s**, while 6.7 G weights/s is what 1.67 GB/s of packed weights amounts to. Compute outruns the read by ~5x at
-expert granularity, so at batch 1 the read can never be hidden. The fix is not a faster I/O path - it is **more tokens
-per weight read**: at a batch of 5 or more, one expert's ~9 ms read sits under 5 x 1.8 = 9 ms of compute and the pipeline
-is level. Streaming experts is a *batched* inference design; at batch 1 the expert set has to fit in RAM.
+weights/s**, while 3.7 ms of read is 15.9 G weights/s. Compute still outruns the read, by 2x instead of 5x, so at batch 1
+the read still cannot be hidden and the fix is still **more tokens per weight read** - but it takes 2 tokens rather than
+5-6 to make one expert's read free, and a pipeline that hides one read behind one multiply has a 33% ceiling rather than
+17%. In a *running* pipeline the read costs 19-25 ms, not 3.7, because the reader shares bandwidth with the GEMV: that is
+what `batch_stream.py` measures, and it is why streaming is still a batched design whose batch-8 arm loses to residency.
+At batch 1 the expert set has to fit in RAM.
 
 As code, the note needs five things before it runs correctly: (1) `wait_completion` returns whichever CQE arrives and
 the loop pairs it with `cur_slot`, which only holds while exactly one read is outstanding - set the constructor's

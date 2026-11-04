@@ -382,10 +382,11 @@ tokens/s and reads prompts at 1.2 tokens/s (512 tokens). The tables for each car
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 How Kindi works: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 An experiment on reusing the activation code as a routing fingerprint: [docs/ROUTING-FINGERPRINT.md](docs/ROUTING-FINGERPRINT.md).
-Whether the experts the router groups together are one function relabelled, measured on a real pack before merging them: [docs/EXPERT-MERGE.md](docs/EXPERT-MERGE.md).
+Whether the experts the router groups together are one function relabelled, measured on a real pack before merging them - and what merging them anyway costs, written out as a pack and gated at matched precision (**+1.36 nats/token**, 3.9x perplexity, for half the expert bytes of its matched-precision control): [docs/EXPERT-MERGE.md](docs/EXPERT-MERGE.md).
+Which experts a MoE layer can be left without, under an exact per-layer byte budget solved with the RCO knapsack and gated on held-out NLL: [docs/EXPERT-PRUNE.md](docs/EXPERT-PRUNE.md).
 What a ternary LUT kernel and expert paging actually cost on an AVX2 i9, including two claims withdrawn: [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
-What the 27B ternary packs differ in - identical codes, re-fitted scales, and one derivative that is the base file
-repacked: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).
+What the 27B ternary packs differ in - identical codes, re-fitted scales, one derivative that is the base file
+repacked, and a training-free refit that puts one file's scales on another's codes: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).
 What the retired 1-bit files' YaRN rope scaling does past their trained window, measured: [docs/CPU-PERF-2026.md](docs/CPU-PERF-2026.md).
 Whether Marlin's INT4 tensor-core kernel can be used here, and the one layout idea in it that can: [docs/INT4-MARLIN.md](docs/INT4-MARLIN.md).
 Where the remaining bits in a ternary pack are, with what this repository measured on real weights against each lever: [docs/TERNARY-OPTIMIZATION-MATRIX.md](docs/TERNARY-OPTIMIZATION-MATRIX.md).
@@ -404,7 +405,7 @@ One command runs every check in this repository - module imports, the quantiser 
 suites, the CLI, and the links in these documents:
 
 ```bash
-python -m tools.selftest            # 80 ok, 1 skipped, 0 failed, ~62 s
+python -m tools.selftest            # 94 ok, 1 skipped, 0 failed, ~68 s
 python -m tools.selftest --verbose  # timings, and every skip with its reason
 ```
 

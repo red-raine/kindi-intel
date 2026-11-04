@@ -34,7 +34,7 @@ import sys
 
 import numpy as np
 
-R_MS = 9.5          # one 14.7 MB expert read, measured
+R_MS = 9.5          # one 14.7 MB expert read, measured; 3.7 with the drive idle (see copytest.py)
 C_MS = 1.8          # one expert GEMV at batch 1, measured
 EXPERT_MB = 14.7    # bytes of one expert matrix (14336 x 4096 at ~1.75 bits)
 LAYERS = 32
@@ -275,9 +275,12 @@ def report(routes, clusters, k, log=print):
 def main(argv):
     if "--selftest" in argv:
         return selftest()
+    global R_MS
     clusters, k, path = 24, 8, None
     for i, a in enumerate(argv):
-        if a == "--clusters":
+        if a == "--read":
+            R_MS = float(argv[i + 1])          # 9.5 is a read that races a write commit; 3.7 is the idle device
+        elif a == "--clusters":
             clusters = int(argv[i + 1])
         elif a == "--top-k":
             k = int(argv[i + 1])

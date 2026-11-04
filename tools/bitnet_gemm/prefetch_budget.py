@@ -8,7 +8,8 @@ At batch 1 the premise is already known to fail (docs/TERNARY-LUT-AND-PAGING-202
 number on the proposal anyway, because whether it helps is a question about *bytes* and *batch*, not about recall, and
 the crossover is worth knowing.
 
-    python -m tools.bitnet_gemm.prefetch_budget
+    python -m tools.bitnet_gemm.prefetch_budget                    # the 9.5 ms the withdrawal of 2026-11-04 retired
+    python -m tools.bitnet_gemm.prefetch_budget --read 3.7         # what the same read costs with nothing committing
     python -m tools.bitnet_gemm.prefetch_budget --recall 0.90 --overfetch 4
 
 Model, with the assumptions stated so they can be argued with:
@@ -25,7 +26,7 @@ Model, with the assumptions stated so they can be argued with:
 """
 import sys
 
-R_MS = 9.5          # one 14.7 MB expert read, measured (stream_probe.py)
+R_MS = 9.5          # one 14.7 MB expert read while the drive is committing a write (copytest.py --flush); 3.7 idle
 C_MS = 1.8          # one expert GEMV at batch 1, measured (tmac.py, 14336 x 4096, 8 threads)
 LAYERS = 32
 K = 2               # top-2 routing
@@ -60,12 +61,15 @@ POLICIES = [
 
 
 def main(argv):
+    global R_MS
     recall, overfetch = None, None
     for i, a in enumerate(argv):
         if a == "--recall":
             recall = float(argv[i + 1])
         elif a == "--overfetch":
             overfetch = int(argv[i + 1])
+        elif a == "--read":
+            R_MS = float(argv[i + 1])          # the device's own rate; 3.7 is what copytest measures when idle
     policies = list(POLICIES)
     if recall is not None:
         policies = [p for p in policies if p[1] == (overfetch or K)] + [("custom", overfetch or K, recall)]
@@ -98,8 +102,8 @@ def main(argv):
         verdict = "over-fetch wins" if over < exact else "exact wins"
         print("  B=%-3d exact/82%% %6.0f ms   over-fetch/96%% %6.0f ms   %s by %4.0f ms"
               % (b, exact, over, verdict, abs(over - exact)))
-    print("\n(both arms are measured against the same 9.5 ms and 1.8 ms; the recalls are the proposal's training-set\n"
-          " numbers, and no held-out split was reported for them)")
+    print("\n(both arms are measured against the same %.1f ms read and %.1f ms GEMV; the recalls are the proposal's\n"
+          " training-set numbers, and no held-out split was reported for them)" % (R_MS, C_MS))
     return 0
 
 

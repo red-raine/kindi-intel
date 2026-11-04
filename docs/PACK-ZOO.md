@@ -102,13 +102,73 @@ nats *worse* at predicting prose than the build it came from. The card's own cla
 against the king's `0.08409`, which needs Qwen3.8-27B to check and is not checkable here - a smaller distance from the
 file it was derived from is the miner's lever, not evidence that the lever pointed the right way.
 
+## Re-deriving the scales without touching the codes: `kindi refit`
+
+Ingot is Bonsai with every code kept and every scale moved. That leaves an experiment this page could not run with two
+GGUFs: take Bonsai's codes, solve each block scale against Ingot's weights, and see how much of the difference the
+scales carry. `kindi refit` is that, and the solve is closed form rather than a search - one pass over the tensor, no
+training, no code rewritten:
+
+```
+for each 128-weight block, with the target weights w and the block's fixed codes c in {-1, 0, +1}:
+    s = <w, c> / <c, c>          # least squares: the projection of w onto the direction c picks out
+    s = max(s, 0)                # a block scale is a magnitude, so a negative is clipped and counted
+    all-zero codes -> keep s     # no direction to fit, and a division by zero otherwise
+```
+
+```bash
+python -m kindi.refit --pack B:/models/packs/bonsai-27b --target B:/models/packs/ingot-27b \
+                      --out B:/models/packs/bonsai-27b-refit --link
+```
+
+Nothing is trained, so the refit cannot make the pack bigger or slower: the code and float files are hard links with
+`--link` (byte copies without it), and only `dpm.bin` (210 MB) and `dscale.bin` (170 KB) are new. On the 27B pair the
+run took 29 minutes and compared all **6,717,440,000** code bytes: **0 differ** from the target, so the fit is asked to
+reproduce a scale the target already holds. It does, exactly - with the codes fixed and `w = c*s`, `<w,c>/<c,c>` is `s` -
+and the output pack's **209,920,000** scales decode **bit-identically** to Ingot's. 0 blocks had no codes and 0 clipped at
+zero; relative RMSE to the target went **0.21593 -> 0.0**. The refit's own level tables then cost nothing (250 levels at
+most, worst block 0.0%), where the 2B pack's 8-bit grid costs 0.75% of a scale in its worst block.
+
+So the written refit is *Ingot's ternary weights with Bonsai's float tensors*: the scales of one file, the codes and the
+norms of the other. That makes it a controlled decomposition rather than a better build - a paired NLL walk against
+Bonsai prices what the scales alone are worth, and the float tensors stay out of that number entirely, since the 79-token
+comparison above is the only measurement here that has them in.
+
+**What the scales alone are worth.** Both packs walked over the same 192 tokens of the same prose file, subtracted token
+by token:
+
+| arm | ternary weights | float tensors | NLL | delta vs Bonsai | 95% interval |
+|---|---|---|---:|---:|---|
+| Bonsai 27B | Prism's PTQ scales | Bonsai's | 1.2907 | - | - |
+| `bonsai-27b-refit` | Ingot's, bit-identical | **Bonsai's** | 1.3121 | **+0.02143** | [-0.02261, +0.07851] |
+
+The refit pack is closer on 91 of the 192 tokens and Bonsai on 101, and the interval covers zero: **re-deriving every
+one of the 209.9 million block scales against the other file's weights does not resolve a direction at this budget.** A
+16-token-per-domain spot check over the four scale-gate corpora before this run pointed the other way on one domain
+(docs at -0.081, an interval degenerate at 16 tokens), which is exactly the noise the 192-token walk is for.
+
+That does not contradict the +0.006405 nats further up, but it bounds it. Ingot's entire difference from Bonsai on 79
+tokens of prose was +0.0064, and the scales are the largest single lever in it - so the honest reading of the Ingot
+recipe at 2 bits is that it moves every scale in the file and moves held-out NLL by less than the ~0.05 nats a paired
+walk of this size can resolve. What that leaves is the code: the trits are identical in both files, so no re-derivation of
+the scales can move a weight the codes have already rounded wrong. [QAT-CONVERSION.md](QAT-CONVERSION.md) measures that
+floor directly - refitting a scale on drifted weights recovers at most 1.2 points of retention, never 1.0.
+
+Three limits on the tool itself. It cannot repair a code, as above. It needs a target pack of the same model in the same
+rotation basis, and refuses rather than guesses: another Hadamard rotation, another width, a tensor the target does not
+have, or a source whose `pcodes.bin` stages its own copy of the scales are all errors, not warnings. And its delta is not
+purely the target's: a pack whose scales sit on a coarse level table can appear to improve for the table's sake, and here
+the refit's tables are exact where Bonsai's 8-bit grid costs 0.75% of a scale in its worst block. That bias runs in the
+refit's favour, and it still does not resolve a direction.
+
 ## Why this belongs next to the K/V measurements
 
 The 2-bit V experiment found one thing that helps a 2-bit container: a scale per 32 values instead of per head -
 19% lower KL for 21% more cache, on trained cache values. The weight side of this family is the same argument one
 level up. `PQ2_0` is `PTQ1_0` with 8 more bits a block spent on a denser code, and the winner of the Ingot round
 spent none of its budget on the code: it kept the trits and re-derived the scales and norms against a BF16 teacher.
-Whatever the 27B can still gain at 2 bits, this evidence says it is in the scale, not the alphabet.
+Whatever the 27B can still gain at 2 bits, this evidence says it is in the scale rather than the alphabet - though the
+refit above puts a size on that lever, and on 192 tokens it is smaller than ±0.05 nats.
 
 ## Reproducing
 
@@ -140,6 +200,14 @@ The distribution comparison is one command on the two converted packs (about 15 
 ```bash
 python -m tools.kl logits --a packs/bonsai-27b --b packs/ingot-27b --tokens 96 --ctx 256 \
   --json packs/kl-logits-bonsai-ingot.json
+```
+
+The refit, and what it is worth:
+
+```bash
+python -m kindi.refit --pack packs/bonsai-27b --target packs/ingot-27b --out packs/bonsai-27b-refit --link
+python -m tools.nll --pack packs/bonsai-27b --against packs/bonsai-27b-refit \
+  --corpus corpora/scale-gate/prose/prose.txt --tokens 192 --block 24 --json packs/nll-refit-27b-prose.json
 ```
 
 ## Maple-Preview is a different engine's problem

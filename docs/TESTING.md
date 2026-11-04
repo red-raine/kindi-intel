@@ -3,7 +3,7 @@
 One command runs everything this repository checks:
 
 ```bash
-python -m tools.selftest            # 80 ok, 1 skipped, 0 failed, ~62 s
+python -m tools.selftest            # 94 ok, 1 skipped, 0 failed, ~68 s
 python -m tools.selftest --verbose  # per-check timing, and every skip with its reason
 ```
 
@@ -20,12 +20,14 @@ CPU-only host, which is the case it most needs to cover.
 | `kindi.convert.selftest` | the converter's tensor walk and layout, and the rope-factor override: composing with the file's block instead of replacing it, yarn from the declared context when the file declares none, factor 1 as the plain table, linear kept linear, a window alone, and the factors and windows that must be refused | engine |
 | `suite:rope` | the rotary table against its closed form: the plain table, position 0, the correction dims of the retired 1.7B file's own parameters (17 and 34), `mscale = 1 + 0.1 ln(factor)`, extrapolation below the low dim and interpolation above the high one, `linear` dividing every angle, and a factor of 1 as the identity | 8 checks |
 | `suite:packio` | the pack's block scales at 8 bits: an exact table when a tensor has no more distinct scales than levels, a minimax grid that keeps every block inside the worst error the written levels promise, zeros (padded rows) preserved and negatives refused, a v1 fp16 pack and its v2 re-encoding loading to one value per block, and a v2 pack shorter than its index refused by name | 9 checks |
+| `suite:refit` | the training-free block scale: a planted scale recovered block for block, a target it cannot match still fitted closer than the scale it started with, an all-zero-code block keeping its scale instead of dividing by zero, a negative solution clipped rather than written, a pack refitted against itself as a fixed point, a target at twice the magnitude giving twice the scales with the codes untouched, a target missing a tensor, at another width, or in another Hadamard rotation basis refused by name, and a pack whose `pcodes.bin` stages its own scales refused rather than left disagreeing with itself | 10 checks |
 | `suite:astvalid` | three-valued validity over the labelled sample, confidence accounting | 31 checks |
 | `suite:moe_loop` | the C MoE FFN against a NumPy reference of the same block: routing, top-k renormalisation, expert arithmetic, and a per-sequence halt mask ending each row at its own loop depth | 8 checks |
 | `suite:loop_halt` | halting the looped block per sequence against the batch mean: the mask's work is exactly the rows' own depths, its output is the shorter loop's, and the batch rule spends loops on rows that were done | 6 checks |
 | `suite:bitnet_gemm` | 2-bit packing, the reference GEMV, and the CPU kernels against it | 9 checks |
 | `suite:expert_merge` | permutation alignment recovers a permuted expert to float rounding, and refuses an unalignable family instead of averaging it silently | 4 cases |
 | `suite:packfetch` | the verified fetch, against a local server that misbehaves: a `Content-Range` starting at a different byte than the range asked for is refused instead of written, a body one byte shorter than its range is refused, a resume continues at the partial file's own length, a partial file longer than the target is discarded, and a wrong sha256 removes the partial file so a bad prefix cannot poison the next attempt | 8 checks |
+| `suite:mergepack` | the merged pack: average linkage under a size cap finding the co-activated pairs, every expert in exactly one group, mass-weighted fusion (one member as itself, zero weights as a plain mean, f32 output), the writable-type check that forces a matched-precision control, and a written pack read back - one expert a group, metadata patched and otherwise intact, every tensor decoding at its new shape, group 0 equal to the mean of its members, and a forward that is finite and no longer the source's | 20 checks |
 | `suite:expert_perm` | the permutation test on experts: a planted signed permutation is recovered exactly, with the planted mapping; an exact copy is `identical` rather than `permutation`; a noisy copy and unrelated experts are neither; merging a permutation is exact after alignment and merging similar experts is lossy with and without it; and the shipped merge's unsigned alignment collapses on a signed permutation while its 0.85 gate catches it | 9 checks |
 | `suite:prefetch_budget` | the paging byte/time model, and that over-fetching beats exact fetch at the proposal's own recall | table |
 | `suite:cluster_budget` | expert clustering against a log whose overlap is known: a batch of like-routed tokens touching more matrices than one of them does, the batch-1 read being the distinct matrices its slots land in (k when they are all distinct, one when they all merge), one group meaning one fetch per batch so per-token bytes fall with the batch, a read that grows with the batch never breaking even while a fixed one does at B=8, a random partition covering every expert exactly once, co-activation counting exactly the co-routed pairs, the group cap predicting B=8 for 12 groups and B=16 for 24 without a router, and merged mass counting a shared group's weight (all of it when both slots merge, none when they do not, and only the shared group's share when three slots put two together) | 18 checks |
@@ -78,6 +80,12 @@ on, rather than passing on a GPU machine and breaking for everyone else.
 * **The two GEMV kernels against each other.** `tools/bitnet_gemm/libcompare.py` runs the pair table and the LUT in one
   process, but it needs a C++ toolchain and torch, so the gate does not run it. What the gate checks is that `kcpu.c`
   still builds and that its own tiers agree with its reference - not that a second kernel agrees with it.
+* **Anything that measures a disk.** `tools/bitnet_gemm/stream_probe.py` is skipped because it writes about a gigabyte
+  per run, and `copytest.py` is not in the gate at all because it writes several: both are manual probes, and their
+  answers describe the drive in the machine they run on rather than an invariant of this tree. `copytest.py` is the one
+  to run when a read or copy rate is being quoted; what it replaced took three rounds. `prefetch_budget.py` and
+  `cluster_budget.py` are in the gate, but their default read rate is a measured constant, so `--read` is how a claim
+  about batch size gets re-priced.
 * **Windows-specific code paths** beyond what the CPU suite happens to exercise, and no check covers the Docker images.
 
 ## Adding a check

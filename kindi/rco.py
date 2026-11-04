@@ -47,7 +47,10 @@ def plan(entries, budget, formats=("ternary", "f32"), unit=1024, max_cells=40 <<
         for f in formats:
             if f not in e["err"]:
                 raise SystemExit("kindi rco: %s has no error for %s" % (e["name"], f))
-        e["_b"] = {f: int(e.get("bytes", {}).get(f) or _bytes(e["weights"], f)) for f in formats}
+        # `is not None`, not `or`: a format that costs zero bytes (a dropped tensor, an empty placeholder) is a
+        # format with a price, and reading its 0 as "no price given" made it unrepresentable
+        e["_b"] = {f: int(e["bytes"][f]) if e.get("bytes", {}).get(f) is not None else _bytes(e["weights"], f)
+                   for f in formats}
     base = "ternary" if "ternary" in formats else formats[0]     # the cheapest format every tensor can take
     base_bytes = sum(e["_b"][base] for e in entries)
     if budget < base_bytes:
@@ -207,6 +210,15 @@ def selftest():
     p2 = plan([dict(e) for e in E], budget)
     check("rco: one upgrade goes to the tensor that spends the byte best", p2["plan"]["c"] == "f32",
           str(p2["plan"]))
+
+    # a format that costs nothing must be expressible: pruning is the caller that needs it - the expert that is
+    # dropped costs 0 bytes and loses its routing mass, which is this problem with a free base format
+    pd = plan([dict(name="x", weights=1.0, err={"drop": 1.0, "keep": 0.0}, bytes={"drop": 0, "keep": 10}),
+               dict(name="y", weights=1.0, err={"drop": 2.0, "keep": 0.0}, bytes={"drop": 0, "keep": 10})],
+              10, formats=("drop", "keep"), unit=1)
+    check("rco: a zero-byte format is a format, not a missing price", pd["plan"]["y"] == "keep", str(pd["plan"]))
+    check("rco: and the free format is the base, so the budget is not charged for it", pd["bytes"] == 10,
+          str(pd["bytes"]))
 
     # the exact table and the fallback agree on a problem small enough for both, and the fallback reports its gap
     exact = plan([dict(e) for e in E], floor + (full - floor) // 2)

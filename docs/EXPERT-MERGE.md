@@ -14,7 +14,7 @@ and what the merge costs on the activations the router actually sent them.
 together are *merely similar*: in no routed pair does a hidden unit have both its gate and up row matched in the other
 expert at |cos| > 0.99, and the best relabelling — a full orthogonal map, which is more than the merge is allowed —
 still leaves 0.711 of the difference behind. The shipped merge measures the same thing from the other side: its own
-aligned cosine on those pairs is **0.098** against a gate of 0.85, and it recovers **0 of 144**. What a cluster offers
+aligned cosine on those pairs is **0.102** median, **0.105** mean, against a gate of 0.85, and it recovers **0 of 144**. What a cluster offers
 the alignment is what noise offers it: the best bijection buys 3.0% of the residual on a routed pair and 2.2% on a pair
 drawn at random.
 
@@ -25,7 +25,7 @@ readable. That last part needed checking, and the first attempt did not: the cop
 bytes where its own index declares 11,258,612,896, its first 3,504,728,316 bytes decoded and everything past that was
 uniform random. Not a truncation — 59 MB *longer* than the model — which is what a resume that writes a body at the
 wrong offset leaves behind. A forward pass over it produced thirteen layers of router logits that read exactly like a
-result, which is the failure this note's tooling now refuses: `Moepack.require_complete` stops the sweep, and`python -m tools.expert_merge.fetch --repair` keeps the readable prefix and re-fetches from the first byte that does
+result, which is the failure this note's tooling now refuses: `Moepack.require_complete` stops the sweep, and `python -m tools.expert_merge.fetch --repair` keeps the readable prefix and re-fetches from the first byte that does
 not decode, each chunk written at a `Content-Range`-validated offset. The repaired file is byte-identical to the
 damaged one up to 3,490,000,000 bytes and differs from 3,504,728,316 - the exact byte `--verify` names - so the
 measurement below is the same GGUF, not a substitute model.
@@ -110,10 +110,10 @@ The full sweep re-runs only the shipped alignment, which is the one the pipeline
 same answer to three digits, because there is no relabelling to find: an alignment is only worth what the pair it is
 fitted to allows.
 
-The pipeline's own gate sees exactly this: mean aligned cosine **0.098** median (0.041-0.169 range), and **0 of 144**
-pairs reach the 0.85 the specification requires before quantising. The gate is load-bearing — it is the only thing
-standing between the pipeline and an average of unrelated functions — and on this evidence it rejects everything the
-router calls a cluster.
+The pipeline's own gate sees exactly this on the 48-layer run — all 144 routed pairs of that sweep: aligned cosine
+**0.102** median, **0.105** mean, 0.000-0.200 across the pairs, and **0 of 144** reach the 0.85 the specification
+requires before quantising. The gate is load-bearing — it is the only thing standing between the pipeline and an
+average of unrelated functions — and on this evidence it rejects everything the router calls a cluster.
 
 ## Controls: a real permutation is found exactly
 
@@ -137,15 +137,78 @@ The premise is still plausible where the stage is aimed: two checkpoints fine-tu
 student mid-distillation, can genuinely differ by a hidden-unit relabelling. That case needs a second checkpoint and is
 not measured here. What is measured is that routing similarity, and weight similarity, are not evidence of it.
 
+## What merging them anyway costs: a pack and an NLL
+
+Everything above says the groups are not relabelled functions and that the shipped gate refuses them. That leaves the
+quantity the gate cannot answer: if a pipeline merged the groups regardless, what would it cost? A mask that mapped
+two slots onto one matrix would leave the router and the renormalisation untouched, which is not a merged pack, so
+[tools/expert_merge/mergepack.py](../tools/expert_merge/mergepack.py) writes one: every non-expert tensor copied byte
+for byte, the expert stacks replaced by one matrix a group, the router reduced to one row a group, and `expert_count`
+saying so. The result is read by the same reader and run by the same forward, so the two arms are two models.
+
+**One partition, and exactly pairs.** The grouping is average linkage on the layer-averaged co-activation matrix with
+a size cap of `ceil(experts / groups)`, so `--groups 64` on 128 experts is 64 pairs, not 64 clusters of whatever size
+k-means felt like. Over the log, 17.7% of a token's routing weight lands in a group that another of its slots also
+picked: that is the share of its expert arithmetic one averaged matrix computes instead of two.
+
+**No permutation alignment, because its gate rejects every pair.** `merge.py` implements the specification's
+permutation-then-Fisher fusion, and the sections above record what it finds on these exact pairs: aligned cosine
+**0.102** median, **0.105** mean, against a 0.85 gate, 0 of 144. Permuting members onto an anchor would align noise, so the arithmetic here is the
+plain weighted mean the specification falls back to, weighted by the routing mass each member carried. The router row
+of a group is the same weighted mean - a merged pack has one row a group, so the routing changes as well as the
+matrices, and the gate below sees both together.
+
+**Precision had to be matched, and that is why there is a control pack.** This build of `gguf` decodes K-quants but
+cannot encode them (`quants.quantize` raises `NotImplementedError` for Q2_K through Q6_K), so a merged stack cannot be
+written in the type its source used. Writing the merged experts at Q4_0 while measuring against the source's Q2_K would
+compare the merge with a *coarser* model and flatter it. Both arms are therefore written by the same code path at
+Q4_0, and `--groups 128` is the control: no merge, the same re-quantisation of the same dequantised weights.
+
+| pack | experts | type | size | NLL, 94 held-out tokens |
+|---|---:|---|---:|---:|
+| source | 128 | Q2_K / Q3_K | 11.26 GB | 4.9563 (reference, not paired) |
+| control | 128 | Q4_0 | 17.03 GB | 4.9053 |
+| merged | 64 pairs | Q4_0 | 8.87 GB | 6.2641 |
+
+| | change | 95% interval | verdict |
+|---|---:|---|---|
+| 128 experts -> 64 pairs, both at Q4_0 | **+1.3588** | +0.8984 .. +1.8029 | rejected (tolerance +0.02) |
+
+Per document the move is the same shape: 4.2356 -> 5.6721 on `docs/BENCHMARKS.md` and 5.5751 -> 6.8561 on
+`kindi/tp.py`, so this is not one pathological text. `exp(1.3588) = 3.9` - the merge makes the model's perplexity about
+four times worse while halving the expert bytes: 8.16 GB against the control's 16.32 GB, both Q4_0, the rest of the
+file copied unchanged in each (8.87 GB and 17.03 GB on disk). That half is measured against the control, the only
+like-for-like baseline there is; against the source's own 11.26 GB the merged file is 8.87 GB, **21% smaller**, and no
+merged pack at Q2_K exists to compare against because this build cannot encode that type.
+
+That is the earlier section written in nats. The pairs this averages are the ones the router groups hardest - 10.8x
+co-firing against independence, routing-profile cosine 0.78 - and replacing each with its mean still costs 1.36 nats a
+token. The 0.85 gate is not over-cautious: it is the difference between this regression and a size win, and it is the
+only thing that stood between the pipeline and it.
+
+What the number still mixes together: the group's pooled router row changes which experts are chosen, and the averaged
+matrix changes what the chosen one computes. This measurement cannot attribute the 1.36 between the two; separating
+them needs a pack whose router keeps 128 rows while its expert stacks hold 64, which this reader could map and which
+nothing here does.
+
 ## What this does not establish
 
-- **One pack, one quantisation.** All 48 layers, but on Q2_K, whose rows are ternary; a 4-bit or fp16 pack has the
-  same question but its own residual scale, and would need its own run.
+- **k is held fixed while N halves.** Both packs read `expert_used_count = 8`, so a token spends 8 of 128 experts
+  (6.2%) in the control and 8 of 64 (12.5%) in the merged pack: the merged model gets twice the relative expert
+  capacity per token. More capacity should flatter the merge, so **+1.36 nats is a lower bound** on what merging at the
+  source's own routing fraction would cost, not a ceiling on it.
+- **The two halves ran at different precisions.** The permutation test is on the Q2_K pack's own ternary rows; the NLL
+  arm re-quantises both sides to Q4_0, so it measures the merge at a finer residual than the pack it read (which is the
+  only way to keep the comparison fair here, and not the same question as a merged pack written in K-quants).
 - **One corpus, one model.** 384 tokens of this repository's own prose and code. The routed pairs are grouped by
   routing on *that* text, so a different corpus proposes different pairs — the permutation test would be re-run, not
   reused, and the answer could in principle differ per layer family.
-- **No downstream measurement.** The merged experts are compared to their parents, not evaluated as a model: nothing
-  here says what a merged pack scores on a benchmark, only that the merge does not reproduce either parent.
+- **The NLL is 94 tokens, not a benchmark.** The merged pack's +1.36 nats is teacher-forced NLL over two held-out
+  documents, and it is one partition at one group size (64 pairs) of one 384-token log. What it establishes is the cost
+  of this merge at matched precision, not what a re-trained or differently grouped merged model would score.
+- **Every non-expert tensor is copied, not checked.** The pack is built by copying attention, embeddings and norms as
+  bytes; nothing re-validates them, so the comparison is only as trustworthy as the copy path the selftest exercises
+  on a small pack.
 - **`r_orth` is one pair per layer.** A 2048x2048 SVD per pair is expensive; the 13 values are the top routed pair of
   each layer, and they are tight (0.681-1.051), but they are not independent samples of the layer.
 
@@ -179,6 +242,16 @@ python -m tools.expert_merge.real --summary merge.json
 
 # the synthetic gate: planted permutations, noisy copies, unrelated experts (~1 s)
 python -m tools.expert_merge.permtest
+
+# the merged pack and its control, at the same quantisation (~35 min each on this machine: 48 layers x 128 experts)
+# `--expert-type` writes the experts at one type for both arms; without it the merged stack is written in the source's
+# own type, which for a K-quant pack this build cannot encode
+python -m tools.expert_merge.mergepack --pack MODEL.gguf --routes routes.npz --groups 128 \
+    --expert-type Q4_0 --out CONTROL.gguf
+python -m tools.expert_merge.mergepack --pack MODEL.gguf --routes routes.npz --groups 64 \
+    --expert-type Q4_0 --out MERGED.gguf \
+    --gate --baseline CONTROL.gguf --corpus docs/BENCHMARKS.md,kindi/tp.py --docs 2 --tokens 48 \
+    --json merge64.json
 ```
 
 `python -m tools.selftest` runs both suites (`suite:expert_merge`, `suite:expert_perm`) as part of the repository gate.

@@ -5,17 +5,18 @@ ternary weight actually cost, first when the *activation* is quantised to int8 a
 second when the weight has to arrive from disk before it can be multiplied. Both were proposed to this branch as
 ready-to-use kernels; neither was usable as written, and the numbers below are what settled each one.
 
-**Two claims I made earlier in this branch are wrong, and both are flagged where they appear**: that the cache-blocked
-LUT beat the untiled kernel by "1.58x", and that 1.67 GB/s was "the device". Neither survives a second measurement. The
-corrections are collected in [Two corrections](#two-corrections) rather than folded quietly into the text.
+**Four claims I made earlier in this branch are wrong, and all are flagged where they appear**: that the cache-blocked
+LUT beat the untiled kernel by "1.58x", that 1.67 GB/s was "the device", that clustering brings the streaming
+crossover to batch 1, and that a spinning disk was reading at 3 GB/s. None of them survives a second measurement. The
+corrections are collected in [Four corrections](#four-corrections) rather than folded quietly into the text.
 
 The harness is [tools/bitnet_gemm](../tools/bitnet_gemm/README.md): `tmac.cpp` (the kernels), `tmac.py` (build,
-validation, timings), `stream_probe.py` (the disk). Nothing under `kindi/` imports it; this is a measurement tool, not a
-shipped path.
+validation, timings), `stream_probe.py` and `copytest.py` (the disk - the second exists because the first measured its
+own file mid-write). Nothing under `kindi/` imports it; this is a measurement tool, not a shipped path.
 
 Host: Intel i9-9980HK (Coffee Lake, family 6 model 158), AVX2 + FMA3 + F16C, **no AVX-512, no VNNI, no AMX**, 8 cores /
 16 threads, 64 GB RAM, Windows under Git Bash. One other caveat applies to everything in the second half: this host's
-block devices are virtualised (see [The disk claims](#the-disk-claims-are-the-least-trustworthy-numbers-here)).
+block devices are virtualised (see [The disk claims, resolved](#the-disk-claims-resolved)).
 
 ## The activation code: int8 in, int16 table out
 
@@ -141,48 +142,80 @@ differently (floats into `rows8`, `scale_a` into the LUT); the matrix is 3.93 M 
 expert, so per-call overhead is relatively larger here; and these are best-of-9 on one host. The LUT arm has no
 threaded mode, so the multi-thread comparison the engine actually runs cannot be made from this extension as it stands.
 
-## The disk: an expert read costs ~9 ms, against 1.8 ms of GEMV
+## The disk: an expert read is 3.3-4.0 ms, and the 9 ms figure was a read racing a write
 
 The third proposal streamed cold expert weights with `io_uring` + `O_DIRECT` + `mlock`, double-buffered against the
 GEMV. `io_uring` does not exist on this host, so the mechanism is not built here; what is measurable is the number it
-rests on. `stream_probe.py` reads with `FILE_FLAG_NO_BUFFERING` (the POSIX arm uses `O_DIRECT`), and the flag is
-**enforced, checked rather than assumed**: an unaligned `ReadFile` under it fails with `ERROR_INVALID_PARAMETER` (87).
+rests on. `stream_probe.py` read 14.7 MB in 9.25-9.99 ms on C:, and every downstream figure in this note - the 17%
+ceiling, the 5-6 token break-even, the 0.58 s/token floor - is that one number in arithmetic. It is wrong, and what
+showed it wrong was a second path to the same bytes: a file copy.
+
+`copytest.py` writes one file of incompressible data and measures it with the same kernel calls a read or a copy really
+uses - `ReadFile` unbuffered, `ReadFile` buffered (the path `CopyFile` takes), `CopyFileExW`, and 4 KB random as the
+control that identifies the medium rather than a cache:
 
 ```bash
-python -m tools.bitnet_gemm.stream_probe                 # C:, 1 GB file, 256 MB window, 3 passes
-python -m tools.bitnet_gemm.stream_probe --threads 4     # four reads in flight (queue depth)
-python -m tools.bitnet_gemm.stream_probe --path B:/      # control: SATA HDD
-python -m tools.bitnet_gemm.stream_probe --path E:/      # control: USB
+python -m tools.bitnet_gemm.copytest --path C:/ --size 2048 --copy 1024 --flush 2048 --rand 300
+python -m tools.bitnet_gemm.copytest --path B:/ --src B:/models/Mixtral-8x22B-v0.1.Q8_0-00001-of-00005.gguf --offset 16384 --size 2048
+python -m tools.bitnet_gemm.copytest --path E:/ --src E:/Windows.iso --size 2048
 ```
 
-| read | C: (KIOXIA NVMe) | B: (WDC 4 TB HDD) | E: (Seagate USB) |
+| arm | C: | B: | E: (USB spindle) |
 |---|---:|---:|---:|
-| 14.7 MB, one call | 9.25-9.99 ms, 1.5-1.6 GB/s | 4.3 ms, 3.6 GB/s | 175 ms, 0.09 GB/s |
-| 200 MB, one call | 3.3 GB/s | 2.5-3.0 GB/s | 32 MB/s |
-| write 2 GB | 69 MB/s | 57 MB/s | - |
-| 14.7 MB at queue depth 4 / 8 | 1.37 / 1.65 GB/s | - | - |
+| 14.7 MB unbuffered, whole file | 3.10-3.47 GB/s (3.3-4.0 ms a read) | 2.64 | 0.14 |
+| 14.7 MB unbuffered, best single | 4.61 | 4.21 | 0.14 |
+| buffered `ReadFile`, cold | 2.80-3.33 | 3.29 | 0.12 |
+| buffered `ReadFile`, warm | 3.29-3.39 | 2.95 | 3.88-4.03 |
+| `CopyFileExW`, one-way share | 1.95 (3.89 both ways) | 1.48 (2.97) | 0.11 |
+| 4 KB random | 3.9-5.7 k IOPS | **24.8 k IOPS** | 110 IOPS |
+| buffered write: into cache, then commit | 1.84, then 0.068 GB/s | - | - |
 
-**Corrected: I first reported 1.67 GB/s as "the device", and that is not what it measures.** The control row is what
-exposes it - a 4 TB spinning disk does not read at 2.5-3 GB/s. Reads of freshly written data are being answered from
-somewhere outside the guest's page cache (the 23x read/write asymmetry on both disks points the same way), so no arm of
-this probe observes the medium itself.
+**It is not the medium.** The same volume, the same 14.7 MB unbuffered reads, when nothing else is happening: 3.1-3.5
+GB/s, 3.3-4.0 ms a read. The 1.6 GB/s figure was not the drive's speed.
 
-Two artifacts of my own probe had to be fixed before it gave even these numbers, and both produced confident nonsense
-first: a file smaller than the drive's own cache reads from that cache (the *same HDD* reported 4 GB/s), and a repeated
-1 MB block compresses to nothing under NTFS compression, so the read measured the decompressor. The current probe uses
-incompressible data, a discarded first pass, steady-state passes over a 256 MB window, and reports the controls beside
-the result.
+**It is not the Windows I/O path either.** The buffered path a copy uses reaches 2.80-3.33 GB/s on C: and 3.29 on B: -
+above the claim, not below it. On the genuinely slow device the fast arm is the *warm* buffered one (3.88-4.03 against
+0.12 cold), so the path has headroom to spare; what it lacks is a device that can fill it.
 
-The number that does not depend on knowing the medium is the **expert-sized read: ~9 ms for 14.7 MB**, flat at queue
-depths 1, 4 and 8. Against 1.8 ms of GEMV, a pipeline that hides one expert read behind one expert multiply has a
-ceiling of `1.8 / (1.8 + 9) = 17%`, per expert, per layer, per token. Reading 200 MB at a time does reach 3.3 GB/s, so
-the per-call cost amortises with transfer size - the same "more work per read" conclusion from the other direction.
+**What it is: a read competing with the drive committing a write.** The `--flush` arm writes 2 GB without fsync and
+reads it back on a timer, and the shape is unmistakable:
 
-The arithmetic that decides when streaming is worth building: the kernel digests 58.7 M weights in 1.8 ms = **32.6 G
-weights/s**, while 1.6 GB/s of packed weights is 6.4 G weights/s. Compute outruns the read by ~5x at expert granularity,
-so at batch 1 the read can never be hidden. The fix is not a faster I/O path, it is **more tokens per weight read**: at
-5-6 tokens one expert's 9 ms read sits under 5-6 x 1.8 ms of compute and the pipeline is level. Streaming experts is a
-*batched* inference design; at batch 1 the expert set has to fit in RAM.
+| when | rate |
+|---|---:|
+| 0.1 s after the write | 3.80 GB/s |
+| 4-30 s after the write | **0.14 GB/s** |
+| 37 s after the write | 3.68 GB/s |
+
+A drive with a write-back cache takes writes at 1.84 GB/s and commits them at 68 MB/s, so 2 GB takes ~30 s to reach the
+medium - and for those 30 s reads of the file being committed run at 0.14 GB/s, which is 10.5 ms per 14.7 MB. That is
+the 9 ms number. `stream_probe` writes its own test file and reads it immediately, and the same code reading a file
+written hours earlier reaches 3.1-3.9 GB/s, so what it reports is a file that has just been written rather than a
+device. One honest gap: the commit reproduces the collapse on demand, but it does not account for every low reading -
+`stream_probe` reported 1.61-1.65 GB/s on a file it had fsync'd, and `copytest` reported 3.44 on a file of the same age
+and volume minutes earlier. The mechanism below is measured; that residual 2x between two probes on the same bytes is
+not, and until it is, neither probe's single number should be quoted as a device rate.
+
+**The copy does not vindicate 1.67 either, and this is what the question was for.** A copy is read *and* write on one
+medium, so its one-way share is bounded by the slower side, and on this host the slower side is the commit: measured
+copies ran 0.37-2.32 GB/s on C: and 1.48 on B:, a 6x spread in one afternoon that tracks cache and commit state rather
+than the device. A copy is therefore a floor on the device - it proves the medium sustained at least that much in both
+directions at once - and never a ceiling on reads. Quoting one as a read rate is this note's original mistake with the
+sign flipped.
+
+**And it corrects a label on the control.** The B: arm used to be described as a 4 TB spinning disk, and "a spindle
+cannot read at 2.5-3.6 GB/s" was the argument that the whole table had to be cache. Measured at 4 KB random over 33.9
+GB, B: does **24,820 IOPS** against the USB spindle's 110 - 225x - so B: is flash and its 2.6-3.3 GB/s are its own. The
+argument was sound in form and wrong in its premise. E: is the spindle, and it is the arm that does the work: 0.12-0.14
+GB/s cold, 3.88-4.03 warm, a 32x gap that shows exactly what a cache adds and why a warm number says nothing about a
+device.
+
+So the rate to build on is the device's own, and only when the drive is idle: **3.3-4.0 ms per 14.7 MB**. That moves the
+double-buffer ceiling from `1.8 / (1.8 + 9) = 17%` to `1.8 / (1.8 + 3.7) = 33%`, and the tokens needed to make one
+expert read free from 5.3 to 2.1. It does **not** move the batch-8 result below, because that result never used this
+rate: `batch_stream.py` times the read *while* sixteen threads of GEMV are running, and gets 19-25 ms - 5x the idle
+device cost - because the reader and the kernel share memory bandwidth. Those are two different costs, and the pipeline
+is the one that decides the design. The arithmetic above is unchanged in form: compute is 32.6 G weights/s and 3.7 ms of
+read is 15.9 G weights/s, so compute still outruns the read, by 2x instead of 5x, and batch 1 still cannot hide it.
 
 ### Prefetch depth cannot fix this, and the numbers say why
 
@@ -191,8 +224,9 @@ hidden state, predict the next token from an n-gram table, and submit `io_uring`
 compute. Its latency budget assumes a cold expert read is **15-35 us**.
 
 That unit is off by three orders of magnitude, and the arithmetic is not close. 14.7 MB in 18-25 us is **590-820 GB/s**,
-which is 100x a PCIe Gen4 x4 link (~8 GB/s) and 500x what this host measures. At line rate 14.7 MB cannot arrive in
-less than 1.8 ms; measured, it is 9.5 ms. To have a 35 us transfer at 1.63 GB/s the expert would have to be **57 KB** -
+which is 100x a PCIe Gen4 x4 link (~8 GB/s) and 150-200x what this host measures. At line rate 14.7 MB cannot arrive in
+less than 1.8 ms; measured, it is 3.3-4.0 ms with the drive idle (9.5 ms while it is committing a write, which is the
+figure this section was written against). To have a 35 us transfer at 4 GB/s the expert would have to be **140 KB** -
 at which size the design is correct, and which is a different model from this one.
 
 The deeper problem is that prefetching hides *latency*, and there is no latency left to hide once the link is
@@ -207,8 +241,15 @@ token's FFN expert stream (32 layers x 14.7 MB, 470 MB), at the two depths the p
 Deeper pipelining is **slightly worse**, and both are far above the 115 ms of GEMV compute they would feed. At top-2 the
 stream is ~940 MB per token, so the floor is **0.58 s/token** however the reads are scheduled, predicted or reordered.
 
+Both rows of that table are low for the same reason the 9.5 ms was: `stream_probe` reads a file it has just written, so
+its numbers are commit-bound. At the idle device rate the same 470 MB takes 0.12 s instead of 0.28 s, and the depth
+comparison does not survive either - deeper pipelining on an idle drive is what fills a link that has spare capacity.
+What the table does still show is that scheduling cannot change the floor once the link is saturated, and the pipeline
+in the B=8 section shows the link *is* saturated in practice: 19-25 ms per expert read under a running batch.
+
 That also disposes of "mispredictions cost minimal CPU overhead beyond PCIe bus occupancy": on a bandwidth-bound stream
-a wasted read costs 9.5 ms of *link time* and directly displaces a useful one. And a prediction path that maps a
+a wasted read costs 3.3-4.0 ms of *link time* on an idle drive and 19-25 ms under a running batch, and either way it
+directly displaces a useful one. And a prediction path that maps a
 speculated token to an expert as `token_id % num_experts` is not a prediction - it is a hash, with an expected hit rate
 of 1/num_experts.
 
@@ -237,6 +278,13 @@ fetching more is counterproductive on a bandwidth-bound stream; raising it *at t
 direction, and that is what a better head does. Over-fetch only overtakes the 82% exact arm at **B = 8**, and never
 overtakes exact fetch with perfect recall at any batch in the table.
 
+Every millisecond above is 9.5 ms of read, which is the commit-bound figure. Re-run at the device's own 3.7 ms
+(`prefetch_budget.py --read 3.7`) the table halves and the crossover moves left rather than disappearing: at B=1
+over-fetch still loses (365 against 279 ms, 31% worse, because it fetches 1.38 GB against 0.92), it starts winning at
+**B = 4** instead of B = 8, and the best batch for exact prefetch is **B = 2** (49% saved) instead of B = 4-6. The
+qualitative answer - over-fetching cannot buy recall on a saturated link, only a better head at the same fetch count
+can - is unchanged, because it rests on the bytes, not on the rate.
+
 Note also what the columns say about the whole idea: prefetching is worth most at **B = 4-6** (43-47%), precisely where
 compute rises to meet the link - the same batching conclusion as above, reached from the scheduling side.
 
@@ -244,16 +292,22 @@ compute rises to meet the link - the same batching conclusion as above, reached 
 
 The runtime integration submits L+1's speculative reads from L's pre-attention normalisation. That is the correct
 place for the *signal* - a head consumes a hidden state of its own layer - and it is also the ceiling: at batch 1 a
-layer's compute is top-2 GEMV = **2 x 1.8 = 3.6 ms**, while an expert read is **9.5 ms**. One layer of lookahead can
-therefore hide at most **38%** of the read, and the remaining 5.9 ms is exposed no matter how good the head is.
+layer's compute is top-2 GEMV = **2 x 1.8 = 3.6 ms**, while an expert read is **3.3-4.0 ms** on an idle drive. One
+layer of lookahead therefore covers **most of it** - 97% at 3.7 ms - which is the opposite of what this section said
+when the read was the commit-bound 9.5 ms and one layer could hide only 38%. Both figures are right about different
+states of the drive, and neither describes the case the design actually runs in: `batch_stream.py` measures a read at
+**19-25 ms** while the batch's GEMV is running, and at that cost one layer of lookahead hides 15-19% again. The
+two-rate answer is the one to carry: the read is cheap when nothing else is happening and expensive when the thing it
+is meant to hide behind is happening, which is why the pipeline and not the isolated rate settles this.
 
 Going deeper is not a training problem. A head maps layer L's state to layer L+1's router, so predicting L+2 would need
 L+1's hidden state, which does not exist until L+1's attention has run. Chaining predictions through a *fabricated*
 state is a different model, and its recall would compound (0.82^k for k layers). The integer router itself costs
-~4-5 us per layer at 64 experts x 4096, i.e. ~160 us per token - 0.02% of a 723 ms token, so the head is not the
-constraint and neither is its cost: the constraint is that 3.6 ms of compute cannot cover 9.5 ms of read. At batch 6
-the same layer has 21.6 ms of compute for 9.5 ms of read, one layer of lookahead is comfortably enough, and the policy
-becomes worth building.
+~4-5 us per layer at 64 experts x 4096, i.e. ~160 us per token - 0.05% of a 352 ms token - so the head is not the
+constraint and neither is its cost. What the head cannot do is make the read cheaper: at batch 1 it can only overlap
+one layer's 3.6 ms against it, and in a running pipeline the read is 19-25 ms rather than 3.7. At batch 4-6 the same
+layer has 14-22 ms of compute, which covers the idle read outright and a good part of the contended one; that is the
+regime where the policy becomes worth building.
 
 Three defects in the training harness as written, beyond the model: the recall it prints is computed on the **training
 batches it is fitting**, with no held-out split, so 82% and 96% are upper bounds; the recall metric counts hits against a
@@ -263,7 +317,8 @@ pre-attention normalisation - so whichever is trained, the other integration is 
 the better predictor (less drift to bridge) and should be the one written down.
 
 What does move the floor is changing the bytes or the work per byte, which is what the earlier sections already found:
-a **batch of 5-6 tokens** puts one expert's 9.5 ms under its own compute, and a **rank cut** divides the read itself.
+a **batch of 2 tokens** puts one expert's 3.7 ms read under its own compute (5-6 is what the commit-bound 9.5 ms
+needed, and it is the number this section was written with), and a **rank cut** divides the read itself.
 Clustering 64 experts into 12 is the case that does not work that way - it divides the *table*, not the read a token
 issues - and it is measured in the next section.
 
@@ -293,13 +348,20 @@ python -m tools.bitnet_gemm.cluster_budget --selftest
 resident arm for comparison: 14 ms/token at every batch (8 slots x 1.8 ms, no read at all). Table size at 32 layers:
 58.8 GB as shipped, **5.5 GB at 12 clusters**.
 
+These columns use the commit-bound 9.5 ms read. At the device's own 3.7 ms (`cluster_budget.py --read 3.7`) every
+crossover moves left and the ordering is preserved: as routed **B=16**, 12 clusters by co-activation **B=2**, the same
+12 at random **B=4**. That is a *better* outcome for clustering quality than the table below says - chosen groups are
+worth two steps of the batch grid rather than zero - and it does not change the conclusion, because the batch-1 arm is
+still over either way and the residency route is the one that reaches batch 1 outright.
+
 What the columns say:
 
 - **Batch 1 improves, and not for the reason given.** 5.24 distinct matrices instead of 8 is a 35% cut in the read, and
   it is real - but it is exactly the tokens whose k experts were merged into one matrix, i.e. the tokens that now compute
   fewer expert functions. It is the quality cost of the merge showing up as a bandwidth saving, not a free lunch.
-- **Batch 1 still does not break even.** One token's compute is 8 x 1.8 = 14.4 ms and a read is 9.5 ms, so break-even
-  at B=1 needs the slots in **1.52 distinct matrices or fewer**. At 12 clusters a token touches 5.24 - still 3.5x over.
+- **Batch 1 still does not break even.** One token's compute is 8 x 1.8 = 14.4 ms and a read is 9.5 ms commit-bound
+  (3.7 ms idle), so break-even at B=1 needs the slots in **1.52 distinct matrices or fewer** (3.89 at the idle rate). At
+  12 clusters a token touches 5.24 - 3.5x over on the first reading, 1.35x on the second, and over on both.
 - **The crossover moves from B=64 to B=8, and the number of groups is what moves it.** A batch's union cannot exceed the
   cluster count, so with 12 clusters the read per token falls as 12/B; it drops under the k/5.28 compute ratio at B=8.
   That is arithmetic on the group count: `cap_break_even(12, 8) = 8`, and `cap_break_even(24, 8) = 16`, which is what
@@ -352,10 +414,11 @@ python -m tools.bitnet_gemm.batch_stream          # --batches B:fetched, --pool,
 **Streaming does not beat residency at B=8 in any arm, and the best B=8 arm is still 2.3x behind.** Two inputs to the
 prediction do not survive the pipeline:
 
-- **A read costs ~20 ms while the batch is computing, not 9.5 ms.** Measured alone, 14.7 MB came back in 9.25-9.99 ms.
-  Here the reader shares memory bandwidth with 16 threads of GEMV and the same 15.8 MB takes 19-25 ms. Nothing about
-  the medium changed; the compute is what happened to it. A pipeline budget that adds a rate measured in isolation to
-  work measured in isolation will be optimistic by exactly this factor.
+- **A read costs ~20 ms while the batch is computing, not the 3.3-4.0 ms it costs on an idle drive.** Read alone, the
+  same 14.7 MB comes back in 3.3-4.0 ms (above), and the 9.5 ms the budget was written against is what it costs while
+  the drive is committing a write. Here the reader shares memory bandwidth with 16 threads of GEMV and the same 15.8 MB
+  takes 19-25 ms. Nothing about the medium changed; the compute is what happened to it. A pipeline budget that adds a
+  rate measured in isolation to work measured in isolation will be optimistic by exactly this factor.
 - **A batch of 8 does not route to one expert's worth of weights.** The captured router fetches **35 experts for 8
 tokens** - 4.4 per token, not 1 - so the sharing the prediction leans on is not there at this batch size. Only a
   12-cluster table, whose union is capped by construction, gets near it (10 experts for 8 tokens).
@@ -371,28 +434,39 @@ the two model-side changes: a table small enough to be resident (12 clusters, 5.
 k of them cost what k multiplies cost.
 
 Caveats: the expert pool is 32 matrices, so a batch fetching more than 32 re-reads experts that are already in the page
-cache; the GEMVs run at the machine's 16 threads, and the streamed arm's timing therefore includes the reader's
-contention, which is the point of the measurement rather than an artifact of it; and this host's reads come from behind
-a cache the note's own probe could not bypass.
+cache; and the GEMVs run at the machine's 16 threads, so the streamed arm's timing includes the reader's contention,
+which is the point of the measurement rather than an artifact of it. The third caveat this gained last time - that the
+host's reads come from behind a cache nothing could bypass - is withdrawn: the drive reads at 3.1-3.5 GB/s on its own,
+and the 0.14 GB/s and 9 ms figures were reads racing a write commit (`copytest.py`, above).
 
-### The disk claims are the least trustworthy numbers here
+### The disk claims, resolved
 
-Every figure in that section is what a process sees when it asks for these bytes, not a device characteristic. The HDD
-control proves an intermediate cache exists that `FILE_FLAG_NO_BUFFERING` does not bypass, and I cannot reach it from
-inside the guest to characterise it. Anyone re-running this on bare metal should expect the NVMe row to move.
+These were the least trustworthy numbers in the note, and the two rounds of measurement above are what settled them. A
+warm cache and a running write commit both depress the read rate, and the second one is what the original 1.6 GB/s and
+9.5 ms were: a probe reading the file it had just written. With the drive idle, the medium does 3.1-3.5 GB/s and an
+expert read is 3.3-4.0 ms; the USB spindle in the control does 0.12-0.14 GB/s cold against 3.9-4.0 warm, which is the
+same effect at 32x and on a device whose cold rate is unambiguous.
 
-## Three corrections
+## Four corrections
 
 1. **"Cache blocking wins 1.58x."** Withdrawn: one sample against one sample, on a baseline that moves ±45% run to run.
    Re-measured with matched sampling, the wide shape is indistinguishable from the untiled kernel and the narrow shape
    loses 25-42%. The K tile alone is still worth ~10% at wide N; the N tile is a parallelism knob.
-2. **"1.67 GB/s is the device."** Withdrawn: it is the throughput of 14.7 MB unbuffered reads on this host, behind a
-   cache the flag does not bypass. The 4 TB HDD reporting 3 GB/s is the proof. What survives is the expert-sized read
-   cost, and the ceiling derived from it (17% at batch 1, level at 5-6 tokens).
+2. **"1.67 GB/s is the device."** Withdrawn, and now placed rather than merely doubted: it is what a read costs while
+   the drive is committing its own fresh write. Measured directly, reads of a 2 GB file run at 0.14 GB/s for the 30 s
+   its commit takes, then return to 3.68 GB/s; with the drive idle the same 14.7 MB reads run at 3.1-3.5 GB/s. The
+   expert read is therefore **3.3-4.0 ms**, not 9.5, and the ceiling derived from it is 33% at batch 1 and level at 2
+   tokens rather than 17% and 5-6 - except in a running pipeline, where 19-25 ms per read is measured and the batched
+   conclusion stands on that instead.
 3. **"Clustering 64 experts into 12 divides the read by five and drops the break-even batch to about one."** Half wrong.
    It divides the table by five, to 5.5 GB, which is a residency win and does reach batch 1 that way. The read is
-   divided by 1.5 at best (8 -> 5.24 distinct matrices at batch 1), and the streaming crossover lands at B=8, not B=1 -
-   and a random partition of the same size lands there too.
+   divided by 1.5 at best (8 -> 5.24 distinct matrices at batch 1), and the streaming crossover lands at B=8 (B=2 at
+   the idle read rate), not B=1 - and a random partition of the same size lands close behind (B=4).
+4. **"A 4 TB spinning disk cannot read at 2.5-3 GB/s, so this table is not a device measurement."** The argument is
+   sound and its premise was wrong: B: is flash. It does **24,820 random 4 KB IOPS** over 33.9 GB against the USB
+   spindle's 110, so its 2.6-3.3 GB/s are its own, and the control that proves a cache exists is E: (0.12-0.14 GB/s
+   cold, 3.9-4.0 warm) rather than B:. The conclusion that the old numbers were not device numbers survives, for a
+   different reason: they were reads racing a write commit.
 
 None of these change the operating recommendation, which is the useful part: **do not port either kernel.** Parity is
 real - the LUT agrees with the pair table to float rounding on the same matrix in one process - but the repack is not
@@ -404,9 +478,12 @@ machine's threads. Paging is a batched design and this engine decodes at batch 1
 - **The comparison against the pair table now happens in one process** (`tools/bitnet_gemm/libcompare.py`, above): both
   kernels on one matrix agree to 1.9e-07, and the LUT is 1.8x faster single-threaded. What is still missing is the LUT
   at 8-16 threads, which its extension does not offer - until that exists, the threaded comparison stays one-armed.
-- **The device needs a bare-metal run.** The same probe on a machine without a virtual block layer would say whether
-  1.6 GB/s at 14.7 MB and 3.3 GB/s at 200 MB is the KIOXIA or the host.
+- **The device has been measured, and the answer was not "bare metal".** `copytest.py` (above) separates the three
+  things the old probe conflated - medium, path, cache state - and the depressed rate turned out to be a read racing
+  the drive's commit of a write, reproducible on demand (3.80 -> 0.14 -> 3.68 GB/s). What a bare-metal run would add
+  now is only the write-commit rate on a drive without a large volatile cache; the read side no longer needs it.
 - **The batched-regime prediction has been run and it did not hold** (`tools/bitnet_gemm/batch_stream.py`, above):
   at B=8 streaming is 2.3-7x worse than residency, because a read costs ~20 ms under a computing batch and the router
-  fetches 4.4 experts per token at that size. What remains open is the same pipeline on a host whose isolated read
-  really is 9.5 ms without contention.
+  fetches 4.4 experts per token at that size. What remains open is a pipeline whose reader does not contend with the
+  compute it feeds - a separate I/O engine, or a drive whose uncontended read stays near its 3.7 ms while 16 threads
+  of GEMV run. Neither exists here, so the design question stays open rather than answered in streaming's favour.

@@ -17,6 +17,12 @@ Two effects make a naive version of this measure the wrong thing, and both were 
   file and a discarded first pass.
 * **A repeated block compresses to nothing** under NTFS compression, which measures the decompressor. The file is
   filled with fresh random data per megabyte.
+* **A read of the file you just wrote measures the commit.** This probe writes its test file and reads it
+  immediately. A write-back cache takes the write at ~1.8 GB/s and commits at ~68 MB/s, so a 2 GB file is still being
+  written for ~30 s and reads of it run at 0.14 GB/s until that ends (`copytest.py --flush` measures the curve). The
+  numbers here came out low even after an `os.fsync`, and the same code on a file written hours earlier reaches
+  3.1-3.9 GB/s - so read a settled file, or use `copytest.py --src`, before quoting a rate. That is where 1.67 GB/s and
+  the "~9 ms expert read" came from.
 
 `--path` is a control, not a feature: a probe that cannot separate an NVMe from a USB disk is measuring nothing.
 The file is written under the target directory and removed.

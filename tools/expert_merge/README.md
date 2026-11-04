@@ -14,6 +14,9 @@ python -m tools.expert_merge.fetch --verify MODEL.gguf                    # is t
 python -m tools.expert_merge.routes --pack MODEL.gguf --out routes.npz    # a real router log
 python -m tools.expert_merge.real --routes routes.npz --out merge.json --jobs 6   # test the pairs it groups
 python -m tools.expert_merge.real --summary merge.json                    # the numbers, read back
+python -m tools.expert_merge.prune --routes routes.npz --keep 96          # which experts to drop, per layer
+python -m tools.expert_merge.prune --routes routes.npz --pack MODEL.gguf --frac 0.75 --gate --corpus A,B
+python -m tools.expert_merge.prune --selftest                             # the solve, the mask and the verdict
 ```
 
 `merge`, `permtest` and `fetch` are all in `python -m tools.selftest`, so none of them needs a pack or a GPU.
@@ -41,22 +44,88 @@ A chunk is written only after its 206 reply names the byte range that was asked 
 after its length, its sha256 and its GGUF payload all check out. Six connections are worth about three of one, which
 for an 11 GB pack is the difference between twenty minutes and two hours.
 
+## Merging the groups into a pack
+
+`mergepack` is the downstream half of the permutation test: it writes a real GGUF in which each co-activated group is
+one expert. Non-expert tensors are copied byte for byte, the three expert stacks become one mass-weighted mean a group,
+the router becomes one pooled row a group, and `expert_count` is patched to match - so the result is a pack the same
+reader and the same forward can run, and the before/after comparison is two models rather than two settings.
+
+```
+python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --groups 64 --out MERGED.gguf
+python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --groups 128 --expert-type Q4_0 \
+    --out CONTROL.gguf                                    # the unmerged control, same path, same quantisation
+python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --groups 64 --expert-type Q4_0 \
+    --out MERGED.gguf --gate --baseline CONTROL.gguf --corpus A,B --docs 2 --tokens 48
+python -m tools.expert_merge.mergepack --selftest         # grouping, fusion, and a written pack read back
+```
+
+Run end to end on the 48-layer pack: 128 experts, top-8, `routes.npz` from 384 tokens of this repository. `--groups
+64` on 128 experts with a size cap of `ceil(128/64)` is exactly 64 pairs, and over the log 17.7% of a token's routing
+weight lands in a group another of its slots also picked - the share of its expert arithmetic one averaged matrix does
+instead of two. There is no permutation alignment in this path: `merge.py`'s own gate rejects every routed pair (median
+aligned cosine 0.102, mean 0.105, against 0.85), so the fusion is the specification's uncertainty-weighted mean,
+applied to the router rows too.
+
+Because this build of `gguf` decodes K-quants but cannot encode them, both arms are written at the same type through
+the same code path, and the unmerged control is the only fair comparison:
+
+| pack | experts | type | size | NLL, 94 held-out tokens |
+|---|---:|---|---:|---:|
+| source | 128 | Q2_K / Q3_K | 11.26 GB | 4.9563 (reference) |
+| control | 128 | Q4_0 | 17.03 GB | 4.9053 |
+| merged | 64 pairs | Q4_0 | 8.87 GB | 6.2641 |
+
+**+1.3588 nats/token** against the control (95% interval +0.8984..+1.8029), i.e. perplexity about 3.9x worse at half
+the expert bytes *of that control* (8.16 GB against 16.32 GB; against the source's own 11.26 GB the merged file is
+8.87 GB, 21% smaller, and the source is Q2_K, so only the control is like-for-like); both documents move the same way
+(+1.44 and +1.28). The router grouping is real - the same pairs co-fire 10.8x more often than independence (median
+10.75, mean 12.75 over the 144 pairs) - and averaging them is still ruinous, which is what
+[docs/EXPERT-MERGE.md](../../docs/EXPERT-MERGE.md) measures from the weight side: a co-activated pair is not a
+relabelled function, so there is nothing for a merge to preserve. The 0.85 gate is load-bearing, not conservative.
+
+## Pruning: which experts a layer can keep
+
+`prune` is the other half of `cluster_budget.py`: that one asks whether a paging schedule can afford the experts a
+layer routes to, this one asks which experts a layer can simply not have. The value of an expert is its **routing
+mass** from the log - the sum of the renormalised top-k weight it was applied with - and the budget is exact and per
+layer, because layer L's experts are its own tensors. The choice is solved by `kindi.rco.plan`, the same knapsack the
+converter uses for `--budget`, with two formats a expert: `drop` at 0 bytes and its mass as the error, `keep` at its
+bytes and no error.
+
+On the 48-layer Qwen3-Coder-30B-A3B pack (1,708,032 bytes an expert, 208.5 MB a layer):
+
+| keep, of 128 a layer | expert weights | of 9.77 GB | routing mass given up |
+|---:|---:|---:|---:|
+| 112 | 8.11 GB | 82.9% | 0.1% |
+| 96 | 7.31 GB | 74.8% | 0.6% |
+| 80 | 6.11 GB | 62.5% | 2.1% |
+| 64 | 4.89 GB | 50.0% | 5.6% |
+
+`--frac F` prices each expert from the pack instead of counting it, and agrees with `--keep` where they coincide
+(0.75 x 218,628,096 bytes is exactly 96 experts). The plan is applied as a mask on the router, so the two arms of an
+NLL gate can share one loaded pack. On 94 held-out tokens (two documents the log never saw) NLL went 4.9563 ->
+4.9391 at 96 experts and -> 4.8850 at 64, with intervals -0.0625..+0.0469 and -0.2194..+0.0595: no measurable cost,
+and no evidence of a gain either. [docs/EXPERT-PRUNE.md](../../docs/EXPERT-PRUNE.md) has the gate's numbers and what
+they do not establish.
+
 ## What the real pack says
 
-Qwen3-Coder-30B-A3B-Instruct Q2_K, layers 0-12, 384 tokens of this repository's text, top-8 of 128 experts:
+Qwen3-Coder-30B-A3B-Instruct Q2_K, layers 0-12, 384 tokens of this repository's text, top-8 of 128 experts; the rows
+below are medians over that run's pairs:
 
 | | routed pairs (39) | random pairs (39) |
 |---|---:|---:|
 | routing-profile cosine | 0.757 | 0.000 |
 | best-bijection residual, against identity | 1.368 vs 1.408 | 1.374 vs 1.404 |
 | verdict | 39 merely-similar | 39 merely-similar |
-| the shipped merge's aligned cosine (gate 0.85) | **0.081**, 0 of 39 pass | 0.074 |
+| the shipped merge's aligned cosine (gate 0.85) | **0.086**, 0 of 39 pass | 0.081 |
 | merged output off the anchor | 0.928 | 0.944 |
 
-The router groups its pairs hard — they co-fire 12.5x more often than independence — and the pairs are still not
-relabellings: no hidden unit has both its gate and up row matched above |cos| 0.99, and a full orthogonal relabelling
-leaves 0.716 of the difference. The merge's own gate rejects every one of them, which is the only reason the stage is
-safe.
+The router groups its pairs hard — they co-fire 13.9x more often than independence (median 13.87, mean 16.44 over
+these 39 pairs) — and the pairs are still not relabellings: no hidden unit has both its gate and up row matched above
+|cos| 0.99, and a full orthogonal relabelling leaves 0.716 of the difference. The merge's own gate rejects every one of
+them, which is the only reason the stage is safe.
 
 ## What the synthetic suite asserts
 
