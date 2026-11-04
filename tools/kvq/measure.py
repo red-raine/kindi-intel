@@ -13,12 +13,18 @@ The keys are held at q8_0 (`KINDI_CPU_KVQ_K=2`) in every row so the only thing c
 question asked. Divergence is measured against the fp16 cache on the same weights: KL(P_fp16 || P_quant) in nats, and how
 often the greedy token agrees.
 
-The model is the synthetic fixture (`kindi.synthpack`), because there is no Prism pack on this host. Its weights are
-random, so the numbers say how much this codec costs the *arithmetic*, not what it costs a trained 2B. That limit is
-stated here rather than hidden: a trained model's V vectors are the ones the note's harness measured on 372 real cache
-vectors, and the same code would need a pack to repeat that.
+Without an argument the model is the synthetic fixture (`kindi.synthpack`), whose weights are random: those numbers say
+how much a codec costs the *arithmetic*, not what it costs a trained 2B, and the end-to-end ordering flips between two
+fixture sizes. `--pack DIR` runs the same table on a converted pack and is the measurement that decides anything - on
+`prism-ml/Ternary-Bonsai-2-2B` it puts the per-32-block scale at 0.15993 nats against 0.19804 for one scale a head,
+closer in all three windows:
+
+    python -m tools.kvq.measure --pack ~/.kindi/packs/bonsai-2b
+
+`tools.kvq.capture` scores the codecs on the V vectors a pack actually writes, which is the same question one level
+down and needs no per-format run at all.
 """
-import ctypes
+import json
 import os
 import sys
 import tempfile
@@ -114,14 +120,54 @@ def check(name, ok, detail=""):
     return ok
 
 
+DEFAULT_TEXT = (
+    "The cache holds one key and one value for every position the model has read. When a layer writes a value it "
+    "knows nothing about the ones before it: the projection is a matrix product over the residual stream, so the "
+    "range within a single head is whatever that token happened to produce. Some positions are dominated by one "
+    "outlier coordinate; others are quiet all the way across. A format that spends one scale on the whole head has "
+    "to cover the loudest coordinate it will ever see, and every quiet value in that head rounds against a grid "
+    "sized for something it is not. A format that spends a scale on each thirty-two values tracks the range where "
+    "it actually lives, at the price of two more bytes for every block it writes. Whether that is a good trade is "
+    "not a question about codecs in the abstract. It is a question about how much the range moves within a head in "
+    "a trained model, which is why the answer needs vectors from one rather than from a fixture with random weights."
+)
+
+
+def tokenise(pack, text, n):
+    """the first `n` tokens of `text` in the pack's own tokeniser (shared with tools.kvq.capture)"""
+    from kindi.tokenizer import Tok
+    if not os.path.isfile(os.path.join(pack, "vocab.json")):
+        raise SystemExit("tools.kvq: %s is not a pack - it has no vocab.json\n"
+                         "  `kindi convert MODEL.gguf --out %s` writes one, and `kindi info --pack %s` shows what is there."
+                         % (pack, pack, pack))
+    vocab = json.load(open(os.path.join(pack, "vocab.json")))
+    merges = os.path.join(pack, "merges.txt")
+    if not os.path.isfile(merges):
+        raise SystemExit("tools.kvq: %s has no merges.txt, so its text cannot be tokenised here" % pack)
+    return Tok(vocab, merges).encode(text)[:int(n)]
+
+
+_ENGINES = {}
+
+
 def _engine(pack, kvq_v, ctx=96):
-    """one engine with the V side forced to `kvq_v`, over a pack that was already built"""
+    """one engine with the V side forced to `kvq_v`, over a pack that was already built
+
+    Cached per (pack, ctx, format): the format decides which buffers the host allocates at construction, so it cannot be
+    re-armed on a live engine, but a 2B pack costs tens of seconds to build and a sweep asks for each format once.
+    """
+    key = (os.path.abspath(pack), int(ctx), int(kvq_v))
+    e = _ENGINES.get(key)
+    if e is not None:
+        e.reset()
+        return e
     os.environ["KINDI_CPU_KVQ_K"] = "2"
     os.environ["KINDI_CPU_KVQ_V"] = str(kvq_v)
     from kindi.cpu import Engine
     e = Engine(pack, ctx=ctx, log=lambda *a: None)
     if e.kvq_v != kvq_v:
         raise SystemExit("the engine refused V format %d (got %d)" % (kvq_v, e.kvq_v))
+    _ENGINES[key] = e
     return e
 
 
@@ -201,7 +247,43 @@ def selftest():
     return 0 if len(PASS) == 5 else 1
 
 
-def report():
+def real(pack, ntokens=40, windows=3):
+    """the end-to-end table on a converted pack: the formats against fp16 on real text, several windows so one passage
+    cannot decide it. This is the run the whole question was waiting for - see CPU-PERF-2026.md."""
+    ids_all = tokenise(pack, DEFAULT_TEXT, ntokens * windows)
+    hd = int(getattr(_engine(pack, 0, ctx=ntokens + 8), "dims", {}).get("head_dim", 64))
+    print("pack %s, head_dim %d, K = q8_0, V varies; mean over %d windows of %d tokens\n"
+          % (pack, hd, windows, ntokens))
+    got = {m: [] for m in sorted(FORMATS)}
+    for w in range(windows):
+        ids = ids_all[w * ntokens:(w + 1) * ntokens]
+        if len(ids) < 8:
+            break
+        base = logits_trace(pack, ids, 0, ctx=ntokens + 8)
+        for m in sorted(FORMATS):
+            got[m].append(0.0 if m == 0 else
+                          compare(base, logits_trace(pack, ids, m, ctx=ntokens + 8))[0])
+        print("  window %d of %d done (formats 0-%d)" % (w + 1, windows, max(FORMATS)), flush=True)
+    print("  %-34s %7s %10s %10s" % ("V format", "bits", "KL mean", "KL max"))
+    for m in sorted(FORMATS):
+        k = got[m]
+        if not k:
+            continue
+        print("  %-34s %7.2f %10.5f %10.5f"
+              % (FORMATS[m], 16.0 if m == 0 else bits_per_value(m, hd), float(np.mean(k)), float(np.max(k))))
+    k4, k6 = got.get(4, []), got.get(6, [])
+    if k4 and k6:
+        print("\nmode 4 against mode 6 over the same %d windows: %.5f against %.5f nats -> %s"
+              % (len(k4), float(np.mean(k4)), float(np.mean(k6)),
+                 "32-block closer" if np.mean(k6) < np.mean(k4) else "head scale closer"))
+        print("per window: " + ", ".join("%.5f/%.5f" % (a, b) for a, b in zip(k4, k6)))
+    return got
+
+
+def report(pack=None, ntokens=40):
+    if pack:
+        real(pack, ntokens=ntokens)
+        return 0
     from kindi import synthpack
     tmp = tempfile.mkdtemp(prefix="kvq-")
     pack, _t, _f = synthpack.build(tmp, log=lambda *a: None, width=256, ffn=512, layers=6)
@@ -236,14 +318,19 @@ def report():
         h, b = float(np.mean([k[0] for k in kls])), float(np.mean([k[1] for k in kls]))
         print("  %-20s scale/head KL %.5f, scale/32 KL %.5f -> %s"
               % (label, h, b, "32-block closer" if b < h else "head scale closer"))
-    print("\nThat is the honest state of the end-to-end question: on random weights the sign flips with the fixture, so it")
-    print("cannot be settled without a trained pack, where the V vectors have the structure the note's harness measured.")
+    print("\nOn random weights the sign flips with the fixture, so this fixture cannot settle anything: the answer needs a")
+    print("trained pack, where `--pack` has it. On Ternary-Bonsai-2-2B the same three-window run gives 0.19804 nats at one")
+    print("scale a head against 0.15993 at one a 32-block, the block scale closer in every window.")
     return 0
 
 
 def main(argv):
     if "--selftest" in argv:
         return selftest()
+    if "--pack" in argv:
+        argv = list(argv)
+        return report(pack=argv[argv.index("--pack") + 1],
+                      ntokens=int(argv[argv.index("--tokens") + 1]) if "--tokens" in argv else 40)
     return report()
 
 

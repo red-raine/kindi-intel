@@ -1307,8 +1307,63 @@ static void q8_unpack(const int8_t* p, const uint16_t* sc, float* out, int n){
   }
 }
 
+/* --------------------------------------------------------------------------------- V capture
+   Diagnostic, off unless KINDI_CPU_VCAP names a file: every V vector as the cache is about to quantise it - the fp32
+   `m->vv` of each (layer, position, head), before any codec touches it. This is the input the K/V-cache question is
+   asked about, and it is the one thing a synthetic pack cannot supply: `kindi.synthpack`'s weights are random, so a
+   codec measured on it is measured on the wrong distribution.
+
+   The value does not depend on KINDI_CPU_KVQ, so one capture serves every format: the same file is the input to `q2`
+   against `q2b`, to q8_0, and to anything added later. Records are self-describing (layer, position, head) because the
+   writes happen inside a parallel loop and their order is the scheduler's, not the model's. Writing is one `critical`
+   around an HD-float record per (position, head) per attention layer, so the hook costs one branch anywhere but there
+   and nothing at all when the variable is unset. KINDI_CPU_VCAP_MAX bounds the record count (default 65536, ~134 MB of
+   fp32 at head_dim 512; the reader takes a prefix without complaint). */
+#define VCAP_MAGIC 0x4B564331          /* "KVC1" */
+typedef struct { int32_t magic, nl, natt, nhkv, hd; } VcapHead;     /* natt: the attention layers, for a reader's check */
+static FILE* g_vcap_f = NULL;
+static long long g_vcap_n = 0, g_vcap_max = 0;
+
+/* Arm a capture explicitly. The environment variable below is the shell's convenience, but it is not enough on the
+   MSVC build: that DLL links the CRT statically (/MT), so its getenv reads a private copy of the environment taken at
+   load time, and a host that sets os.environ *after* loading the library - which is what a test does - changes nothing
+   it can see. An explicit entry point is the same code on every build and does not depend on load order. */
+KCAPI int kc_vcap_begin(Model* m, const char* path, long long limit){
+  if(g_vcap_f || !path || !path[0]) return -1;
+  g_vcap_f = fopen(path, "wb");
+  if(!g_vcap_f) return -2;
+  g_vcap_n = 0;
+  g_vcap_max = limit > 0 ? limit : 65536;
+  int natt = 0;
+  for(int il = 0; il < m->NL; ++il) natt += m->L[il].is_attn ? 1 : 0;
+  const VcapHead h = {VCAP_MAGIC, m->NL, natt, m->NHKV, m->HD};
+  if(fwrite(&h, sizeof h, 1, g_vcap_f) != 1){ fclose(g_vcap_f); g_vcap_f = NULL; return -3; }
+  return 0;
+}
+static void vcap_open(Model* m){
+  const char* p = getenv("KINDI_CPU_VCAP");
+  if(!g_vcap_f && p && p[0]){
+    const char* mx = getenv("KINDI_CPU_VCAP_MAX");
+    kc_vcap_begin(m, p, mx ? atol(mx) : 0);
+  }
+}
+static void vcap_vec(int il, int pos, int kv, const float* v, int hd){
+  if(!g_vcap_f || g_vcap_n >= g_vcap_max) return;
+  #pragma omp critical(kc_vcap)
+  {
+    if(g_vcap_n < g_vcap_max){
+      const int32_t k[4] = {il, pos, kv, hd};
+      fwrite(k, sizeof k, 1, g_vcap_f);
+      fwrite(v, sizeof(float), (size_t)hd, g_vcap_f);
+      ++g_vcap_n;
+    }
+  }
+}
+KCAPI void kc_vcap_close(void){ if(g_vcap_f){ fclose(g_vcap_f); g_vcap_f = NULL; } }
+KCAPI long long kc_vcap_count(void){ return g_vcap_n; }
+
 /* the part of the attention block between its two products: RoPE, the K/V cache, scores, softmax, the weighted V */
-static void attn_mid(Model* m, Layer* L, int pos){
+static void attn_mid(Model* m, Layer* L, int pos, int il){
   const int NH = m->NH, NKV = m->NHKV, HD = m->HD, rh = m->rope_half, G = NH / NKV, n = pos + 1;
   const float* cs = m->cos_t + (size_t)pos * rh;
   const float* sn = m->sin_t + (size_t)pos * rh;
@@ -1329,6 +1384,7 @@ static void attn_mid(Model* m, Layer* L, int pos){
       const int kv = r - NH;
       const float* vv = m->vv + (size_t)kv * HD;
       const size_t ix = (size_t)pos * NKV + kv;
+      vcap_vec(il, pos, kv, vv, HD);
       if(m->kvq_k == 1) L->Ks[ix] = f2h(tern_pack(dst, L->Kt + ix * (HD / 4), HD));
       else if(m->kvq_k == 6) q2b_pack(dst, L->K2b + ix * (HD / 4), L->K2bs + ix * (HD / 32), HD);
       else if(m->kvq_k == 2) q8_pack(dst, L->Kq + ix * HD, L->Kqs + ix * (HD / 32), HD);
@@ -1405,11 +1461,11 @@ static void attn_mid(Model* m, Layer* L, int pos){
   fold(m, m->att, m->sA, m->xp, NH * HD);
 }
 
-static void attn(Model* m, Layer* L, int pos, int add){
+static void attn(Model* m, Layer* L, int pos, int add, int il){
   TS(4);
   rmsfold(m, L->attn_norm, add);
   { const Mat* a[3] = {&L->q, &L->k, &L->v}; float* yy[3] = {m->qn, m->kr, m->vv}; gemv(m, 3, a, yy, m->xp, KCAL_ATTQKV); }
-  attn_mid(m, L, pos);
+  attn_mid(m, L, pos, il);
   gemv1(m, &L->o, m->y, m->xp, KCAL_ATTN_O);
 }
 
@@ -1512,6 +1568,7 @@ KCAPI int kc_step(Model* m, int tok, int pos, int head){
   int best = -1;
   int redo = 0;              /* shared: the guard's verdict for this decision */
   dump_open();
+  vcap_open(m);
   t_last = omp_get_wtime(); t_cur = 0;
   #pragma omp parallel
   {
@@ -1522,7 +1579,7 @@ KCAPI int kc_step(Model* m, int tok, int pos, int head){
       /* every thread stores the same value for the same layer, and the barrier inside the layer's first gemv orders the
          store before any thread reads the tier, so no single-thread flag protocol is needed here */
       if(tail) g_force_fp32 = (il >= m->NL - tail);
-      if(L->is_attn) attn(m, L, pos, il > 0); else gdn(m, L, il > 0);
+      if(L->is_attn) attn(m, L, pos, il > 0, il); else gdn(m, L, il > 0);
       ffn(m, L, il);
     }
     if(head){
@@ -1577,6 +1634,7 @@ KCAPI int kc_step(Model* m, int tok, int pos, int head){
    bit-identical to kc_step(m, t0, pos) followed by kc_step(m, t1, pos + 1). out[0..1] get the greedy tokens when
    head != 0 (b's logits are in b->logits). */
 KCAPI int kc_step2(Model* m, Model* b, int t0, int t1, int pos, int head, int* out, float* snap){
+  vcap_open(m);
   t_last = omp_get_wtime(); t_cur = 0;
   #pragma omp parallel
   {
@@ -1594,8 +1652,8 @@ KCAPI int kc_step2(Model* m, Model* b, int t0, int t1, int pos, int head, int* o
           float* ya[3] = {m->qn, m->kr, m->vv}; float* yb[3] = {b->qn, b->kr, b->vv};
           gemv2(m, 3, a, ya, yb, m->xp, b->xp);
         }
-        attn_mid(m, L, pos);
-        attn_mid(b, L, pos + 1);
+        attn_mid(m, L, pos, il);
+        attn_mid(b, L, pos + 1, il);
       } else {
         rmsfold(m, L->attn_norm, add);
         rmsfold(b, L->attn_norm, add);
