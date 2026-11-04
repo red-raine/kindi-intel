@@ -13,6 +13,10 @@ Gate order is deliberate, cheapest first, and each rejection is attributed to ex
 
 A record rejected for schema is refused before it can cost an n-gram pass, so the contamination rate is measured against
 records that were otherwise usable - which is what makes the number comparable between sources.
+
+The reference set is checked before its grams reach this module: `coverage.check` reports the benchmark ids it does not
+hold, because a reference short of the benchmark keeps the records it cannot match and the report then reads exactly
+like a clean one. That check is where "974 problems" stops being a claim and becomes a test.
 """
 import json
 import os
