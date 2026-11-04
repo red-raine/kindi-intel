@@ -5,6 +5,7 @@ Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only. See LICE
 """
 import configparser
 import hashlib
+import json
 import os
 import sys
 import urllib.request
@@ -90,8 +91,8 @@ def content_range_start(value):
     return start if end >= start else None
 
 
-def _download(url, path, size, sha, log):
-    """resume a partial download, then check its length and its sha256"""
+def _download(url, path, size, sha, log, verify=True):
+    """resume a partial download, then check its length and (unless `verify` is off) its sha256"""
     part = path + ".part"
     have = os.path.getsize(part) if os.path.exists(part) else 0
     if have > size:
@@ -119,6 +120,10 @@ def _download(url, path, size, sha, log):
     wrote = os.path.getsize(part)
     if wrote != size:
         raise SystemExit("kindi: %s is %d bytes after the download, expected %d" % (part, wrote, size))
+    if not verify:
+        log("no sha256 in the repo's metadata: the length is checked, the bytes are not")
+        os.replace(part, path)
+        return
     log("checking sha256")
     h = hashlib.sha256()
     with open(part, "rb") as f:
@@ -128,6 +133,71 @@ def _download(url, path, size, sha, log):
         os.remove(part)
         raise SystemExit("kindi: %s has the wrong sha256; the partial file was removed, run the download again" % part)
     os.replace(part, path)
+
+
+def hf_tree(repo, revision="main"):
+    """the files of a Hugging Face repo, with the size and sha256 its LFS entry states.
+
+    `?expand=true` is what makes the tree carry `lfs`, and the LFS oid *is* the sha256 of the file - so an arbitrary
+    repo can be fetched and verified by the same path the catalog's own entries use, without a hand-written entry.
+    Gated or private repos need a token: HF_TOKEN in the environment is sent when it is set.
+    """
+    url = "https://huggingface.co/api/models/%s/tree/%s?recursive=true&expand=true" % (repo, revision)
+    req = urllib.request.Request(url, headers={"User-Agent": "kindi"})
+    tok = os.environ.get("HF_TOKEN")
+    if tok:
+        req.add_header("Authorization", "Bearer " + tok)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        rows = json.loads(r.read().decode("utf-8"))
+    out = []
+    for row in rows:
+        if row.get("type") != "file":
+            continue
+        lfs = row.get("lfs") or {}
+        out.append(dict(path=row["path"], size=int(row.get("size") or lfs.get("size") or 0),
+                        sha=(lfs.get("oid") or lfs.get("sha256") or None), lfs=bool(lfs)))
+    return out
+
+
+def fetch(spec, out_dir, log=print, revision="main", allow_unverified=False):
+    """`hr:repo/path/in/repo` -> a verified local file.
+
+    The size and sha256 come from the repo's own LFS metadata, so the download is checked against what the publisher
+    stored rather than what the connection said. A file with no LFS entry (a small config, a tokenizer) is fetched
+    without a sha and says so. `--allow-unverified` is for a file whose LFS entry is missing on a very large download
+    where the risk is accepted; without it such a file is refused rather than written unverified.
+    """
+    if not spec.startswith("hf:"):
+        raise SystemExit("kindi fetch: give hf:REPO/PATH (a Kaggle or HTTP URL is not supported yet)")
+    # the repo id is the first two segments, the file is the rest: a repo id without an owner is not a repo id
+    parts = spec[3:].split("/")
+    if len(parts) < 3:
+        raise SystemExit("kindi fetch: hf: needs OWNER/REPO/PATH (got %r), e.g. hf:prism-ml/"
+                         "Ternary-Bonsai-2-2B-gguf/Ternary-Bonsai-2-2B-PTQ1_0.gguf" % spec)
+    repo, path = "/".join(parts[:2]), "/".join(parts[2:])
+    log("hf: %s, file %s (%s)" % (repo, path, revision))
+    rows = hf_tree(repo, revision)
+    row = next((r for r in rows if r["path"] == path), None)
+    if row is None:
+        near = [r["path"] for r in rows if path.split("/")[-1][:16] in r["path"]][:5]
+        raise SystemExit("kindi fetch: %s is not in %s%s" % (path, repo, ("; close: " + ", ".join(near)) if near else ""))
+    os.makedirs(out_dir, exist_ok=True)
+    dest = os.path.join(out_dir, os.path.basename(path))
+    if os.path.isfile(dest) and (not row["sha"] or size_ok(dest, row["size"])):
+        log("already present: %s" % dest)
+        return dest
+    if not row["sha"] and not allow_unverified:
+        raise SystemExit("kindi fetch: %s has no LFS sha256 in the repo, so it cannot be verified; pass "
+                         "--allow-unverified to fetch it anyway" % path)
+    log("downloading %.2f GB" % (row["size"] / 1e9))
+    _download("https://huggingface.co/%s/resolve/%s/%s" % (repo, revision, path), dest, row["size"],
+              row["sha"] or "", log, verify=bool(row["sha"]))
+    log("ok: %s" % dest)
+    return dest
+
+
+def size_ok(path, size):
+    return size and os.path.getsize(path) == size
 
 
 def _select(cfg, pack, log):

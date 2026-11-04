@@ -389,6 +389,8 @@ repacked: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).
 What the retired 1-bit files' YaRN rope scaling does past their trained window, measured: [docs/CPU-PERF-2026.md](docs/CPU-PERF-2026.md).
 Whether Marlin's INT4 tensor-core kernel can be used here, and the one layout idea in it that can: [docs/INT4-MARLIN.md](docs/INT4-MARLIN.md).
 Where the remaining bits in a ternary pack are, with what this repository measured on real weights against each lever: [docs/TERNARY-OPTIMIZATION-MATRIX.md](docs/TERNARY-OPTIMIZATION-MATRIX.md).
+What a model is from its header, the conversion recipe for a job, and the fitted scale (`gsq`) and exact byte budget
+(`rco`) this release adds, with the measured numbers and what is not built: [docs/RECIPES.md](docs/RECIPES.md).
 The settings for each tested card (K420, K1200, K6000, GTX 1080, RTX 3080, Radeon 780M, CPU): [docs/CARDS.md](docs/CARDS.md).
 
 ## Agent benchmark

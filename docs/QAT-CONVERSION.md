@@ -7,6 +7,8 @@ pack, and `kindi drift` measures what it costs.
 
 ```
 kindi qat-pack qat_final.pt --out ~/.kindi/qat255m        # least-squares scale; --scheme absmean for the GGUF one
+kindi qat-pack qat_final.pt --scheme gsq                 # fit codes and scale together: 11% below lsq on heavy tails
+kindi qat-pack qat_final.pt --budget 900000000           # exact choice of which tensors stay f32
 kindi drift qat_step1000.pt qat_final.pt --groups 128,row,tensor
 ```
 
@@ -40,6 +42,16 @@ the encoder the engine's loader uses, and checks the decoded matrix is the quant
   that then clip.
 
 The scale is rounded to fp16 *before* the trits are chosen, so what the engine runs is what the drift tool measured.
+
+A third scheme, **gsq** (`--scheme gsq`), fits the codes and the scale together: a Gumbel-Softmax relaxation of each
+weight's discrete choice, then the least-squares scale alternating to a fixed point, keeping the better end of the
+trajectory. At 2 bits a weight on heavy-tailed (Student-t) matrices it lands 11.4% below `lsq` in weight error and is
+level on Gaussian ones; the objective is the weights, not the layer output, and on that objective the alternation is
+what wins. [`docs/RECIPES.md`](RECIPES.md) has the table and the limit.
+
+The fp16 scale is one number per 128 weights; the other 16 bits a weight can buy are elsewhere in the file (norms,
+embeddings, the head). `--budget BYTES` makes that choice exactly, by dynamic programming over which tensors stay f32
+(`kindi.rco`), and reports the fractional bound and any gap.
 
 ## The drift curve
 

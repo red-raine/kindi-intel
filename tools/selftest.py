@@ -103,6 +103,9 @@ SUITES = [
     ("suite:vlut", [sys.executable, "-m", "tools.vlut.measure", "--selftest"], "checks passed"),
     ("suite:kvq_capture", [sys.executable, "-m", "tools.kvq.capture", "--selftest"], "checks passed"),
     ("suite:kvq_sweep", [sys.executable, "-m", "tools.kvq.sweep", "--selftest"], "checks passed"),
+    ("suite:recipes", [sys.executable, "-m", "kindi.recipes"], "checks passed"),
+    ("suite:gsq", [sys.executable, "-m", "kindi.gsq"], "checks passed"),
+    ("suite:rco", [sys.executable, "-m", "kindi.rco"], "checks passed"),
 ]
 
 

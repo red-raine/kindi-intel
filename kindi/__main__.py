@@ -43,9 +43,24 @@ def cmd_convert(cfg, a):
     out = a.out or cfg["pack"]
     if os.path.exists(os.path.join(out, "kindi_pack.json")) and not a.force:
         raise SystemExit("kindi: %s already holds a pack (use --force to rebuild)" % out)
-    manifest = convert(a.gguf, out, log=log, paircodes=bool(getattr(a, "paircodes", False)),
-                       rope_factor=getattr(a, "rope_factor", None),
-                       rope_window=getattr(a, "rope_window", None))
+    paircodes = bool(getattr(a, "paircodes", False))
+    factor, window = getattr(a, "rope_factor", None), getattr(a, "rope_window", None)
+    role = getattr(a, "recipe", None)
+    if role:
+        from . import recipes
+        det = recipes.detect(a.gguf)
+        p = recipes.plan(det, role)
+        log("recipe %s: %s" % (role, p["recipe"]["what"]))
+        for w in p["warnings"]:
+            log("  warning: %s" % w)
+        step = p["steps"][0]
+        paircodes = paircodes or bool(step["paircodes"])
+        # a recipe that wants a longer window than the file declares builds the table that reaches it; the plan has
+        # already said so as a warning, so the stretch is the caller's decision rather than a silent extrapolation
+        if step["rope_window"] and det.get("ctx") and step["rope_window"] > det["ctx"] and factor is None:
+            factor, window = float(step["rope_window"]) / float(det["ctx"]), int(det["ctx"])
+            log("  rope: factor %g from the file's %d positions, to reach %d" % (factor, det["ctx"], step["rope_window"]))
+    manifest = convert(a.gguf, out, log=log, paircodes=paircodes, rope_factor=factor, rope_window=window)
     if manifest.get("backend") == "kindi_gemma4":
         log("Gemma 4 model ready for Kindi native CUDA inference")
     else:
@@ -79,12 +94,39 @@ def cmd_bench(cfg, a):
     return run(cfg, log=log)
 
 
+def cmd_recipes(cfg, a):
+    from . import recipes
+    if not a.src:
+        return recipes.listing(log=log)
+    det = recipes.detect(a.src)
+    p = recipes.plan(det, a.role, target_bytes=a.budget)
+    if a.json:
+        print(json.dumps(dict(detected=det, plan=dict(role=p["role"], steps=p["steps"], warnings=p["warnings"],
+                                                    gate=p["gate"])), indent=1, default=str))
+        return 0
+    log("detected: %s%s, %s layers, width %s, %s, context %s%s"
+        % (det.get("family") or "unknown", " (%s)" % det["what"] if det.get("what") else "", det.get("layers"),
+           det.get("width"), "%d experts, %d active" % (det["experts"], det["active_experts"]) if det.get("moe")
+           else "no experts", det.get("ctx"), ", ternary source" if det.get("ternary_source") else ""))
+    if det.get("tensor_types"):
+        log("  tensor types: %s" % ", ".join("%s x%d" % kv for kv in det["tensor_types"].items()))
+    log("recipe %s: %s" % (p["role"], p["recipe"]["what"]))
+    for s in p["steps"]:
+        log("  step: %s" % ", ".join("%s=%s" % (k, v) for k, v in s.items() if k != "do"))
+    log("  gate: %s corpus, NLL delta <= %.3f, top-1 >= %.2f"
+        % (p["gate"]["corpus"], p["gate"]["max_delta_nll"], p["gate"]["min_top1"]))
+    for w in p["warnings"]:
+        log("  warning: %s" % w)
+    return 0
+
+
 def cmd_qat_pack(cfg, a):
     from . import ptload, quant
     sd = {k: ptload.widen(v) for k, v in ptload.load(a.pt).items() if v.dtype.kind in "fiu"}
     out = a.out or os.path.join(os.path.expanduser("~"), ".kindi", os.path.splitext(os.path.basename(a.pt))[0])
     quant.selftest()
-    man = quant.pack(sd, out, log=log, name=os.path.basename(a.pt), source=a.pt, scheme=a.scheme)
+    man = quant.pack(sd, out, log=log, name=os.path.basename(a.pt), source=a.pt, scheme=a.scheme,
+                     budget=getattr(a, "budget", None))
     log("kindi qat-pack: %d tensors (%d ternary, %s scale) -> %s, %.0f MB codes + %.1f MB f32"
         % (man["tensors"], man["ternary_tensors"], a.scheme, out, man["bcodes_bytes"] / 2 ** 20,
            man["f32_bytes"] / 2 ** 20))
@@ -179,6 +221,15 @@ def cmd_use(cfg, a):
     return use(cfg, a.model, gguf=a.gguf, log=log)
 
 
+def cmd_fetch(cfg, a):
+    from .catalog import fetch, model_dir
+    out = a.out or model_dir(cfg)
+    fetch(a.spec, out, log=log, revision=a.revision, allow_unverified=a.allow_unverified)
+    log("next: kindi recipes --for %s --role %s" % (os.path.join(out, os.path.basename(a.spec.split("/")[-1])),
+                                                    a.role or "coder"))
+    return 0
+
+
 def cmd_info(cfg, a):
     print("Kindi %s" % __version__)
     print("config: %s" % cfg["source"])
@@ -242,6 +293,9 @@ def main(argv=None):
     s.add_argument("--rope-window", dest="rope_window", type=int, metavar="N",
                    help="the window the factor scales from (YaRN's original_context_length); default: the file's own, "
                         "else the model's declared context length")
+    s.add_argument("--recipe", choices=("coder", "agent", "rag", "search", "science", "chat"),
+                   help="apply a recipe's conversion plan (paircodes, and the rope window it asks for) and print what "
+                        "the file cannot support; `kindi recipes --for FILE` shows the plan without building")
     s = sub.add_parser("fast-head", help="build the fast-head cluster file")
     s.add_argument("--clusters", type=int, default=1024)
     s.add_argument("--iters", type=int, default=12)
@@ -250,11 +304,21 @@ def main(argv=None):
     s = sub.add_parser("verify-tier", help="check that the CPU kernel tiers compute the same thing (CPU)")
     s.add_argument("--tokens", type=int, default=24, help="tokens per prompt (default 24)")
     s.add_argument("--prompts", type=int, default=3, help="prompts (default 3)")
+    s = sub.add_parser("recipes", help="what a model is, and the conversion plan for a job (coder, rag, search, ...)")
+    s.add_argument("src", nargs="?", help="a GGUF file or a pack directory (default: list the recipes)")
+    s.add_argument("--for", dest="src2", help="same as the positional argument")
+    s.add_argument("--role", choices=("coder", "agent", "rag", "search", "science", "chat"),
+                   help="the job to plan for (default: inferred from the file's name and shape)")
+    s.add_argument("--budget", type=int, metavar="BYTES", help="add the exact-budget format choice to the plan")
+    s.add_argument("--json", action="store_true")
     s = sub.add_parser("qat-pack", help="ternarise a float torch checkpoint into a Kindi pack")
     s.add_argument("pt", help="a .pt state dict of float weights")
     s.add_argument("--out", help="pack directory (default: ~/.kindi/<checkpoint name>)")
-    s.add_argument("--scheme", choices=("absmean", "lsq"), default="lsq",
-                   help="absmean is the PTQ1_0/GGUF convention; lsq searches the minimum-error scale (default lsq)")
+    s.add_argument("--scheme", choices=("absmean", "lsq", "gsq"), default="lsq",
+                   help="absmean is the PTQ1_0/GGUF convention; lsq searches the minimum-error scale; gsq fits the "
+                        "codes and the scale together (kindi.gsq) - 11%% closer than lsq on heavy-tailed weights")
+    s.add_argument("--budget", type=int, metavar="BYTES",
+                   help="spend a size budget: choose which tensors stay f32 to minimise squared error (kindi.rco)")
     s = sub.add_parser("moe-check", help="check the CPU Mixture-of-experts FFN against a NumPy reference")
     s.add_argument("--experts", type=int, default=4)
     s.add_argument("--active", type=int, default=2)
@@ -289,17 +353,28 @@ def main(argv=None):
     s = sub.add_parser("use", help="download a model, build its pack and select it")
     s.add_argument("model")
     s.add_argument("--gguf", help="use this GGUF file instead of downloading it")
+    s = sub.add_parser("fetch", help="fetch one file from any Hugging Face repo, verified against its LFS sha256")
+    s.add_argument("spec", help="hf:OWNER/REPO/PATH, e.g. hf:prism-ml/Ternary-Bonsai-2-2B-gguf/"
+                                "Ternary-Bonsai-2-2B-PTQ1_0.gguf")
+    s.add_argument("--out", help="directory to write into (default: the configured models directory)")
+    s.add_argument("--revision", default="main")
+    s.add_argument("--allow-unverified", dest="allow_unverified", action="store_true",
+                   help="fetch a file whose repo entry carries no sha256 (only its length is checked)")
+    s.add_argument("--role", help="the recipe to suggest for it afterwards")
     a = p.parse_args(argv)
     if not a.cmd:
         p.print_help()
         return 1
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
-    return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
+    if getattr(a, "src2", None) and not getattr(a, "src", None):
+        a.src = a.src2
+    return {"convert": cmd_convert, "recipes": cmd_recipes, "fast-head": cmd_fast_head,
+            "verify": cmd_verify, "bench": cmd_bench,
             "bench-spec": cmd_bench_spec, "spec-check": cmd_spec_check, "qat-pack": cmd_qat_pack, "drift": cmd_drift,
             "verify-tier": cmd_verify_tier, "moe-check": cmd_moe_check, "serve": cmd_serve,
             "chat": cmd_chat, "head": cmd_head,
-            "info": cmd_info, "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
+            "info": cmd_info, "models": cmd_models, "use": cmd_use, "fetch": cmd_fetch}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":

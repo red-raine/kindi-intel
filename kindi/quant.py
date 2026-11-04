@@ -67,10 +67,22 @@ def _lsq_scales(w, group):
     return out.astype(np.float16)
 
 
+SCHEMES = ("absmean", "lsq", "gsq")
+
+
 def quantise(w, group=GROUP, scheme="absmean"):
-    """(codes uint8 [C//4][R], scales fp16 [C//group][R], dequantised float32 [R][C]) for one scale scheme"""
+    """(codes uint8 [C//4][R], scales fp16 [C//group][R], dequantised float32 [R][C]) for one scale scheme
+
+    `gsq` is `kindi.gsq.fit`, imported here rather than at module scope because it reads this module's layout: same
+    outputs, same bits, a joint fit of codes and scale instead of a scale chosen first.
+    """
+    if scheme not in SCHEMES:
+        raise ValueError("unknown scale scheme %r (have %s)" % (scheme, ", ".join(SCHEMES)))
     w = np.ascontiguousarray(w, dtype=np.float32)
     R, C = w.shape
+    if scheme == "gsq":
+        from .gsq import fit
+        return fit(w, group=group)
     sc = scales_for(w, group) if scheme == "absmean" else _lsq_scales(w, group)
     sf = sc.astype(np.float32)
     safe = np.where(sf > 0, sf, np.float32(1.0))
@@ -109,13 +121,35 @@ def _pad8(a):
     return a, int(a.shape[0])
 
 
-def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, extra=None, scheme="lsq"):
-    """write bcodes.bin / dpm.bin / f32.bin / index.json / bcodes_index.json / kindi_pack.json for a float state dict"""
+def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, extra=None, scheme="lsq",
+         budget=None):
+    """write bcodes.bin / dpm.bin / f32.bin / index.json / bcodes_index.json / kindi_pack.json for a float state dict
+
+    `budget` (bytes) spends a size allowance through `kindi.rco`: each tensor's ternary error is measured first, then
+    the subset of tensors that stays f32 is chosen exactly under the budget, so a pack that has room for more
+    precision puts it where it buys the most. Without a budget every 2-D weight is ternary, which is the old
+    behaviour.
+    """
     os.makedirs(out_dir, exist_ok=True)
     order = sorted(sd)
     tern = [k for k in order if is_ternary(k, sd[k])]
     if not tern:
         raise SystemExit("kindi quant: no 2-D weight matrices in this checkpoint, so there is nothing to ternarise")
+    chosen = {}
+    if budget is not None:
+        from . import rco
+        entries = []
+        for k in tern:
+            a = np.ascontiguousarray(sd[k], dtype=np.float32)
+            ap, rows = _pad8(a)
+            codes, sc, deq = quantise(ap, group, scheme)
+            entries.append(dict(name=k, weights=int(ap.size), err={"ternary": float(((ap - deq) ** 2).mean()),
+                                                                    "f32": 0.0},
+                                bytes={"ternary": int(codes.size + 2 * sc.size), "f32": int(4 * ap.size)}))
+        p = rco.plan(entries, int(budget))
+        rco.summary(p, log)
+        chosen = dict((k, f) for k, f in p["plan"].items() if f != "ternary")
+    n_tern = sum(1 for k in tern if chosen.get(k, "ternary") == "ternary")
     index = {"tensors": {}, "base": 0, "hadamard": {}}
     bindex = {"tensors": {}}
     fb = open(os.path.join(out_dir, "bcodes.bin"), "wb")
@@ -125,7 +159,7 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
     R = C = 0
     for k in order:
         a = sd[k]
-        if k in tern:
+        if k in tern and chosen.get(k, "ternary") == "ternary":
             R0, C0 = a.shape
             ap, rows = _pad8(np.ascontiguousarray(a, dtype=np.float32))
             codes, sc, _ = quantise(ap, group, scheme)
@@ -144,7 +178,8 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
             index["tensors"][k] = {"dims": list(f.shape), "type": F32, "folded": False, "rows": f.shape[0],
                                    "ne0": int(f.size // max(1, f.shape[0])), "f32_off": f32_off, "nfloats": int(f.size)}
             f32_off += 4 * f.size
-        log("  %-28s %-18s %s" % (k, "ternary" if k in tern else "f32", tuple(a.shape)))
+        log("  %-28s %-18s %s" % (k, "ternary" if (k in tern and chosen.get(k, "ternary") == "ternary") else "f32",
+                                  tuple(a.shape)))
     for h in (fb, fd, ff):
         h.close()
     with open(os.path.join(out_dir, "index.json"), "w") as f:
@@ -153,7 +188,7 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
         json.dump(bindex, f)
     man = {"kindi_version": __version__, "pack_format": PACK_FORMAT, "model": name or (source and os.path.basename(source)),
            "source_file": os.path.basename(source) if source else None, "source_sha256": sha,
-           "tensors": len(order), "ternary_tensors": len(tern), "bcodes_bytes": bc_off, "dpm_bytes": dpm_off,
+           "tensors": len(order), "ternary_tensors": n_tern, "bcodes_bytes": bc_off, "dpm_bytes": dpm_off,
            "f32_bytes": f32_off,           "quant": {"scheme": scheme, "group": group, "scale": "fp16", "values": [-1, 0, 1]},
            "hadamard": {"enabled": False}, "dimensions": infer_dims(sd)}
     if extra:
