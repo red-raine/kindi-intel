@@ -70,15 +70,44 @@ def list_models(cfg, log=print):
     log("kindi use ID  downloads a model, builds its pack and selects it")
 
 
+def content_range_start(value):
+    """the first byte of a `Content-Range: bytes A-B/T` reply, or None if that is not its form
+
+    A resume is only correct if the server's body starts where the file ends. Checking this is the difference between
+    a resumed download and a file with a body written at the wrong offset - which is not a short file, it is a file
+    of the wrong size whose middle does not decode, and every later measurement believes it.
+    """
+    if not value:
+        return None
+    v = value.strip()
+    if not v.lower().startswith("bytes "):
+        return None
+    a, _, b = v[6:].split("/")[0].partition("-")
+    try:
+        start, end = int(a), int(b)
+    except ValueError:
+        return None
+    return start if end >= start else None
+
+
 def _download(url, path, size, sha, log):
-    """resume a partial download, then check the sha256"""
+    """resume a partial download, then check its length and its sha256"""
     part = path + ".part"
     have = os.path.getsize(part) if os.path.exists(part) else 0
+    if have > size:
+        log("  %s is longer than the %d bytes expected; starting it again" % (part, size))
+        os.remove(part)
+        have = 0
     if have < size:
         req = urllib.request.Request(url, headers={"Range": "bytes=%d-" % have} if have else {})
         with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
-            if have and r.status != 206:
-                raise SystemExit("kindi: the server does not resume downloads; delete %s and retry" % part)
+            if have:
+                if r.status != 206:
+                    raise SystemExit("kindi: the server does not resume downloads; delete %s and retry" % part)
+                at = content_range_start(r.headers.get("Content-Range"))
+                if at != have:
+                    raise SystemExit("kindi: asked to resume at %d but the server sent a range starting at %r; the "
+                                     "body would be written at the wrong offset" % (have, at))
             got, step = have, 1 << 30
             while True:
                 b = r.read(1 << 22)
@@ -87,13 +116,17 @@ def _download(url, path, size, sha, log):
                 f.write(b); got += len(b)
                 if got // step != (got - len(b)) // step:
                     log("  %.1f of %.1f GB" % (got / 1e9, size / 1e9))
+    wrote = os.path.getsize(part)
+    if wrote != size:
+        raise SystemExit("kindi: %s is %d bytes after the download, expected %d" % (part, wrote, size))
     log("checking sha256")
     h = hashlib.sha256()
     with open(part, "rb") as f:
         for b in iter(lambda: f.read(1 << 24), b""):
             h.update(b)
     if h.hexdigest() != sha:
-        raise SystemExit("kindi: %s has the wrong sha256 (delete it and retry)" % part)
+        os.remove(part)
+        raise SystemExit("kindi: %s has the wrong sha256; the partial file was removed, run the download again" % part)
     os.replace(part, path)
 
 

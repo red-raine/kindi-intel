@@ -382,6 +382,7 @@ tokens/s and reads prompts at 1.2 tokens/s (512 tokens). The tables for each car
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 How Kindi works: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 An experiment on reusing the activation code as a routing fingerprint: [docs/ROUTING-FINGERPRINT.md](docs/ROUTING-FINGERPRINT.md).
+Whether the experts the router groups together are one function relabelled, measured on a real pack before merging them: [docs/EXPERT-MERGE.md](docs/EXPERT-MERGE.md).
 What a ternary LUT kernel and expert paging actually cost on an AVX2 i9, including two claims withdrawn: [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 What the 27B ternary packs differ in - identical codes, re-fitted scales, and one derivative that is the base file
 repacked: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).

@@ -84,6 +84,8 @@ SUITES = [
     ("suite:moe_loop", [sys.executable, "-m", "tools.moe_loop.test_moe_loop"], "checks passed"),
     ("suite:bitnet_gemm", [sys.executable, "-m", "tools.bitnet_gemm.test_bitnet"], "checks passed"),
     ("suite:expert_merge", [sys.executable, "-m", "tools.expert_merge.merge"], "permutation logic verified"),
+    ("suite:expert_perm", [sys.executable, "-m", "tools.expert_merge.permtest"], "checks passed"),
+    ("suite:packfetch", [sys.executable, "-m", "tools.expert_merge.fetch", "--selftest"], "checks passed"),
     ("suite:prefetch_budget", [sys.executable, "-m", "tools.bitnet_gemm.prefetch_budget"], "over-fetch"),
     ("suite:exodus", [sys.executable, "-m", "tools.exodus"], "check groups passed"),
     ("suite:datahub", [sys.executable, "-m", "tools.datahub.selftest"], "checks passed"),
