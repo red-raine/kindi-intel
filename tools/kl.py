@@ -231,7 +231,7 @@ def cmd_logits(args):
     print("  engine time %.1fs + %.1fs" % (sa, sb))
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(a=args.a, b=args.b, tokens=ids, same_vocab=same_vocab, **m), f, indent=2)
+            json.dump(dict(a=args.a, b=args.b, ids=ids, same_vocab=same_vocab, **m), f, indent=2)
         print("report: %s" % args.json)
     return 0
 
