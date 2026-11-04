@@ -72,6 +72,9 @@ on, rather than passing on a GPU machine and breaking for everyone else.
   measurement of a real pack on a real disk. The overlap those models take as input is measured
   (`tools/bitnet_gemm/cluster_budget.py` reads a captured router log), but the log is of one model on four documents,
   and the read and GEMV rates behind both tools are one machine's.
+* **The two GEMV kernels against each other.** `tools/bitnet_gemm/libcompare.py` runs the pair table and the LUT in one
+  process, but it needs a C++ toolchain and torch, so the gate does not run it. What the gate checks is that `kcpu.c`
+  still builds and that its own tiers agree with its reference - not that a second kernel agrees with it.
 * **Windows-specific code paths** beyond what the CPU suite happens to exercise, and no check covers the Docker images.
 
 ## Adding a check

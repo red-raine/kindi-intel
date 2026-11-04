@@ -106,6 +106,41 @@ in **bytes** where a group is N bytes, so it prefetches 4 groups - 57 KB, or **8
 its comment says "4 lines ahead", and 57 KB cannot survive a 32 KB L1. And the accumulator loop reads
 `local_acc[local_idx + 24 .. +31]` unconditionally, so it silently requires `N % 32 == 0`; the proposal checks neither.
 
+## The two kernels, in one process
+
+Parity between the LUT and the shipped pair table was the weakest claim in this note, because it was made across
+sources: the LUT's number from `tools/bitnet_gemm/tmac.py`, the pair table's from `kindi.cpu`, in different processes,
+on different matrices, with each side packing the weights its own way. That cannot separate the kernels from their
+drivers, and it is why the second half of the claim - that a repack would buy nothing - was inference rather than
+measurement.
+
+```bash
+python -m tools.bitnet_gemm.libcompare        # --rows / --cols / --reps / --threads
+```
+
+`kindi/kcpu.c` now exposes `kc_rows8_gemv`, a harness entry that runs the production `rows8` on caller-packed bytes, so
+both kernels load into one process: `libkcpu` through ctypes (built here with MSVC, `/arch:AVX2`), and
+`tmac_gemv_avx2` through its torch extension. Same 2048 x 1920 ternary matrix, same int8 activation vector, same timing
+loop, one run.
+
+| arm | max abs error vs exact | share of the largest output | ms, 1 thread | G weights/s |
+|---|---:|---:|---:|---:|
+| pair table (`rows8`) | 2.01e-05 | 1.65e-07 | 0.396 | 9.9 |
+| LUT (`vpshufb`) | 5.98e-06 | 4.90e-08 | 0.219 | 18.0 |
+| the two against each other | 2.29e-05 | 1.87e-07 | - | - |
+| pair table, 16 threads | - | - | 0.093 | 42.3 |
+
+**Parity holds, and it is the only half of the old claim that does.** The kernels agree to 1.9e-07 of their largest
+output - float accumulation order, not a layout difference. But at one thread the LUT is **1.8x faster** than the pair
+table (0.219 against 0.396 ms), so a repack would buy something. What it would not buy is the thing that matters here:
+the shipped kernel threaded reaches 42.3 G weights/s, **2.4x** the LUT's single-threaded 18.0. So "a repack would buy
+nothing" was true of the engine and false of the kernels, and the gap is threads, not layouts.
+
+Caveats, since this is now a number rather than a claim: the arms see the same integer activations but carry the scale
+differently (floats into `rows8`, `scale_a` into the LUT); the matrix is 3.93 M weights against a pack's 14.4 M an
+expert, so per-call overhead is relatively larger here; and these are best-of-9 on one host. The LUT arm has no
+threaded mode, so the multi-thread comparison the engine actually runs cannot be made from this extension as it stands.
+
 ## The disk: an expert read costs ~9 ms, against 1.8 ms of GEMV
 
 The third proposal streamed cold expert weights with `io_uring` + `O_DIRECT` + `mlock`, double-buffered against the
@@ -311,15 +346,16 @@ inside the guest to characterise it. Anyone re-running this on bare metal should
    divided by 1.5 at best (8 -> 5.24 distinct matrices at batch 1), and the streaming crossover lands at B=8, not B=1 -
    and a random partition of the same size lands there too.
 
-None of these change the operating recommendation, which is the useful part: **do not port either kernel.** The
-LUT matches the shipped pair table at parity, so a repack of the weight layout would buy nothing; paging is a batched
-design and this engine decodes at batch 1.
+None of these change the operating recommendation, which is the useful part: **do not port either kernel.** Parity is
+real - the LUT agrees with the pair table to float rounding on the same matrix in one process - but the repack is not
+free and not obviously a win: the LUT is 1.8x faster at one thread, while the shipped kernel is 2.4x faster on this
+machine's threads. Paging is a batched design and this engine decodes at batch 1.
 
 ## What would settle the rest
 
-- **The comparison against the pair table needs to happen in one process.** Build `libkcpu`, push the same 2048 x 1920
-  ternary matrix through `rows8` and through `tmac_gemv_avx2`, and report both from the same binary. Everything cross-
-  source above is weaker than that.
+- **The comparison against the pair table now happens in one process** (`tools/bitnet_gemm/libcompare.py`, above): both
+  kernels on one matrix agree to 1.9e-07, and the LUT is 1.8x faster single-threaded. What is still missing is the LUT
+  at 8-16 threads, which its extension does not offer - until that exists, the threaded comparison stays one-armed.
 - **The device needs a bare-metal run.** The same probe on a machine without a virtual block layer would say whether
   1.6 GB/s at 14.7 MB and 3.3 GB/s at 200 MB is the KIOXIA or the host.
 - **The batched-regime prediction is untested.** The 5-6 token break-even is arithmetic from two measured rates, not a

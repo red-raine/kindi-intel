@@ -1877,3 +1877,43 @@ KCAPI int kc_sizeof_layer(void){ return (int)sizeof(Layer); }
    4 attn-other 5 ffn-other 6 head), for the CPU profiler. */
 KCAPI void kc_get_times(double* out){ for(int i = 0; i < 8; ++i) out[i] = kc_times[i]; }
 KCAPI void kc_reset_times(void){ for(int i = 0; i < 8; ++i) kc_times[i] = 0.0; }
+
+/* ---------------------------------------------------------- parity harness entry (tools/bitnet_gemm/libcompare)
+   One matrix, through this kernel, with no model around it. W and S are the caller's bytes in the engine's own layout
+   ([R/8][C/128][64] pair-code words and [R/8][C/128][8] scales), x is the activation and y gets R floats; the tables
+   are built here by the same pair_tables the forward pass calls. b0..b1 are row blocks out of R/8, so a caller can run
+   the kernel serially beside a single-threaded kernel and then report what the engine's threading does to the same
+   matrix. Returns the blocks walked, or a negative code for a shape this layout cannot express. */
+KCAPI int kc_rows8_gemv(const unsigned char* W, const float* S, int R, int C, const float* x, float* y,
+                        int b0, int b1, int threads){
+  if(!W || !S || !x || !y) return -1;
+  if(R <= 0 || C <= 0 || (R % 8) || (C % 128)) return -2;      /* the pair layout has no partial block */
+  if(b0 < 0 || b1 > R / 8 || b0 > b1) return -3;
+  const int P = C / 2;
+  float* T = (float*)malloc((size_t)P * 8 * sizeof(float));
+  if(!T) return -4;
+  Mat A; A.W = W; A.S = S; A.R = R; A.C = C;
+  pair_tables(x, T, 0, P);
+  if(threads <= 1 || b1 - b0 <= 2){
+    if(tier() == KCT_SCALAR) rows8_ref(&A, y, T, b0, b1);
+#if defined(__AVX2__)
+    else rows8(&A, y, T, b0, b1);
+#else
+    else rows8_ref(&A, y, T, b0, b1);
+#endif
+  } else {
+    int rb;                                                    /* declared outside: MSVC's OpenMP 2.0 wants that */
+    #pragma omp parallel for schedule(static) num_threads(threads)
+    for(rb = b0; rb < b1; rb += 2){
+      const int e = (rb + 2 <= b1) ? rb + 2 : b1;               /* rows8 takes pairs of blocks */
+      if(tier() == KCT_SCALAR) rows8_ref(&A, y, T, rb, e);
+#if defined(__AVX2__)
+      else rows8(&A, y, T, rb, e);
+#else
+      else rows8_ref(&A, y, T, rb, e);
+#endif
+    }
+  }
+  free(T);
+  return b1 - b0;
+}

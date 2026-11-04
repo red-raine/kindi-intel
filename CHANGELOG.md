@@ -14,6 +14,10 @@
   fractional bound reported when the table is too large to solve exactly.
 - **`kindi fetch kaggle:OWNER/DATASET[/MEMBER]`.** Kaggle has no per-file endpoint and no hash, so the dataset archive
   is downloaded, the named member is extracted, and the limits are stated.
+- **`tools.bitnet_gemm.libcompare`, and `kc_rows8_gemv` in the CPU library.** Puts the pair-table kernel and the T-MAC
+  LUT on one matrix in one process, which is the comparison the paging note had been making across sources. The two
+  agree to 1.9e-07 of their largest output, so parity holds; at one thread the LUT is 1.8x faster (0.219 against
+  0.396 ms on 2048 x 1920), while the pair table at 16 threads is 2.4x faster than the LUT. [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 - **`tools.bitnet_gemm.cluster_budget`.** Measures whether clustering experts cuts paged bytes enough to stream at
   batch 1, from a captured router log rather than from an assumption about overlap: 12 clusters take the streaming
   crossover from B=64 to B=8 and the table from 58.8 GB to 5.5 GB, but a random partition of the same size reaches
