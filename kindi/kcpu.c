@@ -82,6 +82,15 @@ typedef struct {
                                             5 4 bits as two 4-level passes, 6 2 bits with per-32 block scales
                                             (kc_kv_quant) */
   int kvq_k, kvq_v;                      /* the two sides separately (kc_kv_quant2): K and V need not match */
+  int fold_on;                           /* 1: the weights carry Prism's Hadamard rotation, so activations are folded.
+                                            0: a pack whose weights were never rotated (the 1-bit Qwen3 files) -
+                                            fold() copies instead, and the transform is the identity. */
+  int qhd;                               /* floats per head in the q projection: 2*HD when it carries qwen35's fused
+                                            q|gate (the gate in the second HD), HD for a dense Qwen3 stack, whose
+                                            attention has no gate. The host reads it off the matrix's rows. */
+  float qscale;                          /* the softmax scale, 1/sqrt(HD); 0.0625 for qwen35's 256-wide heads */
+  const float* emb_in;                   /* NULL: read the row for `tok` from emb. Otherwise these D floats are the input
+                                            (kc_step_emb), already in row order and not yet folded. */
 } Model;
 
 /* ------------------------------------------------------------------------------------------- helpers */
@@ -136,6 +145,13 @@ static void fwht_block(float* x, int hb){
 /* out = fold(v) = FWHT_blocks(sg * v); in parallel over blocks (must be called by all threads; ends in a barrier) */
 static void fold(const Model* m, const float* v, const float* sg, float* out, int n){
   int b;                       /* declared outside the for: MSVC's /openmp needs C89 loop form */
+  if(!m->fold_on){
+    /* unfolded weights: the transform is the identity. The copy is still a worksharing loop, so every call site keeps
+       its implicit barrier and the thread split is the same one. */
+    #pragma omp for schedule(static)
+    for(b = 0; b < n; ++b) out[b] = v[b];
+    return;
+  }
   #pragma omp for schedule(static)
   for(b = 0; b < n / m->HB; ++b){
     float* o = out + (size_t)b * m->HB;
@@ -1372,7 +1388,7 @@ static void attn_mid(Model* m, Layer* L, int pos, int il){
   for(r = 0; r < NH + NKV; ++r){
     float tmp[512];
     float* dst;
-    if(r < NH){ rms_rows(m->qn + (size_t)r * 2 * HD, L->q_norm, tmp, 1, HD); dst = m->qr + (size_t)r * HD; }
+    if(r < NH){ rms_rows(m->qn + (size_t)r * m->qhd, L->q_norm, tmp, 1, HD); dst = m->qr + (size_t)r * HD; }
     else { rms_rows(m->kr + (size_t)(r - NH) * HD, L->k_norm, tmp, 1, HD); dst = m->kro + (size_t)(r - NH) * HD; }
     for(int j = 0; j < rh; ++j){
       const float a = tmp[j], b = tmp[j + rh];
@@ -1418,7 +1434,7 @@ static void attn_mid(Model* m, Layer* L, int pos, int il){
         const float* q = m->qr + (size_t)(kv * G + g) * HD;
         float a = 0.f;
         for(int j = 0; j < HD; ++j) a += kf[j] * q[j];
-        m->sc[(size_t)(kv * G + g) * m->ctx + t] = a * 0.0625f;
+        m->sc[(size_t)(kv * G + g) * m->ctx + t] = a * m->qscale;
       }
     }
   }
@@ -1456,7 +1472,10 @@ static void attn_mid(Model* m, Layer* L, int pos, int il){
         for(int j = 0; j < 32; ++j) acc[j] += pt * h2f(V[j]);
       }
     }
-    for(int j = 0; j < 32; ++j) m->att[(size_t)hh * HD + d0 + j] = acc[j] * sigm(m->qn[(size_t)hh * 2 * HD + HD + d0 + j]);
+    if(m->qhd > HD)          /* qwen35's per-head gate: the second HD of the head's q rows */
+      for(int j = 0; j < 32; ++j) m->att[(size_t)hh * HD + d0 + j] = acc[j] * sigm(m->qn[(size_t)hh * m->qhd + HD + d0 + j]);
+    else                     /* dense Qwen3: the head's q is the whole projection, with no gate to apply */
+      for(int j = 0; j < 32; ++j) m->att[(size_t)hh * HD + d0 + j] = acc[j];
   }
   fold(m, m->att, m->sA, m->xp, NH * HD);
 }
@@ -1541,19 +1560,41 @@ static void ffn(Model* m, Layer* L, int il){
   gemv1(m, &L->ffd, m->y, m->xp, KCAL_DENSE_DOWN);
 }
 
-static void embed(Model* m, int tok){
-  const int C = m->emb.C, R = m->emb.R;
-  int g, bl;
+/* one embedding row: token `tok`'s floats, decoded from the pair-code table into `dst`. Called from inside a parallel
+   region (kc_step's, or kc_embed_row's own), because the work-sharing loop is what splits it across threads. */
+static void emb_decode(const Mat* emb, int tok, float* dst){
+  const int C = emb->C;
+  int g, p;
   #pragma omp for schedule(static)
   for(g = 0; g < C / 128; ++g){
     static const signed char W0[9] = {-1, 0, 1, -1, 1, -1, 0, 1, 0}, W1[9] = {-1, -1, -1, 0, 0, 1, 1, 1, 0};
-    const uint32_t* pw = (const uint32_t*)m->emb.W + ((size_t)(tok / 8) * (C / 128) + g) * 64;
-    const float d = m->emb.S[((size_t)(tok / 8) * (C / 128) + g) * 8 + (tok & 7)];
-    for(int p = 0; p < 64; ++p){
+    const uint32_t* pw = (const uint32_t*)emb->W + ((size_t)(tok / 8) * (C / 128) + g) * 64;
+    const float d = emb->S[((size_t)(tok / 8) * (C / 128) + g) * 8 + (tok & 7)];
+    for(p = 0; p < 64; ++p){
       const int code = (pw[p] >> (4 * (tok & 7))) & 15;
-      m->m[g * 128 + 2 * p] = (float)W0[code] * d;
-      m->m[g * 128 + 2 * p + 1] = (float)W1[code] * d;
+      dst[g * 128 + 2 * p] = (float)W0[code] * d;
+      dst[g * 128 + 2 * p + 1] = (float)W1[code] * d;
     }
+  }
+}
+
+static void embed(Model* m, int tok){
+  int g, bl;
+  if(m->emb_in){
+    /* embeddings-in: the caller's row is the input, so no lookup happens and `tok` is not read. Everything below -
+       the fold into h - is the path a looked-up row takes, which is why injecting a token's own row reproduces its
+       logits instead of merely approaching them. */
+    #pragma omp for schedule(static)
+    for(g = 0; g < m->D; ++g) m->m[g] = m->emb_in[g];
+  } else {
+    emb_decode(&m->emb, tok, m->m);
+  }
+  if(!m->fold_on){
+    /* unfolded weights: the embedding row is the whole input - no rotation, no sign vector. (HB is 0 in such a pack,
+       which is also why the block loop below cannot run.) */
+    #pragma omp for schedule(static)
+    for(g = 0; g < m->D; ++g) m->h[g] = m->m[g];
+    return;
   }
   #pragma omp for schedule(static)
   for(bl = 0; bl < m->D / m->HB; ++bl){
@@ -1561,6 +1602,29 @@ static void embed(Model* m, int tok){
     fwht_block(o, m->HB);
     for(int j = 0; j < m->HB; ++j) m->h[bl * m->HB + j] = m->sD[bl * m->HB + j] * o[j];
   }
+}
+
+KCAPI int kc_step(Model* m, int tok, int pos, int head);      /* defined below; kc_step_emb is that same pass */
+
+/* the row a token id feeds, before the fold: D floats, for a host that injects rows rather than ids. It writes `out`
+   and nothing else - m is unchanged - so a caller can read a row between steps without disturbing the sequence. */
+KCAPI void kc_embed_row(Model* m, int tok, float* out){
+  #pragma omp parallel
+  {
+    emb_decode(&m->emb, tok, out);
+  }
+}
+
+/* one token from a caller-supplied embedding row instead of a token id: D floats in row order, before the fold.
+   Everything after the input is kc_step's pass, guards and head included, so this is the same step with a different
+   first instruction. kc_embed_row produces exactly such a row, and injecting a token's own row is bit-identical to
+   stepping that token. */
+KCAPI int kc_step_emb(Model* m, const float* x, int pos, int head){
+  int best;
+  m->emb_in = x;
+  best = kc_step(m, -1, pos, head);
+  m->emb_in = NULL;
+  return best;
 }
 
 /* one token; head != 0: also the output head (logits in m->logits); returns the greedy token or -1 */
@@ -1634,6 +1698,7 @@ KCAPI int kc_step(Model* m, int tok, int pos, int head){
    bit-identical to kc_step(m, t0, pos) followed by kc_step(m, t1, pos + 1). out[0..1] get the greedy tokens when
    head != 0 (b's logits are in b->logits). */
 KCAPI int kc_step2(Model* m, Model* b, int t0, int t1, int pos, int head, int* out, float* snap){
+  /* both tokens come from the embedding table: there is one row per token, and one injected row cannot stand for two */
   vcap_open(m);
   t_last = omp_get_wtime(); t_cur = 0;
   #pragma omp parallel

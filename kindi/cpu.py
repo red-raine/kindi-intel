@@ -2,7 +2,10 @@
 
 The whole forward pass of a token runs in C (kcpu.c, one OpenMP parallel region per token). Same interface as
 kindi.engine.Engine: reset(), feed(tok, pos), step(tok, pos) -> greedy token, generate(ids, n), logits in
-self.ylog[:self.ylog_n]. Loads a Kindi pack (kindi convert) and repacks the ternary weights into pair codes
+self.ylog[:self.ylog_n]. A step can also take a float row instead of a token id (feed_emb / step_emb: D floats in
+row order, before the activation fold), which is the same pass after its first instruction; embed_row(tok) is the
+row the lookup would have supplied, so injecting it back is bit-identical to stepping that token. `feed_emb` / `step_emb` take a float row where the token id would go, so a caller can inject
+an input vector instead of looking one up; `embed_row(tok)` returns the row that lookup would have produced. Loads a Kindi pack (kindi convert) and repacks the ternary weights into pair codes
 ("perm8": per 8-row block and 128-column group, 64 words of 32 bits; one vpermps gives 8 rows x 2 columns).
 kcpu.c is built on first use with gcc (-O3 -march=native -fopenmp) into KINDI_CPU_CACHE (default ~/.cache/kindi).
 Threads: OMP_NUM_THREADS (with OMP_PROC_BIND=close; on a two-socket host, the cores of one socket)."""
@@ -13,7 +16,7 @@ import time
 
 import numpy as np
 
-from . import cbuild
+from . import cbuild, packio, rope
 
 VOCAB = 248320
 DEFAULT_DIMS = {"layers": 24, "width": 2048, "ffn": 6144, "heads": 8, "kv_heads": 2,
@@ -192,7 +195,9 @@ class Model(ctypes.Structure):
                 + [("red", ctypes.POINTER(ctypes.c_double))]
                 + [("pr", PF), ("ex", PF), ("psel", PF), ("sel", ctypes.c_void_p),
                    ("moe_fetch", ctypes.c_void_p), ("moe_ctx", ctypes.c_void_p)]
-                + [("kvq", ctypes.c_int), ("kvq_k", ctypes.c_int), ("kvq_v", ctypes.c_int)])
+                + [("kvq", ctypes.c_int), ("kvq_k", ctypes.c_int), ("kvq_v", ctypes.c_int),
+                   ("fold_on", ctypes.c_int), ("qhd", ctypes.c_int), ("qscale", ctypes.c_float)]
+                + [("emb_in", PF)])          # non-NULL only for the duration of a kc_step_emb call
 
 
 def _lib():
@@ -204,6 +209,9 @@ def _lib():
     lib.kc_init()
     lib.kc_step.argtypes = [ctypes.POINTER(Model), ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.kc_step.restype = ctypes.c_int
+    lib.kc_step_emb.argtypes = [ctypes.POINTER(Model), PF, ctypes.c_int, ctypes.c_int]
+    lib.kc_step_emb.restype = ctypes.c_int
+    lib.kc_embed_row.argtypes = [ctypes.POINTER(Model), ctypes.c_int, PF]
     lib.kc_tier_mask.restype = ctypes.c_int
     lib.kc_get_tier.restype = ctypes.c_int
     lib.kc_kv_quant.argtypes = [ctypes.POINTER(Model), ctypes.c_int]
@@ -248,10 +256,10 @@ def pair_scales(sc):
 def pair_mat(bc, dp, rec):
     """one ternary matrix from the pack's bytes: pair codes [R/8][C/128][64] and the row-block scales"""
     R, C = rec["rows"], rec["ne0"]
-    ns, G = C // 4, C // 128
-    o, q = rec["bc_off"], rec["dpm_off"] // 2
+    ns = C // 4
+    o = rec["bc_off"]
     W = paircodes(bc[o:o + ns * R], R, C)
-    S = pair_scales(np.asarray(dp[q:q + G * R]).reshape(G, R))
+    S = pair_scales(np.asarray(packio.tensor_scales(dp, rec)).reshape(C // 128, R))
     return W, S
 
 
@@ -313,7 +321,7 @@ class Engine(object):
             raise SystemExit(problem)
         idx, bi = _Index(idx, pack, "index.json"), _Index(bi, pack, "bcodes_index.json")
         bc = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
-        dp = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.float16, mode="r")
+        dp = packio.load_scales(pack, man)     # one fp16 a block, whether the pack stores 8-bit indices or fp16
         self.keep = []                    # every array the C side points at
 
         def keep(a):
@@ -425,23 +433,37 @@ class Engine(object):
                 L.M, L.conv = _p(Mst), _p(cv)
         self.Ls = Ls
         m = self.m = Model()
+        # the vocabulary the head scores, and whether the weights carry Prism's Hadamard rotation: a pack converted
+        # from a GGUF with no `prism.hadamard` metadata (the 1-bit Qwen3 files) is unfolded and must not rotate its
+        # activations, which is the same fold() call with the identity in place of the FWHT
+        V = int(man.get("vocab") or VOCAB)
+        self.fold = bool(man.get("fold", True))
+        # qwen35's attention fuses a per-head gate into q (2*HD rows a head, the gate in the second HD); a dense Qwen3
+        # stack has a plain q (HD rows a head, no gate). The matrix's own row count says which, so no manifest key is
+        # needed and a wrong pack cannot silently pick the other one.
+        qrows = next((mm.R for n, mm in mats.items() if n.endswith(".attn_q.weight")), 2 * NH * HD)
+        qhd = qrows // NH
+        if qhd not in (HD, 2 * HD):
+            raise SystemExit("kindi: attn_q has %d rows, which is neither %d nor %d for %d heads"
+                             % (qrows, HD * NH, 2 * HD * NH, NH))
         for k, v in (("D", D), ("NL", NL), ("NFF", NFF), ("NH", NH), ("NHKV", NHKV), ("HD", HD), ("NK", NK),
                      ("HK", HK), ("NV", NV), ("CONV_CH", CC), ("HB", self.HB), ("rope_half", d["rope_dim"] // 2),
-                     ("ctx", self.ctx), ("vocab", VOCAB)):
+                     ("ctx", self.ctx), ("vocab", V), ("fold_on", int(self.fold)), ("qhd", qhd),
+                     ("qscale", 1.0 / np.sqrt(HD))):
             setattr(m, k, v)
         m.L = ctypes.cast(Ls, ctypes.POINTER(Layer))
         m.emb, m.head = mats["token_embd.weight"], mats[self.head_name]
         m.out_norm = f("output_norm.weight")
         m.sD, m.sV, m.sA, m.sF = (_p(sg(D)), _p(sg(NV * HK)), _p(sg(NH * HD)), _p(sg(NFF)))
-        rh = d["rope_dim"] // 2
-        inv = np.float64(d["rope_base"]) ** (-2.0 * np.arange(rh) / d["rope_dim"])
-        th = np.arange(self.ctx, dtype=np.float64)[:, None] * inv[None, :]
-        m.cos_t, m.sin_t = _p(keep(np.cos(th).astype(F32))), _p(keep(np.sin(th).astype(F32)))
+        # the rotary table, including whatever interpolation the file asks for (`kindi.rope`): plain for the floats the
+        # packs here ship, YaRN for the retired 1-bit Qwen3 files, whose manifest records factor 4 from 8192 positions
+        cos, sin = rope.tables(self.ctx, d["rope_dim"], d["rope_base"], man.get("rope_scaling"))
+        m.cos_t, m.sin_t = _p(keep(np.ascontiguousarray(cos, dtype=F32))), _p(keep(np.ascontiguousarray(sin, dtype=F32)))
         W = max(D, NFF, NV * HK, NH * HD)
         sizes = {"h": D, "xn": D, "xp": W, "y": D, "qkv": CC, "zv": NV * HK, "cs": CC, "qk": 2 * NK * HK,
                  "gout": NV * HK, "outn": NV * HK, "m": W, "qn": NH * 2 * HD, "kr": NHKV * HD, "vv": NHKV * HD,
                  "qr": NH * HD, "kro": NHKV * HD, "sc": NH * self.ctx, "att": NH * HD, "ffg": NFF, "ffu": NFF,
-                 "T": W // 2 * 8, "T2": W // 2 * 8, "logits": max(VOCAB, mats[self.head_name].R), "gb": NV, "gg": NV}
+                 "T": W // 2 * 8, "T2": W // 2 * 8, "logits": max(V, mats[self.head_name].R), "gb": NV, "gg": NV}
         for k in _SCR:
             a = z(sizes[k])
             setattr(m, k, _p(a))
@@ -459,7 +481,7 @@ class Engine(object):
         self._sizes = sizes
         m2 = Model()
         for k in ("D", "NL", "NFF", "NH", "NHKV", "HD", "NK", "HK", "NV", "CONV_CH", "HB", "rope_half",
-                  "ctx", "vocab"):
+                  "ctx", "vocab", "qhd", "qscale"):
             setattr(m2, k, getattr(m, k))
         for k in ("L", "emb", "head", "out_norm", "sD", "sV", "sA", "sF", "cos_t", "sin_t"):
             setattr(m2, k, getattr(m, k))
@@ -495,7 +517,7 @@ class Engine(object):
             mm.sel = self.sel.ctypes.data
             mm.moe_fetch, mm.moe_ctx = None, None
         self.nexp, self.nact = nexp, nact
-        self.ylog, self.ylog_n, self.ylog_map = self.logits, VOCAB, None
+        self.ylog, self.ylog_n, self.ylog_map = self.logits, V, None
         self.hsl, self.shortlist = None, 0
         self.shortlist = 0
         self.tier = "auto"
@@ -610,6 +632,37 @@ class Engine(object):
             raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
         return self.lib.kc_step(ctypes.byref(self.m), int(tok), int(pos), 1)
 
+    # --------------------------------------------------------------- embeddings in (a row instead of a token id)
+    def embed_row(self, tok):
+        """the D floats a token id feeds, before the activation fold (`kc_embed_row`)
+
+        Reading a row leaves the engine untouched, so it can be called between steps. A row taken here and injected
+        through `step_emb` is the same input the lookup would have supplied, and the fold is applied to it once either
+        way.
+        """
+        out = np.zeros(self.m.D, dtype=F32)
+        self.lib.kc_embed_row(ctypes.byref(self.m), int(tok), _p(out))
+        return out
+
+    def _input_row(self, row):
+        a = np.ascontiguousarray(row, dtype=F32)
+        if a.ndim != 1 or a.shape[0] != self.m.D:
+            raise ValueError("kindi-cpu: an injected row holds %d float(s); the model's width is %d"
+                             % (a.size, self.m.D))
+        return a
+
+    def feed_emb(self, row, pos):
+        """one position from a float row (D floats, row order, not folded) instead of a token id; no head"""
+        if pos >= self.ctx:
+            raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
+        self.lib.kc_step_emb(ctypes.byref(self.m), _p(self._input_row(row)), int(pos), 0)
+
+    def step_emb(self, row, pos):
+        """one token from a float row instead of a token id: the same pass, guards and head as `step`"""
+        if pos >= self.ctx:
+            raise OverflowError("position %d is past the context (%d)" % (pos, self.ctx))
+        return int(self.lib.kc_step_emb(ctypes.byref(self.m), _p(self._input_row(row)), int(pos), 1))
+
     def guard_stats(self):
         """(decisions examined, decisions that fell back to the fp32 head) under KINDI_CPU_Q8GUARD"""
         seen, hits = ctypes.c_longlong(0), ctypes.c_longlong(0)
@@ -687,7 +740,7 @@ class Engine(object):
         if self.pager is None:
             raise SystemExit("kindi: expert_resident was not set, so nothing is paged")
         self._paging_src = {"bc": np.memmap(os.path.join(self.pack, "bcodes.bin"), dtype=np.uint8, mode="r"),
-                            "dp": np.memmap(os.path.join(self.pack, "dpm.bin"), dtype=np.float16, mode="r")}
+                            "dp": packio.load_scales(self.pack)}
         pc = os.path.join(self.pack, "pcodes.bin")
         if os.path.isfile(pc):
             self.pc = np.memmap(pc, dtype=np.uint8, mode="r")

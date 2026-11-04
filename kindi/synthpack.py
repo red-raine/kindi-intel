@@ -15,7 +15,7 @@ import os
 
 import numpy as np
 
-from . import __version__, quant
+from . import __version__, packio, quant
 from .cpu import is_expert, pair_bytes
 
 DIMS = {"layers": 3, "width": 256, "ffn": 512, "heads": 4, "kv_heads": 2, "head_dim": 64, "groups": 2,
@@ -38,6 +38,9 @@ def build(out_dir, seed=7, log=print, **kw):
     `paircodes=True` also writes pcodes.bin, the pair-code variant: one expert matrix's GEMV form as bytes, so a paged
     expert stages by memcpy instead of rebuilding it (see `cpu.pair_bytes`)."""
     d = _dims(**kw)
+    fold = bool(kw.get("fold", True))
+    if not fold:
+        d["hadamard_block"] = 0          # an unfolded pack records no block size, as `kindi convert` writes it
     nexp, nact = int(kw.get("experts", 0)), int(kw.get("experts_active", 2))
     rng = np.random.RandomState(seed)
     D, NL, NFF = d["width"], d["layers"], d["ffn"]
@@ -46,7 +49,11 @@ def build(out_dir, seed=7, log=print, **kw):
     NV = d["gdn_inner"] // HK
     CC = 2 * NK * HK + NV * HK
     vocab = kw.get("vocab", 128)
-    interval = d["full_attention_interval"]
+    # `dense=True`: every layer full attention, which is the layout `kindi convert` writes for a dense Qwen3 file.
+    # (`attn_q.weight` is NH*HD rows either way, so the host reads the per-head stride off the matrix: HD here, and
+    # 2*HD only for a real qwen35 pack, whose q carries a fused per-head gate.)
+    interval = 1 if kw.get("dense") else d["full_attention_interval"]
+    d["full_attention_interval"] = interval      # the manifest and the tensor walk must agree on which layers attend
     tern, flt = {}, {}
 
     def w(rows, cols, scale=0.35):
@@ -94,30 +101,38 @@ def build(out_dir, seed=7, log=print, **kw):
     quantised = {}
     index = {"tensors": {}, "base": 0, "hadamard": {}}
     bindex = {"tensors": {}}
-    bc_off = dpm_off = f32_off = 0
+    bc_off = dpm_off = dblk = dtab_off = f32_off = 0
     want_pc = bool(kw.get("paircodes"))
     pc_off = n_pc = 0
     with open(os.path.join(out_dir, "bcodes.bin"), "wb") as fb, \
-            open(os.path.join(out_dir, "dpm.bin"), "wb") as fd, open(os.path.join(out_dir, "f32.bin"), "wb") as ff, \
+            open(os.path.join(out_dir, "dpm.bin"), "wb") as fd, \
+            open(os.path.join(out_dir, "dscale.bin"), "wb") as ft, open(os.path.join(out_dir, "f32.bin"), "wb") as ff, \
             (open(os.path.join(out_dir, "pcodes.bin"), "wb") if want_pc else contextlib.nullcontext()) as fp:
         for name in sorted(tern):
             a, rows = quant._pad8(np.ascontiguousarray(tern[name], dtype=np.float32))
             codes, sc, deq = quant.quantise(a, 128)
             quantised[name] = deq[:tern[name].shape[0], :tern[name].shape[1]]
             fb.write(codes.tobytes())
-            fd.write(np.ascontiguousarray(sc.view(np.uint16)).tobytes())
+            table, sidx, _exact = packio.encode(sc)          # the 8-bit form `kindi convert` writes
+            sc_q = packio.decode(table, sidx)
+            fd.write(sidx.tobytes())
+            ft.write(table.tobytes())
             index["tensors"][name] = {"dims": list(tern[name].shape), "type": quant.PTQ1_0, "folded": False,
-                                      "rows": rows, "ne0": a.shape[1], "bc_off": bc_off, "dpm_off": dpm_off}
-            bindex["tensors"][name] = {"bc_off": bc_off, "dpm_off": dpm_off, "rows": rows, "ne0": a.shape[1]}
+                                      "rows": rows, "ne0": a.shape[1], "bc_off": bc_off, "dblk": dblk,
+                                      "dtab_off": dtab_off, "dtab_n": int(table.size)}
+            bindex["tensors"][name] = {"bc_off": bc_off, "dblk": dblk, "dtab_off": dtab_off,
+                                       "dtab_n": int(table.size), "rows": rows, "ne0": a.shape[1]}
             if want_pc and is_expert(name):
-                Wb, Sb = pair_bytes(codes, sc, rows, a.shape[1])
+                Wb, Sb = pair_bytes(codes, sc_q, rows, a.shape[1])
                 fp.write(Wb)
                 fp.write(Sb)
                 bindex["tensors"][name]["pc_off"] = pc_off
                 pc_off += len(Wb) + len(Sb)
                 n_pc += 1
             bc_off += codes.shape[0] * rows
-            dpm_off += sc.shape[0] * rows * 2
+            dpm_off += sc.shape[0] * rows
+            dblk += sc.shape[0] * rows
+            dtab_off += 2 * int(table.size)
         for name in sorted(flt):
             a = np.ascontiguousarray(flt[name].astype(np.float32)).ravel()
             ff.write(a.tobytes())
@@ -138,9 +153,10 @@ def build(out_dir, seed=7, log=print, **kw):
         json.dump(["t%d" % i for i in range(vocab)], f)
     with open(os.path.join(out_dir, "merges.txt"), "w") as f:
         f.write("#version: 0.2\n")
-    man = {"kindi_version": __version__, "pack_format": 1, "model": "kindi-tiny-fixture", "source_file": "synth",
+    man = {"kindi_version": __version__, "pack_format": 2, "model": "kindi-tiny-fixture", "source_file": "synth",
            "source_sha256": None, "tensors": len(tern) + len(flt), "vocab": vocab, "context_length": 256,
-           "head": "output.weight", "hadamard_block": d["hadamard_block"], "synthetic": True,
+           "head": "output.weight", "hadamard_block": d["hadamard_block"], "fold": fold, "synthetic": True,
+           "rope_scaling": kw.get("rope_scaling"),
            "dimensions": dict({k: d[k] for k in ("layers", "width", "ffn", "heads", "kv_heads", "groups",
                                                  "head_dim", "rope_dim", "state_size", "gdn_inner", "rope_base",
                                                  "full_attention_interval")},
@@ -164,8 +180,15 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--experts", type=int, default=0, help="make the FFN a Mixture of experts with this many experts")
     p.add_argument("--active", type=int, default=2, help="experts per token (default 2)")
+    p.add_argument("--vocab", type=int, default=0, help="tokens in the vocabulary (default 128; need not be a multiple of 8)")
+    p.add_argument("--dense", action="store_true", help="every layer full attention (a dense Qwen3 file's shape)")
+    p.add_argument("--no-fold", dest="fold", action="store_false", help="unrotated weights: the engine must not fold")
     a = p.parse_args()
-    kw = {k: getattr(a, k) for k in ("layers", "width", "ffn") if getattr(a, k)}
+    kw = {k: getattr(a, k) for k in ("layers", "width", "ffn", "vocab") if getattr(a, k)}
+    if a.dense:
+        kw["dense"] = True
+    if not a.fold:
+        kw["fold"] = False
     if a.experts:
         kw.update(experts=a.experts, experts_active=a.active)
     build(a.out, seed=a.seed, log=print, **kw)

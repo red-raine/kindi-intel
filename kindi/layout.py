@@ -10,6 +10,8 @@ reorder_head(): optional, for the fast head: the head/embedding rows in cluster 
   16-row groups (padding rows: zero weights, token id -1)."""
 import numpy as np
 
+from . import packio
+
 
 def _base_row(lane):
     return (lane & 1) * 8 + ((lane >> 1) & 1) * 4 + ((lane >> 2) & 1) * 2
@@ -34,7 +36,7 @@ def repack(bi, bc, dp):
     done = {}
     for name, rec in bi.items():
         R, C = rec["rows"], rec["ne0"]
-        o, d = rec["bc_off"], rec["dpm_off"] // 2
+        o, d = rec["bc_off"], packio.block_of(rec)
         if R % 16 or C % 512 or o % 16 or d % 2:
             raise ValueError("tensor %s (%d x %d) does not fit the GEMV layout" % (name, R, C))
         ns, P = C // 4, C // 128
@@ -57,7 +59,7 @@ def reorder_head(bi, bc, dp, clusters, name="token_embd.weight"):
     rec = bi[name]
     R, C = rec["rows"], rec["ne0"]
     ns, P = C // 4, C // 128
-    o, d = rec["bc_off"], rec["dpm_off"] // 2
+    o, d = rec["bc_off"], packio.block_of(rec)
     if len(assign) != R or cent.shape[1] != C:
         raise ValueError("cluster file does not match this pack")
     K = cent.shape[0]
@@ -83,7 +85,10 @@ def reorder_head(bi, bc, dp, clusters, name="token_embd.weight"):
     for other, r in bi.items():
         if other != name and r["bc_off"] > o:
             r["bc_off"] += dbc
-            r["dpm_off"] += ddp * 2
+            if "dblk" in r:                     # a v2 record: offsets in blocks, one byte a block on disk
+                r["dblk"] += ddp
+            else:
+                r["dpm_off"] += ddp * 2
     rec["rows"] = Rp
     meta = {"R": R, "Rp": Rp, "K": K, "cent": cent, "permtok": permtok, "permpos": permpos,
             "gstart": (starts // 16).astype(np.int32), "gcount": (padded // 16).astype(np.int32)}

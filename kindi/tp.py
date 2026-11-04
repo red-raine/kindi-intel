@@ -22,13 +22,16 @@ import os
 import time
 
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:               # a CPU-only host: the two-card engine has no CPU path
+    cp = None
 
 from . import hostram
-from . import layout
+from . import layout, packio, rope
 from .engine import Kernels, DEFAULT_DIMS, VOCAB
 
-rt = cp.cuda.runtime
+rt = cp.cuda.runtime if cp is not None else None
 i32, f32t = np.int32, np.float32
 
 
@@ -311,7 +314,7 @@ class Shard(object):
             R, C = rec["rows"], rec["ne0"]
             ns, P = C // 4, C // 128
             B = tp.bcm[rec["bc_off"]:rec["bc_off"] + ns * R].reshape(ns, R)
-            S = tp.dpm[rec["dpm_off"] // 2:rec["dpm_off"] // 2 + P * R].reshape(P, R)
+            S = tp.dpm[packio.block_of(rec):packio.block_of(rec) + P * R].reshape(P, R)
             if rows is not None:
                 B, S = B[:, rows], S[:, rows]
             if cols is not None:
@@ -465,9 +468,12 @@ class Shard(object):
         with cp.cuda.Device(self.card):
             self.sbuf = z(self.NH * ctx)
             self.apart = z(((ctx + 255) // 256) * self.NH * self.HD)
-            th = np.arange(ctx, dtype=np.float64)[:, None] * self.tp.inv_freq[None, :]
-            self.cos_t = cp.asarray(np.cos(th).astype(np.float32))
-            self.sin_t = cp.asarray(np.sin(th).astype(np.float32))
+            # the same table the single-card engine builds, including any rope scaling the manifest records: a plan
+            # engine that built its own plain table would serve a different model from the pack it loaded
+            cos, sin = rope.tables(ctx, self.tp.dims["rope_dim"], self.tp.dims["rope_base"],
+                                   self.tp.man.get("rope_scaling"))
+            self.cos_t = cp.asarray(cos)
+            self.sin_t = cp.asarray(sin)
             # one allocation per array kind, a view per layer: 64 separate arrays each lose up to a 2 MiB page to
             # rounding, which the context fit does not see
             def kv(dt, last):
@@ -690,7 +696,7 @@ class TPEngine(object):
         self.NKg, self.HK = self.dims["groups"], self.dims["state_size"]
         self.NVg = self.dims["gdn_inner"] // self.HK
         self.NFFg = self.dims["ffn"]
-        self.inv_freq = np.float64(self.dims["rope_base"]) ** (-2.0 * np.arange(self.dims["rope_dim"] // 2) / self.dims["rope_dim"])
+        # no inv_freq here: the table comes from `rope.tables` (kindi.rope), which owns the base and the scaling
         if self.W == 1:
             self.ffn_rows, self.ffn_cols, self.head_split = [(0, self.NFFg)], [(0, self.NFFg)], [0, VOCAB]
         else:
@@ -708,7 +714,7 @@ class TPEngine(object):
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
         self.bcm = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
-        self.dpm = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.uint16, mode="r")
+        self.dpm = np.ascontiguousarray(packio.load_scales(pack)).view(np.uint16)   # fp16 bits, one a block
         self.flm = np.memmap(os.path.join(pack, "f32.bin"), dtype=np.float32, mode="r")
         self.signs = {w: np.fromfile(os.path.join(pack, "signs_%d.f32" % w), dtype=np.float32)
                       for w in (self.D, self.NVg * self.HK, self.NHg * self.HD, self.NFFg)}
@@ -756,8 +762,8 @@ class TPEngine(object):
         R, C = rec["rows"], rec["ne0"]
         ns, P = C // 4, C // 128
         bc = np.array(self.bcm[rec["bc_off"]:rec["bc_off"] + ns * R])
-        dp = np.array(self.dpm[rec["dpm_off"] // 2:rec["dpm_off"] // 2 + P * R])
-        layout.repack({"e": {"bc_off": 0, "dpm_off": 0, "rows": R, "ne0": C}}, bc, dp)
+        dp = np.array(self.dpm[packio.block_of(rec):packio.block_of(rec) + P * R])
+        layout.repack({"e": {"bc_off": 0, "dblk": 0, "rows": R, "ne0": C}}, bc, dp)
         flags = rt.hostAllocMapped | rt.hostAllocPortable
         self.emem_b = cp.cuda.PinnedMemory(bc.nbytes, flags=flags)
         self.emem_d = cp.cuda.PinnedMemory(dp.nbytes, flags=flags)

@@ -40,7 +40,7 @@ def _cupy_arch_fix():
 if cp is not None:
     _cupy_arch_fix()
 
-from . import layout
+from . import layout, packio, rope
 
 VOCAB = 248320
 DEFAULT_DIMS = {"layers": 24, "width": 2048, "ffn": 6144, "heads": 8, "kv_heads": 2,
@@ -90,8 +90,9 @@ class Engine(object):
         self.log = log
         self.ctx = int(ctx)
         man = json.load(open(os.path.join(pack, "kindi_pack.json")))
-        if man.get("pack_format") != 1:
+        if int(man.get("pack_format") or 0) not in (1, 2):
             raise SystemExit("kindi: pack format %r is not supported - re-run kindi convert" % man.get("pack_format"))
+        self.man = man                                               # kept for the rope scaling below
         self.dims = dict(DEFAULT_DIMS, **man.get("dimensions", {}))
         self.HB = int(man.get("hadamard_block", 512))          # Hadamard block of the folded inputs (2B/4B 512, 9B 4096)
         self.head_name = man.get("head", "token_embd.weight")   # the tied embedding, or a separate output.weight
@@ -103,7 +104,9 @@ class Engine(object):
         self.NATT = self.NL // self.dims["full_attention_interval"]
         if self.NV % self.NK or self.NH != self.NHKV * 4:
             raise SystemExit("kindi: unsupported grouped head dimensions")
-        self.inv_freq = np.float64(self.dims["rope_base"]) ** (-2.0 * np.arange(self.dims["rope_dim"] // 2) / self.dims["rope_dim"])
+        # no inv_freq here: `rope.tables` (kindi.rope) owns the base and any scaling the file asks for, and this
+        # engine builds its table from that below. A second, unscaled copy of the frequencies is how the retired
+        # files came to be served with plain RoPE.
         self.k = Kernels()
         self._f32 = {}
         self.split_groups = int(os.environ.get("KINDI_SPLIT_GROUPS", "128"))   # column-split a single GEMV below this many 16-row groups per SM
@@ -119,7 +122,7 @@ class Engine(object):
         self.idx = json.load(open(os.path.join(pack, "index.json")))
         self.bi = json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
         bc = np.fromfile(os.path.join(pack, "bcodes.bin"), dtype=np.uint8)
-        dp = np.fromfile(os.path.join(pack, "dpm.bin"), dtype=np.uint16)
+        dp = np.ascontiguousarray(packio.load_scales(pack, man)).view(np.uint16)   # fp16 bits: what the GPU reads
         self.hsl = None
         self.hs_force = None
         if clusters is not None:
@@ -135,7 +138,7 @@ class Engine(object):
         dims = layout.repack(self.bi, bc, dp)
         self.bc, self.dp = cp.asarray(bc), cp.asarray(dp)
         del bc, dp
-        self.w = {n: (self.bc[self.bi[n]["bc_off"]:], self.dp[self.bi[n]["dpm_off"] // 2:], np.int32(R), np.int32(C))
+        self.w = {n: (self.bc[self.bi[n]["bc_off"]:], self.dp[packio.block_of(self.bi[n]):], np.int32(R), np.int32(C))
                   for n, (R, C) in dims.items()}
         self.fl = cp.asarray(np.fromfile(os.path.join(pack, "f32.bin"), dtype=np.float32))
         # Hadamard sign vectors, one per folded input width: D (norm outputs), NV*HK (GDN output), NH*HD (attention
@@ -176,9 +179,10 @@ class Engine(object):
         self.sbuf = z(self.NH * self.ctx)
         self.apart = z(((self.ctx + 255) // 256) * self.NH * self.HD)   # attention partials: NH x HD per 256-position chunk
         self.aout = cp.zeros(1, dtype=cp.int32)
-        th = np.arange(self.ctx, dtype=np.float64)[:, None] * self.inv_freq[None, :]
-        self.cos_t = cp.asarray(np.cos(th).astype(np.float32))
-        self.sin_t = cp.asarray(np.sin(th).astype(np.float32))
+        # the same table the CPU engine builds, including any rope scaling the pack's manifest records (`kindi.rope`)
+        cos, sin = rope.tables(self.ctx, self.dims["rope_dim"], self.dims["rope_base"], self.man.get("rope_scaling"))
+        self.cos_t = cp.asarray(cos)
+        self.sin_t = cp.asarray(sin)
         # recurrent (GDN) state for the 18 GDN layers; fp16 K/V cache for the 6 attention layers
         interval = self.dims["full_attention_interval"]
         self.M = [cp.zeros((self.NV, self.HK, self.HK) if (il + 1) % interval else (1,), dtype=cp.float32)
