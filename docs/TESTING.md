@@ -3,7 +3,7 @@
 One command runs everything this repository checks:
 
 ```bash
-python -m tools.selftest            # 18 ok, 6 skipped, 0 failed, ~85 s
+python -m tools.selftest            # 0 failed is the pass; the exit status is the answer
 python -m tools.selftest --verbose  # per-check timing, and every skip with its reason
 ```
 
@@ -15,7 +15,7 @@ CPU-only host, which is the case it most needs to cover.
 
 | check | asserts | size |
 |---|---|---|
-| `imports` | every module under `kindi/` and `tools/` imports | 38 modules |
+| `imports` | every module under `kindi/` and `tools/` imports on a host with no `cupy`: the CUDA modules guard the import like the rest of the package, so an unguarded one is a failure, not a skip | 51 modules |
 | `kindi.quant.selftest` | ternary quantisation and the pack's code/decode round trip | engine |
 | `kindi.convert.selftest` | the converter's tensor walk and layout | engine |
 | `suite:astvalid` | three-valued validity over the labelled sample, confidence accounting | 31 checks |
@@ -47,16 +47,17 @@ measurement page that points at a file that moved, is a real regression that no 
 
 ## Skips are declared, not silent
 
-`--verbose` prints them. `kindi.spec`, `kindi.tp`, `kindi.chunk`, `kindi.chunk1` and `kindi.tc` import `cupy`
-unconditionally; they are the CUDA execution path and are reported as skipped on a CPU-only host rather than as passes.
-The rest of the package guards the import (`try: import cupy / except ImportError: the CPU engine`), which is why the CLI
-works without a GPU. `tools.bitnet_gemm.stream_probe` is skipped because it writes about a gigabyte to disk per run; run
-it directly when you are measuring paging.
+`--verbose` prints them, and there is one: `tools.bitnet_gemm.stream_probe` is skipped because it writes about a gigabyte
+to disk per run; run it directly when you are measuring paging. Nothing is skipped for want of a GPU - every module in
+the tree, including the CUDA execution path (`kindi.spec`, `kindi.tp`, `kindi.chunk`, `kindi.chunk1`, `kindi.tc`),
+guards its import the same way (`try: import cupy / except ImportError: cp = None`), so it loads on a CPU-only host and
+is counted as imported. A module that imports `cupy` unguarded fails this check here, on the host the gate actually runs
+on, rather than passing on a GPU machine and breaking for everyone else.
 
 ## What this does not cover
 
-* **The GPU path.** Nothing here executes CUDA kernels. The five `cupy` modules are imported nowhere on a CPU host, so
-  their correctness is exactly as unverified after the gate as before it.
+* **The GPU path.** Nothing here executes CUDA kernels. The five `cupy` modules are imported and no further, so the gate
+  says their import-time surface loads without a card, which is not the same as their arithmetic being right.
 * **Model quality.** Every check is structural or arithmetic - packing, routing, layout, link targets. None of them says
   whether output text got better or worse. The agent benchmark in the README is the tool for that, and it needs a model.
 * **Long-context and paging behaviour.** Covered by `tools/bitnet_gemm/prefetch_budget.py` as a model, not as a

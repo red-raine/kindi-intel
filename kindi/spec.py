@@ -30,7 +30,10 @@ import re
 import time
 
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:               # a CPU-only host: the tensor-core and speculative paths are CUDA
+    cp = None
 
 from . import tp as _tp
 from . import chunk as _chunk
@@ -235,7 +238,7 @@ class Replay(object):
                 raise RuntimeError("kindi: a plan launch failed")
 
 
-if cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_GRAPHS", "0") != "1":
+if cp is not None and cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_GRAPHS", "0") != "1":
     Graph = Replay
 
 

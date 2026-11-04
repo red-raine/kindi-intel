@@ -10,15 +10,16 @@ their exit codes into a single answer, so "it still works" is a command rather t
 Three of the checks are new, because nothing covered them:
 
   * **imports** - import every module under `kindi/` and `tools/`. A module that cannot be imported is broken even if no
-    test touches it. Modules that need `cupy` are reported as skipped with that reason: they are the CUDA execution path
-    and this branch runs on a CPU-only host, where requiring a GPU to parse a config would be the bug.
+    test touches it, and on a CPU-only host that includes every module that touches the CUDA path: the package guards
+    the import (`try: import cupy / except ImportError: cp = None`), so one that does not is the bug this check exists
+    to catch. Every module that loads is counted, which is how a silently empty loop would show up here.
   * **docs** - every relative Markdown link in `README.md` and `docs/` must resolve. Measurement pages are worthless if
     their links rot.
   * **cli** - `python -m kindi --version` and `info` must run end to end on a host with no pack and no GPU.
 
 Not covered, stated rather than implied: no check exercises the GPU execution path (`spec`, `tp`, `chunk`, `chunk1`,
-`tc` are imported only where `cupy` exists), the streaming probe is skipped because it writes hundreds of megabytes,
-and nothing here tests model quality - these are structural and arithmetic regressions only.
+`tc` are imported and nothing more), the streaming probe is skipped because it writes hundreds of megabytes, and
+nothing here tests model quality - these are structural and arithmetic regressions only.
 """
 import importlib
 import os
@@ -31,7 +32,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-GPU_ONLY = "needs cupy (CUDA execution path; skipped on a CPU-only host)"
+CUPY_HINT = "  (the package guards this: try/except ImportError -> cp = None, as kindi.engine does)"
 
 
 class Result(object):
@@ -57,14 +58,12 @@ def check_imports():
                 continue
             try:
                 importlib.import_module(name)
-            except ImportError as e:
-                missing = getattr(e, "name", "") or ""
-                if "cupy" in str(e) or "cupy" in missing:
-                    results.append(Result(name, "skip", GPU_ONLY))
-                else:
-                    results.append(Result(name, "FAIL", "%s: %s" % (type(e).__name__, e)))
             except Exception as e:
-                results.append(Result(name, "FAIL", "%s: %s" % (type(e).__name__, e)))
+                missing = getattr(e, "name", "") or ""
+                hint = CUPY_HINT if ("cupy" in str(e) or "cupy" in missing) else ""
+                results.append(Result(name, "FAIL", "%s: %s%s" % (type(e).__name__, e, hint)))
+            else:
+                results.append(Result(name, "ok", "imported"))
     return results
 
 
@@ -97,8 +96,10 @@ SUITES = [
     ("suite:rope", [sys.executable, "-m", "kindi.rope"], "checks passed"),
     ("suite:kvq", [sys.executable, "-m", "tools.kvq.measure", "--selftest"], "checks passed"),
     ("suite:nll", [sys.executable, "-m", "tools.nll", "--selftest"], "checks passed"),
+    ("suite:kl", [sys.executable, "-m", "tools.kl", "--selftest"], "checks passed"),
     ("suite:vlut", [sys.executable, "-m", "tools.vlut.measure", "--selftest"], "checks passed"),
     ("suite:kvq_capture", [sys.executable, "-m", "tools.kvq.capture", "--selftest"], "checks passed"),
+    ("suite:kvq_sweep", [sys.executable, "-m", "tools.kvq.sweep", "--selftest"], "checks passed"),
 ]
 
 

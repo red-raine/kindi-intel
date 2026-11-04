@@ -18,7 +18,10 @@ import os
 import re
 
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:               # a CPU-only host: the chunk GEMM is a CUDA path
+    cp = None
 
 from . import tp as _tp
 

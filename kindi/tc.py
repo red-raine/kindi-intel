@@ -7,8 +7,11 @@ JIT (any driver new enough for the card) compiles that PTX. The cubin lands in t
 import os
 import re
 
-import cupy as cp
-from cupy.cuda import compiler, function
+try:
+    import cupy as cp
+    from cupy.cuda import compiler, function
+except ImportError:               # a CPU-only host: tensor-core products need a CUDA card
+    cp, compiler, function = None, None, None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAMES = ("k_tc_pack", "k_tc_q8", "k_tc_mv2", "k_tc_mv4", "k_tc_mv8", "k_tc_sum", "k_tc_mm4", "k_tc_mm8", "k_tc_mm16",

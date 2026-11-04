@@ -398,13 +398,13 @@ One command runs every check in this repository - module imports, the quantiser 
 suites, the CLI, and the links in these documents:
 
 ```bash
-python -m tools.selftest            # 18 ok, 6 skipped, 0 failed, ~85 s
+python -m tools.selftest            # 0 failed is the pass; the exit status is the answer
 python -m tools.selftest --verbose  # timings, and every skip with its reason
 ```
 
-The exit status is the answer. It needs no GPU, no network and no pytest. [docs/TESTING.md](docs/TESTING.md) lists what
-each check asserts, which modules are skipped and why (the five that import `cupy` unconditionally), and what the gate
-does not cover.
+The exit status is the answer. It needs no GPU, no network and no pytest - every module in the tree, the `cupy` ones
+included, imports on a host with no `cupy` installed. [docs/TESTING.md](docs/TESTING.md) lists what each check asserts,
+what is skipped and why, and what the gate does not cover.
 
 ## Limits
 
