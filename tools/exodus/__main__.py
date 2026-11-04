@@ -1,6 +1,6 @@
 """Exodus-Ternera: the parts of the specification that can be executed, and what executing them found.
 
-    python -m tools.exodus               # all three modules, 36 checks
+    python -m tools.exodus               # all three modules, 37 checks
     python -m tools.exodus.rotate        # the rotation stage
     python -m tools.exodus.router        # routing, halting, distillation loss
     python -m tools.exodus.heads         # attention-head slicing

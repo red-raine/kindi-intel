@@ -14,7 +14,8 @@ argued:
 
 `LoopedMoEBlock` runs the same parameters several times with a damped residual, and can dispatch either the note's way
 (mask and multiply over every expert) or the sparse way (`index_add_`), so the cost difference is measurable rather
-than claimed.
+than claimed. `forward(x, halt=...)` takes a `[B, loops]` per-sequence halt mask (`tools.exodus.router.halt_mask`): a
+halted row stops being routed and stops costing work, and its state is the one a shorter loop would have produced.
 """
 import torch
 import torch.nn as nn
@@ -120,6 +121,8 @@ class LoopedMoEBlock(nn.Module):
         self.calls = 0                       # expert forwards, to make the dispatch difference countable
         self.rows = 0                        # token-rows an expert actually multiplied: the work, not the calls
         self.seen_width = None               # the width an expert was actually given
+        self.active_rows = 0                 # row-loop units computed: what halting is supposed to reduce
+        self.loops_run = 0                   # loops with at least one live row
 
     def _expert(self, e, h):
         self.calls += 1
@@ -173,17 +176,39 @@ class LoopedMoEBlock(nn.Module):
             parts.append(acc.reshape(x.shape))
         return torch.cat(parts, dim=-1)
 
-    def forward(self, x, collect_norms=False):
+    def forward(self, x, collect_norms=False, halt=None):
+        """One pass over the looped block; `halt` is the per-sequence mask that ends a row's loop early.
+
+        `halt` is `[B, loops]` of booleans, cumulative along the loop axis, exactly as
+        `tools.exodus.router.halt_mask` builds it: `halt[b, l]` means row b is already finished and must not run loop l.
+        A halted row is dropped from the norm, the router and the experts, so it costs nothing from then on, and its
+        residual state stays where it was - which is the same value a shorter loop would have produced, since nothing
+        later reads a halted row. That equality is the property the measurement checks; `halting` does not change any
+        live row's arithmetic, because every operation here is row-wise.
+
+        `halt=None` runs every row for every loop, which is what every earlier caller did.
+        """
         h = x
         norms = []
-        for _ in range(self.loops):
-            normed = self.norm(h)
+        self.active_rows = 0
+        self.loops_run = 0
+        for loop in range(self.loops):
+            live = None if halt is None else ~halt[:, loop]
+            if live is not None and not bool(live.any()):
+                break
+            self.loops_run += 1
+            rows = h if live is None else h[live]
+            self.active_rows += int(rows.shape[0])
+            normed = self.norm(rows)
             if self.router_kind == "avg":
                 w, i = self.router(normed)
                 out = self._dispatch_avg(normed, w, i)
             else:
                 out = self._dispatch_split(normed, self.router(normed))
-            h = h + self.alpha * out
+            if live is None:
+                h = h + self.alpha * out
+            else:
+                h = h.index_add(0, live.nonzero(as_tuple=True)[0], self.alpha * out)
             if collect_norms:
                 norms.append(float(h.norm()) / max(1e-9, float(x.shape[-1]) ** 0.5))
         return (h, norms) if collect_norms else h
