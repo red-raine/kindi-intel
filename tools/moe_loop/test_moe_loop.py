@@ -127,6 +127,46 @@ def test_logit_average_flattens():
         "averaging the logits did not flatten the routing weights: %.3f vs %.3f" % (halved, summed)
 
 
+def test_halt_mask_ends_rows_at_their_own_depth():
+    """A per-sequence mask must stop each row after its own loop count, and leave what it computed alone."""
+    b = _block(d=16, loops=6)
+    torch.manual_seed(3)
+    x = torch.randn(8, 16)
+    depth = [1, 1, 2, 2, 3, 3, 6, 6]                       # 6 is "needs every loop", so never halted
+    halt = torch.zeros(8, 6, dtype=torch.bool)
+    for i, r in enumerate(depth):
+        halt[i, r:] = True
+    with torch.no_grad():
+        y = b(x, halt=halt)
+        active = b.active_rows
+        ref = torch.zeros_like(x)                           # what each row must equal: loops = its own depth
+        saved = b.loops
+        for r in sorted(set(depth)):
+            idx = [i for i, d in enumerate(depth) if d == r]
+            b.loops = r
+            ref[idx] = b(x[idx])
+        b.loops = saved
+    assert active == sum(depth), \
+        "the mask did not skip the halted rows' remaining loops: %d row-loops, expected %d" % (active, sum(depth))
+    err = float((y - ref).abs().max())
+    assert err < 1e-5, "a halted row is not the state a shorter loop gives: max |diff| %.2e" % err
+    print("     measured, not asserted: %d row-loops against %d unhalted (%.0f%% less work)"
+          % (active, 8 * b.loops, 100 * (1 - active / float(8 * b.loops))))
+
+
+def test_no_mask_is_bit_identical():
+    """`halt=None` and an all-False mask are the same computation, so nothing above changed the default path."""
+    b1, b2 = _block(d=16, loops=4), _block(d=16, loops=4)
+    torch.manual_seed(4)
+    x = torch.randn(5, 16)
+    with torch.no_grad():
+        a = b1(x)
+        c = b2(x, halt=torch.zeros(5, 4, dtype=torch.bool))
+    assert torch.equal(a, c) and b1.active_rows == b2.active_rows == 20, \
+        "an empty mask changed the output or the work: max |diff| %.2e, rows %d vs %d" \
+        % (float((a - c).abs().max()), b1.active_rows, b2.active_rows)
+
+
 def main():
     check("ternary weight is three values, with a gradient", test_ternary)
     check("damping reduces per-loop growth, RMSNorm alone does not", test_loop_growth)
@@ -134,6 +174,8 @@ def main():
     check("the split router gives an expert half the state", test_split_router_sees_a_subvector)
     check("the mask dispatch does 8x the expert arithmetic", test_dispatch_work)
     check("averaging logits flattens the top-k weights", test_logit_average_flattens)
+    check("a per-sequence halt mask ends each row at its own depth", test_halt_mask_ends_rows_at_their_own_depth)
+    check("no mask and an empty mask are the same computation", test_no_mask_is_bit_identical)
     print("\n%d checks passed" % len(PASS))
     return 0
 

@@ -13,7 +13,8 @@ Three claims, three measurements:
 
 2. **Per-sequence halting decided by a batch mean is not per-sequence.** `torch.sigmoid(gate).mean() > 0.85` averages over
    the batch, so one confident sequence cannot halt on its own and one unconfident sequence can halt the rest. Test
-   `halting` measures both rules on the same gates.
+   `halting` measures both rules on the same gates, and the rule that ships is now `halt_mask` - a per-row, sticky
+   mask - which `LoopedMoEBlock` applies by dropping halted rows from the router and the experts.
 
 3. **`batchmean` on a 3-D tensor divides by the batch, not by the tokens.** `F.kl_div(..., reduction="batchmean")` divides
    by `input.size(0)`, so on `[B, S, C]` the value is `S` times the per-token mean and any threshold quoted against it
@@ -59,13 +60,31 @@ def loop_gain(weight_sum, max_loops):
 # --- halting ---------------------------------------------------------------------------------------------------------
 
 def halts_batch_mean(gates, threshold=0.85):
-    """`torch.sigmoid(self.halt_gate(h)).mean() > 0.85` - one decision for the whole batch, per loop."""
+    """The rule this replaces, kept only as the comparison arm.
+
+    `torch.sigmoid(self.halt_gate(h)).mean() > 0.85` - one decision for the whole batch, per loop. It is not the halt
+    rule any more (`halt_mask` is), and it is still here because the measurement has to have something to be better
+    than: `tools.moe_loop.halt` runs both rules on the same gates and reports what each costs.
+    """
     return bool(torch.sigmoid(torch.as_tensor(gates, dtype=torch.float64)).mean() > threshold)
 
 
-def halts_per_sequence(gates, threshold=0.85):
-    """What a per-sequence halt flag has to look like: one decision per row."""
-    return (torch.sigmoid(torch.as_tensor(gates, dtype=torch.float64)) > threshold).numpy()
+def halt_mask(gates, halted=None, threshold=0.85):
+    """Per-sequence halt mask: True where a row is done, **cumulative**, so it never becomes False again.
+
+    `gates` is one loop's halt logits per row ([B]) or every loop's at once ([B, L]); `halted` is the mask carried
+    in from earlier loops. The return has the same shape as `gates` and is sticky along the loop axis - a row that
+    fires at loop 3 stays halted at loops 4-7, which is the whole difference from the batch mean: the flag belongs
+    to a row, so `LoopedMoEBlock` can drop that row from the router and the experts instead of the batch's average
+    deciding for it.
+    """
+    fired = torch.sigmoid(torch.as_tensor(gates, dtype=torch.float64)) > threshold
+    if halted is not None:
+        carried = torch.as_tensor(halted, dtype=torch.bool)
+        fired = fired | (carried.unsqueeze(1) if fired.dim() == 2 and carried.dim() == 1 else carried)
+    if fired.dim() == 2:
+        fired = torch.cummax(fired.to(torch.int8), dim=1).values.to(torch.bool)
+    return fired
 
 
 # --- distillation loss ------------------------------------------------------------------------------------------------
@@ -120,22 +139,33 @@ def t_renormalisation():
 
 def t_halting():
     gates = np.array([3.0, -0.5, -1.0, 0.2])                 # sigmoid -> 0.953, 0.378, 0.269, 0.550
-    per = halts_per_sequence(gates)
+    per = halt_mask(gates).numpy()
     batch = halts_batch_mean(gates)
-    check("halting: the confident sequence wants to halt on its own", bool(per[0]),
-          "per-sequence %s" % per.astype(int).tolist())
-    check("halting: the batch mean overrides it", batch is False,
-          "batch mean sigmoid %.3f < 0.85, so nothing halts" % float(np.mean(1 / (1 + np.exp(-gates)))))
+    check("halting: the confident sequence halts on its own, the batch mean overrides it",
+          bool(per[0]) and int(per.sum()) == 1 and batch is False,
+          "per-sequence %s, batch mean sigmoid %.3f < 0.85 so nothing halts"
+          % (per.astype(int).tolist(), float(np.mean(1 / (1 + np.exp(-gates))))))
     three = np.array([9.0, 9.0, 9.0, -3.0])                 # three rows certain, one not
-    per3 = halts_per_sequence(three)
+    per3 = halt_mask(three).numpy()
     mean3 = float(np.mean(1 / (1 + np.exp(-three))))
     check("halting: three confident rows out of four still do not halt the batch", halts_batch_mean(three) is False,
           "per-sequence %s, mean sigmoid %.3f < 0.85" % (per3.astype(int).tolist(), mean3))
     many = np.array([9.0] * 58 + [-3.0] * 6)                 # 90% confident, at realistic batch size
-    per6 = halts_per_sequence(many)
+    per6 = halt_mask(many).numpy()
     check("halting: at batch 64 the mean fires, stopping the rows that were not done", halts_batch_mean(many) is True,
-          "per-sequence halts %d of 64, mean sigmoid %.3f > 0.85" % (int(per6.sum()),
-                                                                    float(np.mean(1 / (1 + np.exp(-many))))))
+          "per-sequence halts %d of 64, so the batch rule drops %d rows that still had work"
+          % (int(per6.sum()), int((~per6).sum())))
+    # the mask's two properties the block depends on: it is sticky, and it is per loop
+    sticky = halt_mask(np.array([9.0, -9.0]), halted=np.array([False, True])).numpy()
+    check("halting: the mask is sticky, a halted row never restarts", sticky.tolist() == [True, True],
+          "a row halted at an earlier loop stays halted after its gate falls to -9")
+    loops = np.array([[9.0, 9.0, 9.0, 9.0],
+                      [-9.0, 6.0, -9.0, -9.0],
+                      [-9.0, -9.0, -9.0, 6.0]])            # rows halt at loops 0, 1, 3
+    mask = halt_mask(loops).numpy()
+    check("halting: [B, L] gates give a per-loop cumulative mask", mask.tolist() ==
+          [[True, True, True, True], [False, True, True, True], [False, False, False, True]],
+          "each row halts at its own loop and stays halted: %s" % mask.astype(int).tolist())
 
 
 def t_loss_scale():
@@ -159,7 +189,7 @@ def selftest():
     del PASS[:]
     for t in (t_renormalisation, t_halting, t_loss_scale):
         t()
-    expected = 10
+    expected = 11
     ok = len(PASS) == expected
     print("\n%d checks passed%s" % (len(PASS), "" if ok else " of %d - a check did not run" % expected))
     return 0 if ok else 1

@@ -5,8 +5,9 @@ activations, straight-through estimators), a two-head router over halves of the 
 loop. Each piece exists in two versions - the note's and a corrected one - so the difference is a number instead of an
 argument.
 
-    python -m tools.moe_loop.test_moe_loop     # 6 checks, CPU only
+    python -m tools.moe_loop.test_moe_loop     # 8 checks, CPU only
     python -m tools.moe_loop.probe             # the same quantities printed, plus the drift curve
+    python -m tools.moe_loop.halt              # per-sequence halting, against the batch mean
 
 Nothing here trains anything, and nothing imports it. The engine's serving-side MoE is `kindi/moe.py` (one router,
 renormalised top-k, Hadamard fold, verified against NumPy at 1e-7 by `kindi moe-check`); this is the training-side
@@ -54,6 +55,43 @@ relative error at eight loops is already beyond what a float teacher would toler
    (`softmax_topk` in [kindi/moe.py](../../kindi/moe.py)), the note's does not, so the block's output shrinks as `k` grows.
 6. **Odd `d_model` breaks the router.** `x.chunk(2, dim=-1)` returns `d//2` and `d//2 + 1` for odd `d`, while both
    heads were built for `d//2`.
+
+## Halting per sequence: what the mask is worth
+
+The specification's halt rule is `sigmoid(halt_gate(h)).mean() > 0.85` - one flag for the batch. It is replaced by
+`tools.exodus.router.halt_mask`, a sticky flag per row, and `LoopedMoEBlock.forward(x, halt=...)` drops a halted row from
+the norm, the router and the experts. The gates in [halt.py](halt.py) are synthetic - each row is given the depth at
+which its own gate would say it is done, because a trained gate decides *which* rows halt, not whether halting them
+individually beats halting them together.
+
+8 loops, d_model 32, 8 experts, top-2, alpha 0.5, batch 64. `row-loops` is rows x loops actually computed, counted by
+the block; `expert rows` is what the experts multiplied.
+
+| halt distribution | rule | row-loops | expert rows | saved | output vs the gates |
+|---|---|---|---|---|---|
+| mixed, depth uniform 1..8 | none | 512 | 1024 | 0% | relL2 0.154 |
+| | batch mean | 448 | 896 | 12.5% | **7 rows cut, 183 row-loops past 49 finished rows** |
+| | per-sequence mask | **272** | **544** | **46.9%** | **exact** |
+| all done at 2 | both rules | 128 | 256 | 75% | exact |
+| all need 8 | both rules | 512 | 1024 | 0% | exact |
+
+The mask's saving is exact in the strong sense: a row halted at loop `r` is the state a run with `loops=r` produces on
+that row, checked row by row (`exact` in the table is below 1e-5; the selftest measures 2.3e-08 on a 16-wide block,
+which is float noise from a different matmul height). Nothing a row computed is changed - only the loops after it are not
+run.
+
+The batch mean's 12.5% is not comparable, and the table is the reason: it fires at loop 7 on this batch, so it stops seven
+rows that were still working and spends 183 row-loops on forty-nine that had already finished. When every row needs every
+loop it saves nothing; when every row finishes early it is exact and saves exactly what the mask saves. **It is only
+useless - or harmful - in the mixed batch, which is the case that exists.**
+
+**The clock does not show it, at any width.** The same mixed batch, timed at d_model 32, 128 and 512 (`halt.py` prints
+this each run): mask/none lands between **0.86x and 1.22x** with spreads of 5-44%, flips direction between two runs of
+this file, and does not improve as the arithmetic grows. A 46.9% cut in row-loops that behaves that way is not a clock
+saving: what is being timed is the eight Python dispatches of a small matmul per loop, plus the mask's own boolean
+indexing, not the experts. The row-loop count is the portable number, and it becomes time in a dispatcher that is not
+Python - which is also why `kindi`'s expert paging is callback-bound at ~0.3 ms a fetch
+([docs/CPU-PERF-2026.md](../../docs/CPU-PERF-2026.md#L405)).
 
 ## What could not be tested here
 
