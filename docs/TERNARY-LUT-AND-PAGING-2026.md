@@ -267,8 +267,9 @@ What the columns say:
   at B=1 needs the slots in **1.52 distinct matrices or fewer**. At 12 clusters a token touches 5.24 - still 3.5x over.
 - **The crossover moves from B=64 to B=8, and the number of groups is what moves it.** A batch's union cannot exceed the
   cluster count, so with 12 clusters the read per token falls as 12/B; it drops under the k/5.28 compute ratio at B=8.
-  That is arithmetic on the group count. A **random** partition of the same 12 reaches B=8 as well, which is the
-  control that matters: if the crossover were the win being claimed, clustering quality would not be needed for it.
+  That is arithmetic on the group count: `cap_break_even(12, 8) = 8`, and `cap_break_even(24, 8) = 16`, which is what
+  the 24-cluster run measured. A **random** partition of the same 12 reaches B=8 as well, which is the control that
+  matters: if the crossover were the win being claimed, clustering quality would not be needed for it.
 - **Picking the groups buys about a sixth of the bytes, not a step of batch.** Co-activation beats the random partition
   at every batch (5.24 vs 6.13 distinct at B=1; 9.57 vs 11.50 at B=8, which is 0.55 vs 0.66 GB) and never changes the
   crossover. Worth having, not worth a design.
@@ -277,12 +278,14 @@ What the columns say:
   comes true through the table fitting in memory - which is what merging experts actually delivers - not through
   streaming the merged table off disk.
 
-Caveat on the shape: the model in the proposal has 64 experts and the capture has 128, so 12-of-128 (9.4%) is a coarser
-merge than 12-of-64 (18.75%) and gives more slot collisions - the more generous case for the proposal. The 24-cluster
-run, which matches the ratio, lands at break-even B=16 with 6.46 distinct at B=1, so moving to the real geometry makes
-the batch-1 answer slightly worse, not better. What is *not* measured here is quality: whether the experts the router
-groups together are one function is `docs/EXPERT-MERGE.md`'s question, and it has to be paid before any of this table
-can be spent.
+Caveat on the shape, and what it does and does not cost the answer: the model in the proposal has 64 experts and the
+capture has 128. The **crossover is exact anyway** - 12 groups cap the read at 12 per batch whatever the layer held
+before the merge, so 64 into 12 breaks even at B=8 just as 12-of-128 does; the pre-merge 64 only sets the baseline
+(how much an *unmerged* batch would have read, B=64 here). What 128 makes approximate is the byte figure at small
+batch: 12-of-128 (9.4%) is a coarser merge than 12-of-64 (18.75%) and so collides slots more, which means 5.24 distinct
+matrices at B=1 is the favourable end, not the likely one - the 24-cluster run matching the ratio gives 6.46 and
+break-even B=16. What is *not* measured here at all is quality: whether the experts the router groups together are one
+function is `docs/EXPERT-MERGE.md`'s question, and it has to be paid before any of this table can be spent.
 
 ### The disk claims are the least trustworthy numbers here
 

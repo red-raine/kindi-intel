@@ -152,6 +152,17 @@ def break_even(rows, k):
     return None
 
 
+def cap_break_even(clusters, k):
+    """The crossover a group count forces, with no measurement at all.
+
+    A batch's union can never exceed the number of groups, so the read per token is at worst `clusters` per batch and
+    falls as clusters/B; it is covered once clusters/B <= k*c/r. This is why the answer for 64 experts into 12 does not
+    depend on the 64: the pre-merge size sets how much a batch *would* have read, the post-merge size sets the floor it
+    cannot exceed, and break-even is decided by the floor.
+    """
+    return int(np.ceil(clusters / (k * C_MS / R_MS)))
+
+
 def table_gb(n_experts, layers=LAYERS):
     return layers * n_experts * EXPERT_MB / 1024.0
 
@@ -213,6 +224,12 @@ def report(routes, clusters, k, log=print):
         log("  %3d experts x %d layers x %.1f MB = %5.2f GB" % (n, LAYERS, EXPERT_MB, table_gb(n)))
     log("")
     need = k * C_MS / R_MS
+    log("the group cap sets the crossover with no measurement at all: %d groups / (k*c/r = %.2f) = B=%d predicted,"
+        % (clusters, need, cap_break_even(clusters, k)))
+    log("and that is what the two clustered arms measured - so the 12-of-64 case answers the same as 12-of-%d, its"
+        % n_experts)
+    log("router only deciding how much a batch would have read without the merge.")
+    log("")
     log("batch 1 breaks even only if a token's %d slots land in %.2f distinct matrices or fewer, because one GEMV" % (k, need))
     log("per slot (%.1f ms) has to cover one read per distinct matrix (%.1f ms):" % (C_MS, R_MS))
     for name, rows in results.items():
@@ -316,6 +333,13 @@ def selftest():
           break_even([(B, 2.0 * B) for B in BATCHES], k=2) is None)
     check("a fixed read per batch breaks even once B covers k/%.2f reads" % (R_MS / C_MS),
           break_even([(B, 2.0) for B in BATCHES], k=2) == 8, str(break_even([(B, 2.0) for B in BATCHES], k=2)))
+
+    # the group cap predicts the crossover without a router: 12 groups and k=8 land on B=8, 24 groups on B=16
+    check("the cap predicts B=8 for 12 groups with top-8", cap_break_even(12, 8) == 8, str(cap_break_even(12, 8)))
+    check("and B=16 for 24 groups, matching the measured runs", cap_break_even(24, 8) == 16,
+          str(cap_break_even(24, 8)))
+    check("a table small enough to be one group would cross at B=1 only for k=1",
+          cap_break_even(1, 8) == 1 and cap_break_even(1, 1) == 6)
 
     # a random partition is a partition: every expert in exactly one group, all groups used
     p = random_partition(32, 8)
