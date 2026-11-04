@@ -136,6 +136,9 @@ reading 1,093 tokens/s at 512 to 855 at 22K.
 - The cluster runs seven servers on one 4-core host with `--memory 6g`. One server on a computer of its own can use
   the default budgets.
 
+Q4_K and Q4_0 are the two formats with no tensor-core prompt GEMM on this card: their products run on dp4a. Whether
+Marlin's INT4 kernel can fill that gap, and what blocks it, is [INT4-MARLIN.md](INT4-MARLIN.md).
+
 ## CPU (x86-64 with AVX2)
 
 | item | value |

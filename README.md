@@ -385,6 +385,7 @@ An experiment on reusing the activation code as a routing fingerprint: [docs/ROU
 What a ternary LUT kernel and expert paging actually cost on an AVX2 i9, including two claims withdrawn: [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 What the 27B ternary packs differ in - identical codes, re-fitted scales, and one derivative that is the base file
 repacked: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).
+Whether Marlin's INT4 tensor-core kernel can be used here, and the one layout idea in it that can: [docs/INT4-MARLIN.md](docs/INT4-MARLIN.md).
 The settings for each tested card (K420, K1200, K6000, GTX 1080, RTX 3080, Radeon 780M, CPU): [docs/CARDS.md](docs/CARDS.md).
 
 ## Agent benchmark
