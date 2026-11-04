@@ -163,20 +163,42 @@ def pretoken(text):
 
 
 class Tok(object):
+    """Byte-level BPE over whichever vocab shape the pack shipped.
+
+    Three shapes exist in packs on this machine: a token -> id dict (GPT-2's own vocab.json, which is what the 255M
+    packs carry), a plain token list (a GGUF tokenizer.ggml.tokens array, which is what `kindi convert` writes), and a
+    list of [token, score] pairs (a HuggingFace tokenizer.json vocab). Only the last two have the 248044 added-token
+    region, so the special-token split is built from the tail when there is one and skipped when there is not.
+    """
+
     def __init__(self, vocab, merges_path):
         self.vocab = vocab
-        self.sid = {s: i for i, s in enumerate(vocab) if isinstance(s, str)}
         self.ranks = load_ranks(merges_path)
         self.u2b = {v: k for k, v in _B2U.items()}
-        added = [s for s in (v[0] if isinstance(v, list) else v for v in vocab[248044:])
+        if isinstance(vocab, dict):
+            if all(isinstance(i, int) for i in vocab.values()):
+                self.sid = dict(vocab)
+                self.byid = {int(i): s for s, i in vocab.items()}
+            else:
+                self.sid = {s: i for i, s in enumerate(vocab)}
+                self.byid = {i: s for i, s in enumerate(vocab)}
+            tail = []
+        else:
+            names = [(s[0] if isinstance(s, list) else s) for s in vocab]
+            self.sid = {s: i for i, s in enumerate(names) if isinstance(s, str)}
+            self.byid = {i: s for i, s in enumerate(names) if isinstance(s, str)}
+            tail = vocab[248044:] if len(vocab) > 248044 else []
+        added = [s for s in (v[0] if isinstance(v, list) else v for v in tail)
                  if isinstance(s, str) and s.startswith("<") and s.endswith(">")]
         self.added = added
-        self.split_re = re.compile("(" + "|".join(re.escape(s) for s in sorted(added, key=len, reverse=True)) + ")")
+        self.split_re = (re.compile("(" + "|".join(re.escape(s) for s in sorted(added, key=len, reverse=True)) + ")")
+                         if added else None)
         self.cache = {}
 
     def encode(self, text):
         out = []
-        for k, part in enumerate(self.split_re.split(text)):
+        parts = self.split_re.split(text) if self.split_re else [text]
+        for k, part in enumerate(parts):
             if not part:
                 continue
             if k % 2:
@@ -192,8 +214,10 @@ class Tok(object):
         return out
 
     def decode_bytes(self, i):
-        item = self.vocab[i]
-        s = item[0] if isinstance(item, list) else str(item)
+        s = self.byid.get(int(i), "")
+        if not s and not isinstance(self.vocab, dict):
+            item = self.vocab[i]
+            s = item[0] if isinstance(item, list) else str(item)
         if all(ch in self.u2b for ch in s):
             return bytes(self.u2b[ch] for ch in s)
         return s.encode("utf-8")
