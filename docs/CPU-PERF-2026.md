@@ -967,7 +967,7 @@ format that keeps the model, and the 2-bit rungs buy the last 12 MiB at the pric
 four-level alphabet with one fp16 scale per **32-value block** instead of per head: 8 bytes of codes and 2 bytes of
 scale a block, so 2.5 bits a value against 2.0625 at a 256-value head - 21% more cache than mode 4 for no extra level.
 The pack the question needed is on this host now: `prism-ml/Ternary-Bonsai-2-2B`'s PTQ1_0 file (429 MB, sha256
-checked) converted to a 506 MB pack at `~/.kindi/packs/bonsai-2b`. Measured three ways:
+checked) converted to a 506 MB pack at `~/.kindi/packs/bonsai-2b`. Measured four ways:
 
 - **At the codec, on the values the model writes.** 2376 V vectors captured from that pack (198 tokens of prose
   through the trained 2B, 6 attention layers): mean relL2 **0.4072 -> 0.3841, 5.7% closer, and the block scale wins on
@@ -982,6 +982,24 @@ checked) converted to a 506 MB pack at `~/.kindi/packs/bonsai-2b`. Measured thre
 - **It does not turn 2 bits into 4.** The best 2-bit V rung is still 8.4x the KL of 4-bit V (0.15993 against 0.01901),
   and 4-bit V costs 4.06 bits against 2.50. Mode 6 is the right pick *if* a 2-bit V is the constraint and the extra 21%
   of cache is available; it is not a substitute for the 4-bit rung.
+- **Over the full 48 prompts the gain is resolvable, and it is the same 20%.** Three windows are three numbers; the arm
+  table's intervals came from a paired bootstrap over prompts, so this comparison gets one. `tools.kvq.sweep` walks all
+  48 prompts of `tools.kvq.prompts` (the categories this document's sweep names, four prompts each), 160 greedy
+  tokens a prompt, both formats replayed over the **same** fp16 token stream so every decision sees an identical
+  context: 7,680 decisions, mean KL **0.03563** at one scale a head against **0.02846** at one a 32-block, 20.1% lower
+  - the 19% the three windows reported, from a set that was not chosen to like it. The paired difference over the 48
+  prompts is **+0.00717 nats, 95% interval [+0.00554, +0.00885]** (bootstrap over prompts: one prompt is one
+  observation, not its 160 correlated decisions; 2,000 resamples, fixed seed). Mode 6 is closer on **46 of 48**, and
+  the two exceptions are small (`code-c` -0.0082, `translation-4` -0.0073). The gain is not one kind of text: every
+  category moves the same way, from 12% (factual, translation) to 32% (SQL, enumeration). At the first generated token
+  alone it is +0.00822 [+0.00062, +0.01816], closer on 28 of 48, and top-1 agreement over the walk is 96.1% against
+  96.3%. What the 48 prompts buy over three windows is the thing three windows could not supply: a sign that does not
+  depend on which passages were picked.
+
+The 48 prompts the arm table used were a harness file outside this tree, and that file is not on this host; the set in
+`tools/kvq/prompts.py` is a set of the same kinds of text - four prompts in each of twelve categories, code included -
+and its digest (`00a46b37...`) is written into every run's JSON. It is therefore not the same text, and the levels are not the arm table's - the walk is also 160
+tokens rather than 40 - while the paired difference and its interval are the numbers to compare.
 
 What the variant did turn up is a bug in the selector: `kc_kv_quant2` packed its choice as `K*4 + V`, which stopped
 being injective once `V` could reach 4 - K at 2 bits with V at 4 bits gave 8, the same code as K at 4 bits with V in
@@ -1007,7 +1025,10 @@ them in the environment that launches the process.
 
 Harness: `~/kt/perf/kvq/` (`kqkv_arms.sh`, `kqkv_asym.sh`, `kqkv_q4.sh`, `kqkv_q2.sh` and `kqkv_q45.sh` run the arms,
 `kqkv_wide.py` is the sweep, `kvq_report.py` scores divergence, KL and cost, `kvq_detail.py` the divergence-step
-distribution, `q2_floor.py` and `q45_floor.py` the alphabet floors, `q2_check.py` the position-0 round trip).
+distribution, `q2_floor.py` and `q45_floor.py` the alphabet floors, `q2_check.py` the position-0 round trip). That
+directory is not in this tree; the formats themselves, the pack run and the 48-prompt paired comparison are, as
+`tools.kvq.measure`, `tools.kvq.capture`, `tools.kvq.sweep` and `tools.kvq.prompts` - the last one run by
+`python -m tools.kvq.sweep --pack ~/.kindi/packs/bonsai-2b`, which took 75 minutes on this host for the 7,680 decisions.
 ## Positional encoding: what the retired files ask for, and what it does past 8k
 
 The two retired Bonsai Q1_0 GGUFs do not ask for the plain rotary table. Both declare `qwen3.rope.scaling` as
