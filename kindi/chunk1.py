@@ -8,7 +8,10 @@ KINDI_CHUNK=0: off (the engine as before)."""
 import os
 
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:               # a CPU-only host: the chunk GEMM is a CUDA path
+    cp = None
 
 from . import chunk as _c
 
