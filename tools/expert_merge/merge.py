@@ -180,10 +180,17 @@ def align_and_fuse(expert_weights, expert_fishers, eps=1e-6):
         w["up_proj.weight"] = cur_w["up_proj.weight"][perm, :]
         w["down_proj.weight"] = cur_w["down_proj.weight"][:, perm]
         f = dict(cur_f)
-        if f["gate_proj.weight"].ndim == 2:
+        # a scalar Fisher (the documented "plain average" case) has no unit axis to permute; a per-weight tensor
+        # does. np.ndim rather than .ndim because the scalar path stores a float, which has no attribute - that
+        # AttributeError is what a scalar Fisher used to hit here even though _fisher accepts one.
+        nd = np.ndim(f["gate_proj.weight"])
+        if nd == 2:
             f["gate_proj.weight"] = f["gate_proj.weight"][perm, :]
             f["up_proj.weight"] = f["up_proj.weight"][perm, :]
             f["down_proj.weight"] = f["down_proj.weight"][:, perm]
+        elif nd == 1:
+            raise ValueError("a per-unit Fisher is ambiguous under a hidden-unit permutation: it would have to be "
+                             "permuted on gate/up rows and on down columns, which are different lengths")
         aligned_w.append(w)
         aligned_f.append(f)
 
