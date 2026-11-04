@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **`kindi recipes` and `--scan`.** Reads a GGUF header (family, depth, width, experts, context, rope scaling, tensor
+  types) without touching tensor data, and prints the conversion plan for a job - `coder`, `agent`, `rag`, `search`,
+  `science`, `chat` - with the reasons a file cannot support it. `--scan DIR` does it for every model under a
+  directory. [docs/RECIPES.md](docs/RECIPES.md).
+- **`--scheme gsq`.** Fits the ternary codes and the group scale together (Gumbel-Softmax relaxation, then
+  least-squares alternation). 11.4% below `lsq` in weight error on heavy-tailed matrices, level on Gaussian ones.
+- **`--budget BYTES`.** Chooses which tensors stay f32 under an exact byte budget, by dynamic programming with the
+  fractional bound reported when the table is too large to solve exactly.
+- **`kindi fetch kaggle:OWNER/DATASET[/MEMBER]`.** Kaggle has no per-file endpoint and no hash, so the dataset archive
+  is downloaded, the named member is extracted, and the limits are stated.
+
+### Fixed
+
+- **A GGUF header length the file cannot back is refused by name.** A 79 KB file whose header claims a 2.6-exabyte
+  tensor name used to end in a bare `MemoryError`; every stated length is now checked against the bytes that remain.
+
 ## 0.3.0 (2026-10-28)
 
 ### New
