@@ -141,7 +141,10 @@ def main(argv):
         print("checks passed")
         return 0
     json_out = argv[argv.index("--json") + 1] if "--json" in argv else None
-    paths = [a for a in argv if a.endswith(".json")]
+    # the output path is a .json too, and reading it as a shard meant the tool could not write the file it was
+    # asked for on the first run and could not read it on the second - the one argument that is never an input
+    paths = [a for i, a in enumerate(argv) if a.endswith(".json") and i != (argv.index("--json") + 1
+                                                                          if json_out else -1)]
     if not paths:
         print("usage: python -m tools.expert_merge.prunegate [--json OUT.json] SHARD.json [SHARD.json ...]")
         return 2

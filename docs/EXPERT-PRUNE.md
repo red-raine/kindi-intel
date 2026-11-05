@@ -86,25 +86,46 @@ thing - which experts exist - and share one loaded pack, so no re-quantisation a
 the comparison. The gate corpus is held out of the fit (`--corpus`); the default is the log's own four documents,
 which the tool labels in-sample so nobody has to remember which one they ran.
 
-Ninety-four held-out tokens - two documents the log never saw, 48 each - were scored through both routers in one
-process, and the arms differ token by token:
+The first gate scored 94 held-out tokens - two documents the log never saw, 48 each. It was widened to **765 tokens
+over three documents, 256 each** (`docs/BENCHMARKS.md`, `kindi/tp.py`, `docs/PACK-ZOO.md`, all outside the fit), four
+arms, one process an arm, and the four baselines agreed bit for bit (3.4499) - which is the check that the arms are
+one experiment. `tools.expert_merge.prunegate` merges the shards, refuses them if their baselines or corpora differ,
+and names what each interval establishes:
 
-| keep, of 128 a layer | NLL | change | 95% interval | tolerance +0.02 |
-|---:|---:|---:|---|---|
-| 128 (as shipped) | 4.9563 | - | - | - |
-| 96 (74.8% of the bytes) | 4.9391 | **-0.0171** | -0.0625 .. +0.0469 | inside it |
-| 64 (50.0% of the bytes) | 4.8850 | **-0.0712** | -0.2194 .. +0.0595 | inside it |
+| keep, of 128 a layer | expert bytes | mass given up | NLL | change | 95% interval | width | verdict |
+|---:|---:|---:|---:|---:|---|---:|---|
+| 128 (as shipped) | 9.77 GB | - | 3.4499 | - | - | - | - |
+| 112 (82.9%) | 8.11 GB | 0.07% | 3.4640 | **+0.0142** | -0.0061 .. +0.0377 | 0.044 | unresolved |
+| 96 (74.8%) | 7.31 GB | 0.59% | 3.4719 | **+0.0220** | -0.0057 .. +0.0534 | 0.059 | unresolved |
+| 64 (50.0%) | 4.89 GB | 5.61% | 3.5140 | **+0.0641** | -0.0017 .. +0.1354 | 0.137 | unresolved |
+| 32 (25.0%) | 2.62 GB | 25.30% | 3.9612 | **+0.5114** | +0.3822 .. +0.6544 | 0.272 | **loss (certified)** |
 
-Both plans pass the tolerance on the point estimate and **neither interval excludes zero**. The honest reading is
-that dropping a quarter or half of the expert bytes costs nothing measurable on these 94 tokens - not that pruning
-improves the model. The negative signs are small against intervals of ±0.05 and ±0.14 and come from two documents;
-what the mechanism does is visible in the routing (top-k renormalisation over a smaller set hands the survivors more
-weight), and whether that helps or hurts on this or any other corpus is exactly what 94 tokens cannot settle.
+Three things changed with the corpus, and the first is the one worth keeping.
 
-The gate's own limit is arithmetic and stated by the tool: a moving-block interval of ±0.05 is wider than a 0.02
-tolerance, so a plan can be **accepted without the tolerance being established** - the run prints that case instead
-of a bare "pass". Narrowing it means more documents, which is about eight minutes of 48-layer forward a document on
-this host (less for a pruned arm, which unpacks fewer experts), not a better argument.
+**The sign flipped.** On 94 tokens of two documents pruning looked free at 96 experts (-0.017) and at 64 (-0.071). On
+765 tokens of three it costs +0.014, +0.022 and +0.064, and the ordering is now monotone in what is dropped. The
+negative numbers were a property of the two documents, not of the mechanism: the earlier reading should never have
+been quoted without that caveat, and the caveat is now measured rather than assumed.
+
+**Pruning is a spectrum, not a threshold, and only the far end is certified.** At 112 a layer the point estimate
+(+0.0142) is inside the tolerance and its interval does not exclude zero; at 96 it is just outside the tolerance; at
+64 it is six times the tolerance; at 32 - a quarter of the expert bytes, 25.3% of the routing mass - the interval
+sits entirely above the tolerance (+0.38 to +0.65), which is the one claim this corpus supports without
+qualification. Routing mass is not the loss, and the gap is measurable: 25.3% of the mass going costs 25x what 5.6%
+does in NLL.
+
+**The tolerance is finer than this measurement resolves, and here is the arithmetic.** The paired per-token delta has
+a standard deviation of 0.31 nats at 112 (0.42, 0.97, 1.92 as more is dropped), so the tokens an interval of half
+-width 0.02 needs are `(1.96 * sd / 0.02)^2`: **918 at 112, 1,668 at 96, 8,983 at 64 and 35,425 at 32**. Certifying
+the *verdict* costs more again, because the point estimate already sits inside the tolerance at 112 (which needs a
+half-width of 0.0058, so ~10,900 tokens) and just outside it at 96 (~167,000 to push the lower bound past 0.02). The
+765 tokens here are 2.2 h of 48-layer forward across four processes; 10,900 is a day and a half. That is the honest
+answer to "is pruning lossless within 0.02": at this forward rate the gate cannot certify it, and the decision has to
+be made on the point estimate with its interval printed beside it.
+
+The tool says this instead of printing a bare "pass": a plan whose interval straddles the tolerance is reported
+`marginal` by `prune` and `unresolved` by `prunegate`, and only an interval entirely inside the tolerance (or entirely
+beyond it, as at 32) is reported as established.
 
 ## What this does not establish
 
@@ -113,8 +134,16 @@ expert is estimated from a handful of tokens; a wider corpus would move the plan
 decision is between experts with almost no mass and almost no mass. The plans at 80 and 64 are decided on tens of
 selections each and are less sensitive to that.
 
-**The gate is small.** Both documents are held out of the fit, but 48 tokens each is not a held-out set in any
-statistical sense, and the moving-block interval says so out loud.
+**The gate is small, and narrower than the corpus.** 765 tokens over three documents is 8x the first run, and the
+three are all repository prose and Python: documents are the unit a moving-block interval with a block of 8 does not
+resample, so the interval describes token noise inside this kind of text, not the spread over corpora. The required-n
+numbers above inherit that limitation - they say what 765 tokens predicts, not what 10,900 tokens would find.
+
+**The forward is slower than this note used to say.** The dequantiser here runs at ~14-30 Mvalues/s, not the 80 the
+`tools/expert_merge/moe.py` docstring quotes, so a 256-token document is ~17 minutes of an unpacked-expert forward
+rather than eight. The cost is per *document*, not per token, because the set of experts a layer's tokens route to
+saturates near 128 long before the document does - which is why 765 tokens cost about what 94 did and why widening
+the corpus further is cheap per token but not per document.
 
 **No pack is written.** The artifact is a JSON plan (layer -> kept ids) plus the routing mask that applies it. What a
 pruned shard *would* weigh is the table above; what this tree can serve is still the 11.26 GB file, because the
