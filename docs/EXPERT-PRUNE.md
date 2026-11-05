@@ -148,16 +148,17 @@ not fitted to. 8.11 GB of expert weights for the 9.77 GB file - a sixth of the e
 distinguishable from nothing at this resolution.
 
 **The point estimates fell, which is what noise looks like when the corpus grows.** 765 tokens read +0.0142 at 112
-and +0.0220 at 96; 1,785 read +0.0045 and +0.0164. Both halved, and both moved toward zero. That is the direction a
-corpus made of two documents was always able to produce, and it is why the earlier numbers were labelled unresolved
-rather than accepted.
+and +0.0220 at 96; 1,785 read +0.0045 and +0.0164 - two thirds and a quarter of the way to zero, both in the same
+direction. That is what a corpus of three documents was always able to produce, and it is why the earlier numbers were
+labelled unresolved rather than accepted.
 
 **96 experts is still unresolved, and the arithmetic for resolving it is now the only thing standing in the way.**
 The estimate (+0.0164) is inside the tolerance and the interval is 0.038 wide, so the honest statement is "costs at
 most +0.036, point estimate under the tolerance, not certified". Pushing the upper bound under 0.02 needs a half-width
-of 0.0036 against the 0.0189 measured - 27x the corpus, about 49,000 tokens, and at ~13 minutes a forward that is 13
-hours of this machine rather than the day and a half it used to be. The lever exists now; whether 96 is worth 13 hours
-is a different question from whether it can be answered.
+of 0.0036 against the 0.0189 measured - 27x the corpus, about 49,000 tokens, which is ~6 hours a forward for this pack
+and so ~12 for the baseline and the arm (in batches of documents: 49,000 tokens of logits would be 30 GB at once). The
+lever exists now - the day and a half became a working day - and whether 96 is worth that day is a different question
+from whether it can be answered.
 
 **64 experts flipped from unresolved to certified loss, and that is the other half of the widening.** At 765 tokens
 it read +0.0641 with an interval that reached from -0.002 to +0.135 - not established. At 1,785 it reads +0.0965,
