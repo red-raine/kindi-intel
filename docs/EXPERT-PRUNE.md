@@ -172,6 +172,56 @@ text: a sixth of the expert bytes for nothing measurable, and the only plan in t
 one worth another corpus - 7.31 GB, a quarter of the experts gone, point estimate under the tolerance - and 64 is out
 by a fifth of a nat.
 
+## What a mass budget cannot see
+
+Routing mass is the right currency for a byte budget and the wrong one for a hazard, because it treats an expert as a
+small linear map whose removal costs its share of the output. Some experts are not that. `tools/expert_merge/superex`
+measures what each expert actually writes into the residual stream - `max |down_proj(silu(gate x) * up x)|` over the
+tokens that chose it, on the same `ffn_norm(x)` the router handed it - for all 48 layers of the Q2_K pack, one
+dequantisation of three matrices an expert (~7 min for the pack):
+
+| expert | output | x its layer's median | routing-mass rank | share of its layer's mass |
+|---|---:|---:|---:|---:|
+| L02E92 | 946.94 | **2,152x** | 38 / 128 | 1.03% |
+| L01E114 | 283.32 | **927x** | 27 / 128 | 1.32% |
+| L03E82 | 179.20 | **525x** | 27 / 128 | 1.40% |
+| L01E68 | 64.23 | **210x** | **92 / 128** | **0.28%** |
+
+The four are a separate population and the gap is not close: the next largest expert in the pack is 42.7x its own
+layer's median (L46), then 38x, then 33x. Two of these ids are the ones Su et al. (ICLR 2026) name as super experts in
+Qwen3-30B-A3B - **L2E92 and L3E82** - and their third, **L1E68**, is our fourth entry; we find one they do not,
+L1E114, at four times E68's output. Different model (the Coder variant), different corpus, same structure.
+
+**Mass does not rank them, and that is the whole finding.** L1E68 writes 210x its layer's median while carrying
+**0.28%** of that layer's routing mass, at rank 92 of 128. A byte budget that keeps the top 64 by mass drops it, and the
+plan's own summary reports the loss as a fraction of a percent of mass - which is exactly what it is, and exactly why
+the summary cannot see it.
+
+| plan | flagged experts dropped | its measured NLL cost |
+|---|---|---|
+| 112 of 128 | none | +0.0045 (lossless) |
+| 96 of 128 | none | +0.0164 (unresolved) |
+| 64 of 128 | **L1E68** | +0.0965 (loss) |
+| 32 of 128 | **L1E68, L2E92** | not gated |
+
+So the 64 arm's fifth of a nat has a mechanism, not just a magnitude, and the 96 plan survives this test only because
+96 > 92. That is a budget comparison, not a guard: a different corpus re-ranks mass, and a slightly tighter plan drops
+the expert at rank 92 while reporting the same sub-percent mass loss. The fix is to make it a guard - `prune
+--protect` forcing the flagged set into the keep set before the DP runs (3 or 4 experts of 6,144, 0.05% of expert
+bytes) - which is item **P0** in [the master plan](../masterplan.md).
+
+**The threshold has to be relative to the layer, which is why the tool's first version was wrong.** The literature's
+stated cut is global (P99.5 and 10% of the largest output anywhere). On this pack the layer median rises 150x with
+depth - 0.31 at layer 1, 56.6 at layer 47 - so a global 10%-of-peak cut flags **31** experts, 23 of them in layer 47
+that are only 1.7x their own layer's median, while the layer-1 expert at 210x sits under it. Relative to the expert's
+own layer at 100x, the population separates cleanly at four, and the ratio is a margin inside the gap (42.7x to 210x),
+not a tuned number. `superex` reports both and uses the relative one.
+
+**What this does not establish.** The profile is on the 384-token fitting corpus, not held-out text, so a different
+corpus re-ranks the set - which is an argument for the guard, not against it. Output magnitude is not the paper's
+test: they removed the experts and measured, and no removal arm has been run here. And a large output is a *mechanism*
+for the 64 arm's cost, not a proof that E68 is the whole of it.
+
 ## The forward was the limit, and it is not one any more
 
 Everything above is priced in documents because the forward paid the dequantiser for a layer's experts once **a
@@ -232,3 +282,29 @@ are all at or above 64 to keep that out of the comparison.
 **Nothing here says the kept experts are the right ones for text the log never saw.** The mass was measured on
 repository prose and Python; a corpus with a different distribution of subject matter routes differently, and a plan
 fitted on this one is fitted on this one.
+
+**The outlier profile is on the fitting corpus too.** `superex` measures what each expert writes over the same 384
+tokens the plans were fitted on, so the flagged set is as corpus-specific as the plans are - which is the reason the
+answer is a guard that protects a *superset* (every layer's top expert by output, and the 100x set) rather than a
+number computed once and hard-coded.
+
+## Reproduce
+
+```bash
+# the mass plans, priced from the pack's own bytes
+python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 112,96,64,32 --json plans.json
+
+# what each expert writes into the residual stream, and whether a plan drops an outlier (~7 min for 48 layers)
+python -m tools.expert_merge.superex --pack MODEL.gguf --routes routes.npz \
+    --plan plans.json --json superex.json
+
+# re-check a stored profile against another plan without reading the weights again (seconds)
+python -m tools.expert_merge.superex --from-json superex.json --plan plans.json
+
+# the gate: 1,785 held-out tokens, batched, each arm against a baseline it measures itself
+python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 112,96 --gate \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md,tools/nll.py \
+    --docs 7 --tokens 255 --json gate-112-96.json
+# then the verdicts, from the shards (refuses shards whose baseline disagrees)
+python -m tools.expert_merge.prunegate gate-112-96.json
+```
