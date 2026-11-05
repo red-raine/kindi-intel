@@ -127,16 +127,22 @@ is what this table used to quote):
 
 Against the pair table already in the engine, this harness compares a documented figure, so the number that counts is
 from [libcompare.py](libcompare.py): both kernels in one process, one matrix, one activation vector, pinned and paired.
-**The pair table wins**: 1.5x at 2048 x 1920 and **2.0-2.9x** at 14336 x 4096, at one thread as well as eight, with
+**The pair table wins**: 1.7-2.2x at 2048 x 1920 and **2.8-2.9x** at 14336 x 4096, at one thread as well as eight, with
 45 paired rounds an arm and the direction reproduced in two runs. The kernels agree to 2.2e-07 of their largest output,
 so that is speed and not correctness. The earlier "parity" reading came from comparing this harness's figure, taken as a
-minimum of nine, against a documented one - and there is nothing here to pay for a repack.
+minimum of nine, against a documented one - and there is nothing here to pay for a repack, since even the best tiled LUT
+arm (2.21 ms) trails the untiled pair table (1.81 ms) by 1.22x.
+
+`--sweep` interleaves 1, 2, 4, 6 and 8 threads on the physical cores and then 8 against 16 on the SMT siblings. That
+sweep is **not a result**: two attempts gave non-monotone curves (6 threads beating 8) with 15-45% CV while this host
+ran at 47% background load. Thread counts contend with the background differently from one another, so pairing does
+not make them exchangeable - the curve needs a quiet host.
 
 The single-shuffle version the note proposes would be ~2x fewer ALU ops per group and would also be wrong, because int8
 activations do not fit a single-shuffle int8 table. That argument is about the LUT family, not about which kernel to
 ship: the pair table is ahead on both counts.
 
-## The cache-blocked T-MAC: built, exact, and 1.55x faster at expert width
+## The cache-blocked T-MAC: built, exact, and 1.80x faster at expert width
 
 The next note adds tiling: an `N_blk` tile of outputs with the accumulators spilled to a per-tile buffer, a `K_blk`
 tile so the tables fit L1, and `_mm_prefetch` on the weight stream. It is now the second entry point,
@@ -155,33 +161,45 @@ x 3 runs:
 
 | N | arm | median ms | speedup | 95% CI | per run |
 |---|---|---:|---:|---|---|
-| 14336 | untiled kernel | 5.15 | 1.00x | | |
-| 14336 | 1024 x 512 (the note's tiles) | **3.30** | **1.55x** | 1.45-1.66 | 1.59 1.70 1.37 |
-| 14336 | 512 x 512 | 3.82 | 1.37x | 1.29-1.46 | 1.44 1.49 1.19 |
-| 2048 | untiled kernel | 0.63 | 1.00x | | |
-| 2048 | 1024 x 512 | 0.65 | 0.91x | 0.84-0.98 | 0.93 0.91 0.89 |
-| 2048 | 512 x 512 | **0.58** | **1.10x** | 1.03-1.18 | 1.12 1.08 1.11 |
-| 2048 | 2048 x 1024 | 1.15 | 0.55x | 0.52-0.57 | 0.56 0.53 0.55 |
+| 14336 | untiled kernel | 3.89 | 1.00x | | |
+| 14336 | 1024 x 512 (the note's tiles) | **2.21** | **1.80x** | 1.71-1.91 | 1.91 1.76 1.74 |
+| 14336 | 512 x 512 | 2.60 | 1.49x | 1.34-1.62 | 1.55 1.46 1.44 |
+| 14336 | 1024 x all K | 2.76 | 1.40x | 1.27-1.53 | 1.50 1.34 1.36 |
+| 14336 | 2048 x 1024 | 3.89 | 1.22x | 1.08-1.40 | 1.30 1.23 1.14 |
+| 2048 | untiled kernel | 0.48 | 1.00x | | |
+| 2048 | 1024 x 512 | 0.53 | 0.98x | 0.79-1.25 | 0.77 1.11 1.05 |
+| 2048 | 512 x 512 | 0.55 | 1.02x | 0.85-1.29 | 0.74 1.19 1.14 |
+| 2048 | 1024 x all K | 0.76 | 0.75x | 0.63-0.92 | 0.59 0.82 0.83 |
+| 2048 | 2048 x 1024 | 0.95 | 0.53x | 0.46-0.63 | 0.40 0.60 0.59 |
 
-The note's tiles win in every run at the expert width and sit inside the noise floor at N = 2048 (0.91x). The 45% loss
-in that table belongs to the single-tile arm - 2048 x 1024 at N = 2048 is one tile for eight threads, and seven of them
-idle. `512 x 512` is the blocking that pays at both widths, so it is the better default. These milliseconds are not
-comparable with the ranges this file used to quote: those were unpinned min-of-N, these are pinned medians paired
-within a round. `docs/TERNARY-LUT-AND-PAGING-2026.md` has the full method and the retractions.
+The note's tiles win in every run at the expert width (1.74-1.91) and nothing is separable at N = 2048, where all three
+tiling arms sit inside the noise floor. The 47% loss belongs to the single-tile arm - 2048 x 1024 at N = 2048 is one tile
+for eight threads, and seven of them idle. These milliseconds are not comparable with the ranges this file used to
+quote: those were unpinned min-of-N, these are pinned medians paired within a round. `docs/TERNARY-LUT-AND-PAGING-2026.md`
+has the full method and the retractions.
+
+**The pinning was wrong when this table was first written, and the numbers above are the re-measurement.** `0xff` is
+eight *logical* processors on this 8C/16T host - four cores with both SMT threads - because `_core_masks()` read
+`SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` as two WORD headers where the API has two DWORDs, broke on the first record
+and fell back to one mask per logical without saying so. `--selftest` now asserts that every logical appears in exactly
+one core's mask, and the table prints the mask it ran under (`0x5555` here). Under the corrected mask the win grows from
+1.55x to 1.80x, `512 x 512` stops paying at the narrow width, and `1024 x 512` - the note's own choice - becomes the
+best arm at the width we run.
 
 **A mechanism I had for why this would not work is withdrawn too**: that the kernel is not bandwidth-bound, so there is
-nothing for blocking to recover. The stream does move only 2.9-4.4 GB/s against several times that in DRAM headroom, and
+nothing for blocking to recover. The stream does move only 3.8-6.6 GB/s against several times that in DRAM headroom, and
 the limiter is on the compute path (`vpshufb`, int16 widening, a GEMV that reads each weight once) - but the tiles still
-recover 35% of the time, so the compute path was losing something to layout and occupancy that the theory did not model.
+recover 44% of the time, so the compute path was losing something to layout and occupancy that the theory did not model.
 What the two shapes do say is consistent with two facts that survive:
 
 * **The premise that motivated the K tile is off by 4x once the table is correct.** A single-shuffle int8 table is
   32 bytes a group (the note's 32 KB at K = 4096); the two byte planes a correct table needs are 128 bytes a group, i.e.
   **131 KB at K = 4096** - so the note's own K_blk = 512 (16 KB) is safe by accident rather than by its arithmetic. At
   16 KB a slice is L1-resident, which is the one part of the argument that does hold up.
-* **`N_blk` splits the work across threads, and that dominates.** One tile for 8 threads is 0.55x (seven of them idle),
-  two tiles is 0.91x, and 14 tiles is 1.55x. So the note's tile width is right at expert width and wrong below it, and
-  what decides is tiles-per-thread, not the tile shape - except that `512 x 512` (28 and 4 tiles) wins at both.
+* **`N_blk` splits the work across threads, and that is most of the win.** One tile for 8 threads is 0.53x (seven of
+  them idle), two tiles is 0.98x, 7 tiles is 1.22x, and 14 tiles is 1.80x. So the note's tile width is right at expert
+  width and wrong below it, and what decides is tiles-per-thread, not the tile shape - and the remaining third is the K
+  block: at N = 14336, 1024 x all K is 1.40x where 1024 x 512 is 1.80x.
 
 Two concrete defects in that note besides the arithmetic: `_mm_prefetch(reinterpret_cast<const char*>(w_grp + 4 * N),
 _MM_HINT_T0)` is `w_grp + 4 * N` **bytes**, and a group is N bytes, so it prefetches 4 groups - 57 KB, or **896 cache

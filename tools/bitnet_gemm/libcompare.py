@@ -8,6 +8,7 @@ it the only way it can be settled - both kernels in one process, one matrix, one
 
     python -m tools.bitnet_gemm.libcompare                          # 2048 x 1920 and 14336 x 4096
     python -m tools.bitnet_gemm.libcompare --rounds 15 --runs 3 --threads 8
+    python -m tools.bitnet_gemm.libcompare --sweep --rows 14336 --cols 4096 --threads 16   # 1,2,4,6,8,16
 
 What it builds: `kindi/kcpu.c` into the same library `kindi.cpu` uses (MSVC here, gcc elsewhere), and `tmac.cpp` as a
 torch extension. The pair-table arm runs `rows8` - the kernel the packs actually decode through - via `kc_rows8_gemv`,
@@ -142,6 +143,47 @@ def compare(mod, L, fx, R, C, threads, rounds, runs):
     return rows
 
 
+def sweep(mod, L, fx, R, C, rounds, upto):
+    """Does the shipped kernel stop scaling before the machine does?
+
+    The pair table's own loop streams a group once, keeps its accumulators in registers and sweeps K straight through,
+    so there is no K tile for it to block; if it has headroom, it has to be in thread scaling rather than in a layout.
+
+    Every thread count is an arm **inside one round**, for the same reason the two kernels are: a sweep that measures
+    each thread count in its own block is two blocks of drift compared against each other. The first version of this
+    did that and read the 8-to-16 step as 1.94x in one run and 0.98x in the next; here the ratios share their rounds.
+    Bands are pinned separately - core count is a property of the process, not of a call - so 8 threads appears in both
+    and is the anchor for the SMT band.
+    """
+    bands = [(min(8, upto), (1, 2, 4, 6, 8))]
+    if upto >= 16:
+        bands.append((16, (8, 16)))
+    print("\n  %d x %d thread scaling, %d interleaved rounds, every thread count an arm in every round:" % (R, C, rounds))
+    for cores, counts in bands:
+        info = tmac.pin_affinity(cores)
+        arms = []
+        for thr in counts:
+            arms.append(("pair table @%d" % thr,
+                         (lambda t: (lambda: rows8_gemv(L, fx["W"], fx["S"], fx["x"], t)))(thr)))
+        for thr in counts:
+            arms.append(("LUT @%d" % thr,
+                         (lambda t: (lambda: (mod.set_threads(t), mod.tmac_gemv_avx2(
+                             fx["a_t"], fx["lut_packed"], fx["scale_a"], fx["ones"]))[-1]))(thr)))
+        t = tmac.paired(arms, rounds)
+        print("\n    pinned to %d cores (%s), %s"
+              % (cores, tmac.affinity_line(info), "SMT band" if cores == 16 else "physical cores"))
+        print("    %-18s %9s %10s %12s %9s %8s"
+              % ("arm", "median ms", "G weights/s", "vs band first", "GB/s", "CV"))
+        for name, _fn in arms:
+            times = np.asarray(t[name], dtype=np.float64)
+            ms = 1e3 * float(np.median(times))
+            first = np.asarray(t[arms[0][0]], dtype=np.float64)
+            speed = float(np.mean(first / times))
+            print("    %-18s %9.3f %10.1f %11.2fx %9.1f %7.1f%%"
+                  % (name, ms, R * C / ms / 1e6, speed, (R * C / 4) / (ms / 1e3) / 1e9,
+                     100.0 * times.std(ddof=1) / times.mean()))
+
+
 def main(argv):
     def arg(name, default):
         return argv[argv.index(name) + 1] if name in argv else default
@@ -150,6 +192,7 @@ def main(argv):
     runs = int(arg("--runs", 3))
     threads = int(arg("--threads", 8))
     seed = int(arg("--seed", 0))
+    do_sweep = "--sweep" in argv
     if "--rows" in argv or "--cols" in argv:
         shapes = [(int(arg("--rows", 2048)), int(arg("--cols", 1920)))]
     else:
@@ -171,6 +214,10 @@ def main(argv):
     for R, C in shapes:
         fx = fixture(R, C, seed)
         worst = max(worst, correctness(L, mod, fx, R, C))
+        if do_sweep:
+            sweep(mod, L, fx, R, C, max(1, rounds // 2), threads)
+            print()
+            continue
 
         print("\n  %d x %d, %d interleaved rounds x %d runs, paired against the pair table:"
               % (R, C, rounds, runs))

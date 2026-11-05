@@ -59,13 +59,17 @@ Read `appendix.md` for links and numbers. Five conclusions that moved the plan:
    naive one but *nothing* over a good FMA kernel once decode is bandwidth-bound; the 6× figures are vs llama.cpp FP16
    on the same bytes. What is measured: pinning the small always-hot tensors (+26%), explicit merged reads instead of
    page faults (+13–14%, up to +55% with a coalesced layout), thread count at physical cores. That is `P6`. The one
-   exception, added 2026-11-05: **1.55× [1.45, 1.66]** from tiling the LUT GEMV at expert width, which is a layout and
+   exception, added 2026-11-05: **1.80× [1.71, 1.91]** from tiling the LUT GEMV at expert width, which is a layout and
    occupancy win inside the compute path rather than arithmetic (`docs/TERNARY-LUT-AND-PAGING-2026.md`) — so "memory-side,
-   not kernel-side" is right about *what the win is*, and wrong to imply the kernel has none.
+   not kernel-side" is right about *what the win is*, and wrong to imply the kernel has none. That figure is a
+   re-measurement: 1.58×, 1.37× and the first 1.55× were all taken with SMT siblings counted as cores (the Windows
+   topology parse read two WORDs where the API has two DWORDs and fell back to per-logical masks). Under `0x5555` the
+   win grows to 1.80× and the narrow-width tiling win disappears.
    **The LUT is still the wrong decoder on this host**, measured in one process: the shipped pair table (`rows8`) is
-   1.5× the LUT at 2048×1920 and **2.0-2.9×** at 14336×4096, and the best tiled LUT arm (3.30 ms) is 1.38-1.44× slower
-   than the untiled pair table (2.29-2.40 ms). `tools/bitnet_gemm/libcompare.py`; `P5` is unaffected (it is a byte
-   cut), and no repack is justified by speed.
+   1.7-2.2× the LUT at 2048×1920 and **2.8-2.9×** at 14336×4096, and the best tiled LUT arm (2.21 ms) is 1.22× slower
+   than the untiled pair table (1.81 ms). `tools/bitnet_gemm/libcompare.py`; `P5` is unaffected (it is a byte
+   cut), and no repack is justified by speed. Thread scaling is **unmeasured** here — the sweep came back non-monotone
+   at 47% background load, which pairing cannot rescue.
 
 ---
 

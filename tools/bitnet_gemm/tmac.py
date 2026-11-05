@@ -11,11 +11,17 @@ wraps. What that costs is one extra shuffle per table; what it buys is that int8
 **Why this file changed: min-of-min was measuring luck.** The tiling comparison used to report the best of three runs of
 the best of five calls, so it reported the quietest sample of a distribution whose own spread is +-45% run to run - and
 the wide-shape row straddled the untiled one in either direction depending on the afternoon. Two things were wrong with
-that, and both are fixed here:
+that, and both are fixed here - plus a third that made the first fix a lie for a while:
 
 * **Nothing was pinned.** Eight OpenMP threads were free to land on SMT siblings and to migrate, so the thread count in
   the table was a request rather than a fact. `pin_affinity` sets the process mask to one thread per **physical** core
   (from `GetLogicalProcessorInformationEx`, so no sibling is picked), and every table prints the mask it ran under.
+* **The pinning was itself wrong, silently.** `_core_masks()` parsed `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` with two
+  WORD headers; the API's are a DWORD relationship and a DWORD size, so the first record read size 0, the loop broke and
+  the fallback (one mask per logical processor) ran without saying so. On this 8C/16T host `pin_affinity(8)` therefore
+  pinned logicals 0-7 - four cores with both siblings - and every table before 2026-11-05 said "8 physical cores" over
+  four. Masks are now `0x5555` for 8 threads, `--selftest` asserts every logical appears in exactly one core's mask, and
+  the wide-shape win is 1.80x rather than the 1.55x measured under the wrong mask.
 * **The statistic was a minimum.** A minimum of a noisy sample is not an estimate of a mean: it moves with the noise
   floor, and it cannot be given an interval. The arms now run in **interleaved rounds** - one call an arm a round, with
   the order rotated so no arm is always first - and the reported number is the median with a 95% interval on the
@@ -76,14 +82,17 @@ def _core_masks():
         return [(1 << i) for i in range(_logical_count())]
     width = ctypes.sizeof(ctypes.c_size_t)
     masks, off = [], 0
-    while off + 4 <= need.value:
-        size = int.from_bytes(buf[off + 2:off + 4], "little")
-        if size < 4:
+    while off + 8 <= need.value:
+        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: DWORD Relationship, DWORD Size, then the union at +8. The two
+        # headers are DWORDs - reading them as WORDs put the size at +2, which read 0 on the first record, broke the
+        # loop and fell back to one mask per logical processor without saying so. That made pin_affinity(8) a claim
+        # about 8 cores when it was 8 logicals, and on an 8C/16T part those are 4 cores' worth of threads.
+        size = int.from_bytes(buf[off + 4:off + 8], "little")
+        if size < 8:
             break
-        # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: WORD Relationship, WORD Size, then the union at +4.
-        # PROCESSOR_RELATIONSHIP: Flags, EfficiencyClass, Reserved[20], WORD GroupCount, GROUP_AFFINITY GroupMask[].
-        # So the first core's mask starts at +4+24 = +28 and is one ULONG_PTR wide.
-        mask = int.from_bytes(buf[off + 28:off + 28 + width], "little")
+        # PROCESSOR_RELATIONSHIP at +8: Flags, EfficiencyClass, Reserved[20], WORD GroupCount, then GROUP_AFFINITY
+        # whose Mask is one ULONG_PTR wide - so the first core's mask starts at +8+24 = +32.
+        mask = int.from_bytes(buf[off + 32:off + 32 + width], "little")
         if mask:
             masks.append(mask)
         off += size
@@ -402,8 +411,11 @@ def selftest():
     check("identical arms are indistinguishable",
           all(r["verdict"] in ("indistinguishable", "baseline") for r in same),
           str([(r["arm"], r["speedup"], r["lo"], r["hi"]) for r in same]))
-    check("an identical arm's ratio is 1 to within the floor",
-          all(abs(r["speedup"] - 1.0) <= NOISE for r in same), str([r["speedup"] for r in same]))
+    # Not the noise floor: two identical arms on a *busy* host (47% background load was measured here) differ by
+    # several percent, and asserting 2% would make this test measure the machine. A mispaired round - the bug it is
+    # here to catch - shows up as far more than a tenth, because it compares different work, not noisy work.
+    check("an identical arm's ratio is 1 to within a tenth",
+          all(abs(r["speedup"] - 1.0) <= 0.10 for r in same), str([r["speedup"] for r in same]))
 
     # a real 2x difference must be caught, with an interval that excludes 1
     diff = summarise(paired([("fast", work(100000)), ("slow", work(200000))], rounds=9))
@@ -433,7 +445,19 @@ def selftest():
     check("the mask is inside the machine", info["mask"] < (1 << info["logical"]), str(info))
     masks = _core_masks()
     check("core masks are distinct and non-empty", len(masks) >= 1 and all(masks) and
-          len({m & (-m) for m in masks}) == len(masks), str(masks))
+          len({m & (-m) for m in masks}) == len(masks), str([hex(m) for m in masks]))
+    # the invariant that catches the parse bug: every logical processor must appear in exactly one core's mask
+    seen = 0
+    for m in masks:
+        seen |= m
+    check("core masks cover every logical processor exactly once",
+          bin(seen).count("1") == info["logical"] and sum(bin(m).count("1") for m in masks) == info["logical"],
+          "%d masks cover %d of %d logicals" % (len(masks), bin(seen).count("1"), info["logical"]))
+    if info["logical"] > len(masks):
+        check("a machine with SMT gets one mask per core, not per thread", len(masks) < info["logical"],
+              "%d masks for %d logicals" % (len(masks), info["logical"]))
+        check("the sibling sets are wider than one bit somewhere", any(bin(m).count("1") > 1 for m in masks),
+              str([hex(m) for m in masks]))
     wide = pin_affinity(info["logical"] + 4)
     check("asking for more threads than cores uses all logical processors",
           bin(wide["mask"]).count("1") == info["logical"], str(wide))

@@ -4,6 +4,14 @@
 
 ### New
 
+- **Pinning that pins the cores it claims.** `tools.bitnet_gemm.tmac`'s Windows topology probe read
+  `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` as two WORD headers where the API has a DWORD relationship and a DWORD
+  size, so the size field read 0, the loop broke on the first record and every mask fell back to one logical processor
+  without a word. On this 8C/16T host that made `pin_affinity(8)` mean **four cores with both SMT threads**, and every
+  table measured that way said "8 physical cores" over logicals 0-7. The parse is fixed, every table prints its mask,
+  and the selftest asserts that each logical belongs to exactly one core's mask. Re-measured, tiling the LUT GEMV wins
+  **1.80x [1.71, 1.91]** at expert width instead of 1.55x and the narrow-width `512 x 512` win is gone; the pair
+  table's lead over the best tiled LUT arm narrows to 1.22x. [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 - **GLM-5.3-Flash and MiniMax M3 conversion support.** `kindi convert` recognises `glm5-next` and `minimax-m3` and
   writes a **catalog pack** for them: `kindi_pack.json` plus `tensors.json` with every tensor's shape, type, bytes and
   role in its block, the geometry the header declares, the attention its tensors prove, a byte price per group, what a
@@ -49,10 +57,12 @@
 - **`tools.bitnet_gemm.libcompare`, and `kc_rows8_gemv` in the CPU library.** Puts the pair-table kernel and the T-MAC
   LUT on one matrix in one process, which is the comparison the paging note had been making across sources. The two
   agree to 2.2e-07 of their largest output, so correctness is not what separates them - speed is, and **the shipped pair
-  table wins**: 1.5x at 2048 x 1920 and 2.0-2.9x at 14336 x 4096, at one thread and at eight, pinned to physical cores
-  with 45 paired rounds an arm and reproduced in two runs. The first version of the harness left the LUT's OpenMP thread
-  count unset, and the "LUT 1.8x faster at one thread" it reported was that label rather than a kernel. No repack is
-  justified by speed: the best tiled LUT arm is still 1.38-1.44x behind the untiled pair table.
+  table wins**: 1.7-2.2x at 2048 x 1920 and 2.8-2.9x at 14336 x 4096, at one thread and at eight, pinned to physical
+  cores with 45 paired rounds an arm and reproduced in two runs. The first version of the harness left the LUT's OpenMP
+  thread count unset, and the "LUT 1.8x faster at one thread" it reported was that label rather than a kernel. No repack
+  is justified by speed: the best tiled LUT arm is still 1.22x behind the untiled pair table. `--sweep` is not a result
+  yet - thread scaling on this host is non-monotone at 47% background load, and pairing does not make arms exchangeable
+  when they contend with the background differently.
   [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 - **`tools.expert_merge.prune`.** Which experts a layer can simply not have, under an exact per-layer byte budget,
   decided from the captured router log and solved by the RCO knapsack - `drop` for 0 bytes and the expert's routing
