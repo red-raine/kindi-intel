@@ -99,6 +99,42 @@ return the same bytes. The Gumbel phase is kept because it is the mechanism a ca
 with an identity metric it has nothing left to improve, and this page says so rather than quoting the training as a
 gain.
 
+## Auto: one scheme a tensor, measured instead of guessed
+
+`kindi qat-pack CKPT.pt --scheme auto` runs all three quantisers on every ternary tensor, keeps the cheapest error, and
+writes the choice as `autotune.json` beside the pack (a pack with one scheme a tensor cannot be read without it). The
+codes and scales are the same bytes under every scheme - 67,764,992 of them for the 255M checkpoint either way - so the
+choice is free and the only question is which one costs less. The tuner is 3x that fit, because it fits all three.
+
+Measured on `bitqwen-qat-255m` (50 ternary matrices, 255.5 M parameters):
+
+| policy | relL2 a weight | vs `gsq` | bytes |
+|---|---:|---:|---:|
+| `absmean` | 0.017329 | +77.2% | 67,764,992 |
+| `lsq` | 0.010131 | +3.6% | 67,764,992 |
+| `gsq` | **0.009780** | - | 67,764,992 |
+| `auto` | **0.009780** | **+0.00%** | 67,764,992 |
+
+The per-tensor policy picks `gsq` on **50 of 50** tensors, so on this checkpoint it reproduces the best global scheme
+exactly and buys nothing. That is the honest result, and it is the expected one: the checkpoint was trained with the
+quantiser in the loop, so its weights are already shaped into three levels and the three schemes have converged on
+nearly the same answer. The 11.4% that `gsq` wins above is against **unshaped** heavy tails, which a QAT run does not
+have. Where the choice still moves is the head: `lm_head` is 2.070e-02 under `gsq` against 2.103e-02 under `lsq` and
+3.549e-02 under `absmean`, and no single global scheme is the answer to every tensor on a model that was not trained
+this way.
+
+`--within F` relaxes it: each tensor takes the **cheapest** scheme whose error is within F of the best it measured, so
+the policy is one you can explain per tensor instead of a strict minimum. On this checkpoint that costs nothing at 1%:
+
+| `--within` | policy | relL2 a weight | vs `gsq` |
+|---:|---|---:|---:|
+| 0.01 | 3 `lsq`, 47 `gsq` | 0.009780 | +0.00% |
+| 0.02 | 6 `lsq`, 44 `gsq` | 0.009848 | +0.70% |
+| 0.05 | 27 `lsq`, 23 `gsq` | 0.009941 | +1.65% |
+
+At 1% three tensors fall back to the cheaper scheme for no measurable error, which is what a policy you have to defend
+per tensor looks like. Above 2% the tolerance starts spending real quality for tidiness.
+
 ## RCO: an exact byte budget across tensors
 
 `kindi.rco` answers the other question a conversion asks: with a size the machine can hold, which tensors deserve to
