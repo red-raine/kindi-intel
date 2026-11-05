@@ -130,36 +130,37 @@ zero; relative RMSE to the target went **0.21593 -> 0.0**. The refit's own level
 most, worst block 0.0%), where the 2B pack's 8-bit grid costs 0.75% of a scale in its worst block.
 
 So the written refit is *Ingot's ternary weights with Bonsai's float tensors*: the scales of one file, the codes and the
-norms of the other. That makes it a controlled decomposition rather than a better build - a paired NLL walk against
-Bonsai prices what the scales alone are worth, and the float tensors stay out of that number entirely, since the 79-token
-comparison above is the only measurement here that has them in.
+norms of the other. That is a controlled decomposition rather than a better build, and three paired walks over the same
+192 tokens of the same prose file - the same windows, the same tokenisation - price its two levers apart:
 
-**What the scales alone are worth.** Both packs walked over the same 192 tokens of the same prose file, subtracted token
-by token:
+| arm | ternary weights | float tensors | NLL | delta vs Bonsai | 95% interval | closer on |
+|---|---|---|---:|---:|---|---:|
+| Bonsai 27B | Prism's PTQ scales | Bonsai's | 1.2907 | - | - | - |
+| `bonsai-27b-refit` | Ingot's, bit-identical | **Bonsai's** | 1.3121 | **+0.02143** | [-0.02261, +0.07851] | 91 of 192 |
+| Ingot 27B | Ingot's | Ingot's | 1.3310 | **+0.04024** | [+0.01418, +0.10469] | 99 of 192 |
 
-| arm | ternary weights | float tensors | NLL | delta vs Bonsai | 95% interval |
-|---|---|---|---:|---:|---|
-| Bonsai 27B | Prism's PTQ scales | Bonsai's | 1.2907 | - | - |
-| `bonsai-27b-refit` | Ingot's, bit-identical | **Bonsai's** | 1.3121 | **+0.02143** | [-0.02261, +0.07851] |
+The two deltas add exactly, 0.02143 + 0.01881 = 0.04024, because every arm walked the same tokens: the middle row
+against the last is the float tensors on their own, **+0.01881, interval [+0.00362, +0.06186]**, and it is the one that is
+resolved. It is also closer on 123 of the 192 tokens while worse on average - the norm cost is carried by the rows it
+hurts rather than spread over all of them.
 
-The refit pack is closer on 91 of the 192 tokens and Bonsai on 101, and the interval covers zero: **re-deriving every
-one of the 209.9 million block scales against the other file's weights does not resolve a direction at this budget.** A
-16-token-per-domain spot check over the four scale-gate corpora before this run pointed the other way on one domain
-(docs at -0.081, an interval degenerate at 16 tokens), which is exactly the noise the 192-token walk is for.
+Three things follow, and none of them flatters the Ingot recipe. The whole file difference on this text is **+0.040
+nats**, roughly half scales and half norms. The scales' half, +0.021 with an interval from -0.023 to +0.079, **does not
+resolve a direction**: re-deriving all 209.9 million block scales against the other file's weights is, on this evidence,
+neither a gain nor a measured loss. And the level-table bias inside that arm - the refit's tables are exact where
+Bonsai's 8-bit grid costs 0.75% of a scale in its worst block - is bounded by what that grid costs by itself in this
+format: +0.00182 nats pooled over 4,096 tokens of the 2B pack ([QAT-CONVERSION.md](QAT-CONVERSION.md)), a tenth of the
++0.021 and well inside its interval.
 
-That does not contradict the +0.006405 nats further up, but it bounds it. Ingot's entire difference from Bonsai on 79
-tokens of prose was +0.0064, and the scales are the largest single lever in it - so the honest reading of the Ingot
-recipe at 2 bits is that it moves every scale in the file and moves held-out NLL by less than the ~0.05 nats a paired
-walk of this size can resolve. What that leaves is the code: the trits are identical in both files, so no re-derivation of
-the scales can move a weight the codes have already rounded wrong. [QAT-CONVERSION.md](QAT-CONVERSION.md) measures that
-floor directly - refitting a scale on drifted weights recovers at most 1.2 points of retention, never 1.0.
+The 79-token `tools.kl` walk further up put Ingot at +0.006405 nats on this file, six times smaller than the +0.040 above.
+Different protocol, shorter window; the two agree on the sign and the paired walk is the one with an interval. What both
+leave is the code: the trits are identical in the two files, so no re-derivation of the scales can move a weight the
+codes have already rounded wrong, and [QAT-CONVERSION.md](QAT-CONVERSION.md) measures that floor directly - refitting a
+scale on drifted weights recovers at most 1.2 points of retention, never 1.0.
 
-Three limits on the tool itself. It cannot repair a code, as above. It needs a target pack of the same model in the same
-rotation basis, and refuses rather than guesses: another Hadamard rotation, another width, a tensor the target does not
-have, or a source whose `pcodes.bin` stages its own copy of the scales are all errors, not warnings. And its delta is not
-purely the target's: a pack whose scales sit on a coarse level table can appear to improve for the table's sake, and here
-the refit's tables are exact where Bonsai's 8-bit grid costs 0.75% of a scale in its worst block. That bias runs in the
-refit's favour, and it still does not resolve a direction.
+Two limits on the tool itself. It cannot repair a code, as above. And it needs a target pack of the same model in the
+same rotation basis, and refuses rather than guesses: another Hadamard rotation, another width, a tensor the target does
+not have, or a source whose `pcodes.bin` stages its own copy of the scales are errors, not warnings.
 
 ## Why this belongs next to the K/V measurements
 
@@ -168,7 +169,7 @@ The 2-bit V experiment found one thing that helps a 2-bit container: a scale per
 level up. `PQ2_0` is `PTQ1_0` with 8 more bits a block spent on a denser code, and the winner of the Ingot round
 spent none of its budget on the code: it kept the trits and re-derived the scales and norms against a BF16 teacher.
 Whatever the 27B can still gain at 2 bits, this evidence says it is in the scale rather than the alphabet - though the
-refit above puts a size on that lever, and on 192 tokens it is smaller than ±0.05 nats.
+refit above puts a size on that lever, and on 192 tokens the scales' half is +0.021 with an interval that covers zero.
 
 ## Reproducing
 
@@ -206,8 +207,12 @@ The refit, and what it is worth:
 
 ```bash
 python -m kindi.refit --pack packs/bonsai-27b --target packs/ingot-27b --out packs/bonsai-27b-refit --link
-python -m tools.nll --pack packs/bonsai-27b --against packs/bonsai-27b-refit \
-  --corpus corpora/scale-gate/prose/prose.txt --tokens 192 --block 24 --json packs/nll-refit-27b-prose.json
+# the three arms: scales (Bonsai -> refit), norms (refit -> Ingot), both (Bonsai -> Ingot)
+for pair in "bonsai-27b bonsai-27b-refit" "bonsai-27b-refit ingot-27b" "bonsai-27b ingot-27b"; do
+  set -- $pair
+  python -m tools.nll --pack packs/$1 --against packs/$2 --corpus corpora/scale-gate/prose/prose.txt \
+    --tokens 192 --block 24 --json packs/nll-$1-vs-$2.json
+done
 ```
 
 ## Maple-Preview is a different engine's problem
