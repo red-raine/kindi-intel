@@ -10,6 +10,9 @@
   pack - `dpm.bin`/`dscale.bin` re-derived, the code and float files copied or hard-linked - records the target and
   what it compared in `kindi_pack.json`, and re-reads its own output through `packio` before returning. Priced with
   `tools.nll --against` on the 27B pair whose codes are byte-identical: [docs/PACK-ZOO.md](docs/PACK-ZOO.md).
+  `--retable` is its storage control - the same codes and the same scale values, only the 8-bit tables rebuilt - which
+  on that pair moves 0 of 209,920,000 values and prices at +0.00000 nats, so the refit's delta is the values it writes
+  and not the encoding it writes them in.
 - **`kindi recipes` and `--scan`.** Reads a GGUF header (family, depth, width, experts, context, rope scaling, tensor
   types) without touching tensor data, and prints the conversion plan for a job - `coder`, `agent`, `rag`, `search`,
   `science`, `chat` - with the reasons a file cannot support it. `--scan DIR` does it for every model under a

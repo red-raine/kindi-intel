@@ -127,11 +127,12 @@ run took 29 minutes and compared all **6,717,440,000** code bytes: **0 differ** 
 reproduce a scale the target already holds. It does, exactly - with the codes fixed and `w = c*s`, `<w,c>/<c,c>` is `s` -
 and the output pack's **209,920,000** scales decode **bit-identically** to Ingot's. 0 blocks had no codes and 0 clipped at
 zero; relative RMSE to the target went **0.21593 -> 0.0**. The refit's own level tables then cost nothing (250 levels at
-most, worst block 0.0%), where the 2B pack's 8-bit grid costs 0.75% of a scale in its worst block.
+most, worst block 0.0%), where the 2B pack's 8-bit grid costs 0.75% of a scale in its worst block - and the control
+below prices that storage at +0.00000 nats, because a refit's values are the target's table entries to begin with.
 
 So the written refit is *Ingot's ternary weights with Bonsai's float tensors*: the scales of one file, the codes and the
-norms of the other. That is a controlled decomposition rather than a better build, and three paired walks over the same
-192 tokens of the same prose file - the same windows, the same tokenisation - price its two levers apart:
+norms of the other. That is a controlled decomposition rather than a better build, and four paired walks over the same
+192 tokens of the same prose file - the same windows, the same tokenisation - price each lever apart:
 
 | arm | ternary weights | float tensors | NLL | delta vs Bonsai | 95% interval | closer on |
 |---|---|---|---:|---:|---|---:|
@@ -144,13 +145,41 @@ against the last is the float tensors on their own, **+0.01881, interval [+0.003
 resolved. It is also closer on 123 of the 192 tokens while worse on average - the norm cost is carried by the rows it
 hurts rather than spread over all of them.
 
+**The middle row changes two things, and the storage half of it is zero.** A refit rewrites each scale's *value* and
+its 8-bit *table* entry together, so the walk of Bonsai against the refit prices both at once. `kindi refit --retable`
+separates them: it keeps every code and every scale value and only rewrites the values through the refit's own
+encoder. Built from Bonsai it changes **0 of 209,920,000** scale values - 402 of 402 tensors come back exact, worst
+relative error 0.0 - so the pack decodes bit-identically to the one it came from. Priced over the same 192 tokens it
+costs **+0.00000 nats, interval [+0.00000, +0.00000]**, with 0 tokens closer on either side and both NLLs at 1.2907:
+a null control, and the harness returns one. The whole +0.02143 is the scale values themselves:
+
+| lever | packs walked | nats | 95% interval |
+|---|---|---:|---|
+| 8-bit level tables (storage) | Bonsai -> `bonsai-27b-retable` | +0.00000 | [+0.00000, +0.00000] |
+| scale values | `bonsai-27b-retable` -> `bonsai-27b-refit` | +0.02143 | [-0.02261, +0.07851] |
+| float tensors (norms) | `bonsai-27b-refit` -> Ingot 27B | +0.01881 | [+0.00362, +0.06186] |
+| the file difference | Bonsai -> Ingot 27B | +0.04024 | [+0.01418, +0.10469] |
+
+The middle row is the refit's own walk, recorded once: the retable pack decodes identically to Bonsai, so walking one
+against the refit *is* walking the other. That the storage costs nothing is not luck about this encoder. Every code
+byte matches the target, so the solve returns the target's own scale in every block - `<w, c> / <c, c>` with
+`w = c*s` is `s` - which makes all 209.9 million fitted values members of Ingot's 256-entry table before a table is
+built. The encoder then reproduces any 256-level set exactly, which is also what it does to Bonsai's scales. Two
+files, the same 8 bits an entry, each carrying its own numbers without loss: the difference between them is which
+numbers those are.
+
+That reframes what the refit measures, and the middle row is what makes it visible. It is not fitting: with the codes
+frozen it is a transplant of Ingot's scales onto Bonsai's codes, so +0.02143 is the price of Ingot's magnitude set on
+this text with no alphabet, no table and no code difference in the way. What it cannot answer is whether a better fit
+exists, because a fit is not what happened - the values it wrote were already the target's.
+
 Three things follow, and none of them flatters the Ingot recipe. The whole file difference on this text is **+0.040
 nats**, roughly half scales and half norms. The scales' half, +0.021 with an interval from -0.023 to +0.079, **does not
 resolve a direction**: re-deriving all 209.9 million block scales against the other file's weights is, on this evidence,
-neither a gain nor a measured loss. And the level-table bias inside that arm - the refit's tables are exact where
-Bonsai's 8-bit grid costs 0.75% of a scale in its worst block - is bounded by what that grid costs by itself in this
-format: +0.00182 nats pooled over 4,096 tokens of the 2B pack ([QAT-CONVERSION.md](QAT-CONVERSION.md)), a tenth of the
-+0.021 and well inside its interval.
+neither a gain nor a measured loss. And the level table inside that arm is not a lever at all: the control prices the
+refit's storage at +0.00000, because a fitted scale *is* the target's table entry. A build that has to invent levels
+pays for its grid, which is what the 2B pack's +0.00182 nats pooled over 4,096 tokens measures, a tenth of the +0.021
+and inside its interval ([QAT-CONVERSION.md](QAT-CONVERSION.md)) - but it is not what the refit arm is paying.
 
 The 79-token `tools.kl` walk further up put Ingot at +0.006405 nats on this file, six times smaller than the +0.040 above.
 Different protocol, shorter window; the two agree on the sign and the paired walk is the one with an interval. What both
@@ -207,7 +236,12 @@ The refit, and what it is worth:
 
 ```bash
 python -m kindi.refit --pack packs/bonsai-27b --target packs/ingot-27b --out packs/bonsai-27b-refit --link
-# the three arms: scales (Bonsai -> refit), norms (refit -> Ingot), both (Bonsai -> Ingot)
+# the storage control: same codes, same scale values, only the tables rebuilt
+python -m kindi.refit --pack packs/bonsai-27b --out packs/bonsai-27b-retable --retable --link
+# the four walks: storage (Bonsai -> retable), scales (retable/refit), norms (refit -> Ingot), both (Bonsai -> Ingot)
+python -m tools.nll --pack packs/bonsai-27b --against packs/bonsai-27b-retable \
+  --corpus corpora/scale-gate/prose/prose.txt --tokens 192 --block 24 \
+  --json packs/nll-retable-vs-bonsai-27b-prose.json
 for pair in "bonsai-27b bonsai-27b-refit" "bonsai-27b-refit ingot-27b" "bonsai-27b ingot-27b"; do
   set -- $pair
   python -m tools.nll --pack packs/$1 --against packs/$2 --corpus corpora/scale-gate/prose/prose.txt \

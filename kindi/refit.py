@@ -115,6 +115,20 @@ class Pack(object):
         return self._tabs[t0:t0 + tn][self._dpm[q:q + n]]
 
 
+def _v2_record(dpm, dtable, vals, dblk, dtab_off, *recs):
+    """one tensor's scales as an 8-bit level table: write the index, keep the table, point every record at both.
+
+    Returns (next dtab_off, table, index, exact). The refit and the retable both write through this, so whatever a
+    paired walk of their output measures is the same storage path in both.
+    """
+    table, idx, exact = packio.level_table(vals)
+    dpm.write(np.ascontiguousarray(idx).tobytes())
+    dtable.append(table)
+    for r in recs:
+        r.update({"dblk": dblk, "dtab_off": dtab_off, "dtab_n": int(table.size)})
+    return dtab_off + 2 * int(table.size), table, idx, exact
+
+
 def _place(src, dst, link):
     if link:
         try:
@@ -196,12 +210,8 @@ def refit(src, dst, target, log=print, link=False, chunk=512):
         tot["tensors"] += 1
         vals = np.ascontiguousarray(new.T.reshape(-1)).astype(np.float16)        # flat [group][row], as packs store it
         if v2:
-            table, idx, exact = packio.level_table(vals)
-            dpm.write(np.ascontiguousarray(idx).tobytes())
-            dtable.append(table)
-            s.ix["tensors"][name].update({"dblk": dblk, "dtab_off": dtab_off, "dtab_n": int(table.size)})
-            s.bi[name].update({"dblk": dblk, "dtab_off": dtab_off, "dtab_n": int(table.size)})
-            dtab_off += 2 * int(table.size)
+            dtab_off, table, idx, exact = _v2_record(dpm, dtable, vals, dblk, dtab_off,
+                                                     s.ix["tensors"][name], s.bi[name])
             tot["max_levels"] = max(tot["max_levels"], int(table.size))
             tot["exact"] += int(exact)
             # what this tensor's 8-bit table costs the scales it was fitted to, block by block - the file's own error,
@@ -275,6 +285,85 @@ def refit(src, dst, target, log=print, link=False, chunk=512):
     return rep
 
 
+def retable(src, dst, log=print, link=False):
+    """every code and every scale value kept; only the storage changes - the same values, re-encoded as tables
+
+    A refit changes two things at once: which values a block scale takes, and how it is stored. A paired walk of a
+    refit against its source therefore prices both in one number. This mode leaves the values exactly as they are and
+    runs them through the refit's own encoder, so a walk of its output against the source measures the storage path
+    and nothing else - and on a source this encoder already produced that walk must return zero, which is the control.
+    """
+    t0 = time.time()
+    s = Pack(src)
+    if os.path.exists(dst) and os.listdir(dst):
+        raise SystemExit("kindi retable: %s already holds files; a retable writes a new pack, it does not patch one" % dst)
+    if os.path.exists(os.path.join(src, "pcodes.bin")):
+        raise SystemExit("kindi retable: %s holds pcodes.bin, which carries its own copy of the block scales for the "
+                         "expert matrices and would go stale; convert without --paircodes first" % src)
+    os.makedirs(dst, exist_ok=True)
+    tot = dict(blocks=0, tensors=0, exact=0, max_levels=0, max_rel=0.0, changed=0, scale_bytes=0)
+    dtable, dtab_off, dblk = [], 0, 0
+    dpm = open(os.path.join(dst, "dpm.bin"), "wb")
+    keep_first = None
+    for i, name in enumerate(s.bi):
+        # one copy: a v1 source hands back a memmap view, and the encoder indexes it in place
+        vals = np.ascontiguousarray(np.asarray(s.scales(name)).astype(np.float16))     # flat [group][row]
+        dtab_off, table, idx, exact = _v2_record(dpm, dtable, vals, dblk, dtab_off,
+                                                 s.ix["tensors"][name], s.bi[name])
+        back = packio.decode(table, idx).astype(np.float64)
+        v64 = vals.astype(np.float64)
+        ok = v64 > 0
+        if ok.any():
+            tot["max_rel"] = max(tot["max_rel"], float((np.abs(back[ok] - v64[ok]) / v64[ok]).max()))
+        tot["changed"] += int((back != v64).sum())
+        tot["blocks"] += int(vals.size)
+        tot["tensors"] += 1
+        tot["exact"] += int(exact)
+        tot["max_levels"] = max(tot["max_levels"], int(table.size))
+        tot["scale_bytes"] += 2 * int(table.size)
+        dblk += int(vals.size)
+        if keep_first is None:
+            keep_first = (name, vals.copy())
+        if (i + 1) % 40 == 0:
+            log("  %d / %d tensors" % (i + 1, len(s.bi)))
+    dpm.close()
+    with open(os.path.join(dst, "dscale.bin"), "wb") as f:
+        f.write(np.concatenate(dtable).astype(np.float16).tobytes())
+    for name in sorted(os.listdir(src)):
+        if name in COPY or name.startswith("signs_"):
+            _place(os.path.join(src, name), os.path.join(dst, name), link)
+    with open(os.path.join(dst, "index.json"), "w") as f:
+        json.dump(s.ix, f)
+    with open(os.path.join(dst, "bcodes_index.json"), "w") as f:
+        json.dump({"tensors": s.bi}, f)
+    man = dict(s.man)
+    man["pack_format"] = 2
+    man["dpm_bytes"] = os.path.getsize(os.path.join(dst, "dpm.bin"))
+    man["block_scales"] = {"bits": packio.BITS, "file": "dscale.bin",
+                           "bytes": os.path.getsize(os.path.join(dst, "dscale.bin")),
+                           "ternary_tensors": tot["tensors"], "exact_tensors": tot["exact"],
+                           "max_levels": tot["max_levels"], "max_relative_error": round(tot["max_rel"], 6)}
+    man["retable"] = {"source": os.path.abspath(src),
+                      "method": "every code and every scale value kept; the scales re-encoded as one 8-bit level "
+                                "table a tensor through kindi.refit's own encoder",
+                      "blocks": tot["blocks"], "tensors": tot["tensors"], "exact_tensors": tot["exact"],
+                      "max_levels": tot["max_levels"], "max_relative_error": round(tot["max_rel"], 8),
+                      "scale_values_changed": tot["changed"], "seconds": round(time.time() - t0, 1)}
+    with open(os.path.join(dst, "kindi_pack.json"), "w") as f:
+        json.dump(man, f, indent=2)
+    out = Pack(dst)
+    name, want = keep_first
+    got = np.asarray(out.scales(name))
+    if got.shape != want.shape or not np.allclose(got.astype(np.float32), want.astype(np.float32),
+                                                  rtol=max(2.0 * tot["max_rel"], 1e-3)):
+        raise SystemExit("kindi retable: %s reads back from %s with scales that are not the ones written" % (name, dst))
+    log("retable %s -> %s" % (src, dst))
+    log("  %d blocks, %d tensors; %d scale values changed, worst %.6f relative; %d tensors exact, %d levels at most"
+        % (tot["blocks"], tot["tensors"], tot["changed"], tot["max_rel"], tot["exact"], tot["max_levels"]))
+    log("  %d s" % int(time.time() - t0))
+    return man["retable"]
+
+
 # --- selftest ---------------------------------------------------------------------------------------------------------
 
 PASS = []
@@ -344,6 +433,35 @@ def selftest():
           "worst %.3f relative, %d code bytes differ" % (float(np.abs(sd.astype(np.float32) / (2 * sa) - 1).max()),
                                                          rd["code_bytes_differing"]))
 
+    # a retable writes the same codes and re-encodes the values; a tensor with more distinct scales than the table
+    # has entries is where the 8-bit grid actually costs something, so build one deliberately
+    vary = os.path.join(tmp, "vary")
+    quant.pack({"x.weight": (rng.randn(512, 128) * (1.0 + np.arange(512) / 512.0)[:, None]).astype(np.float32)},
+               vary, log=lambda *x: None)
+    rp = os.path.join(tmp, "retab")
+    rr = retable(vary, rp, log=lambda *x: None)
+    same_codes = np.array_equal(np.asarray(Pack(rp).codes("x.weight")[0]), np.asarray(Pack(vary).codes("x.weight")[0]))
+    check("a retable keeps every code and bounds the scale error by its 8-bit grid",
+          same_codes and rr["scale_values_changed"] > 0 and 0.0 < rr["max_relative_error"] < 0.02,
+          "worst %.5f relative, %d of %d values moved, codes %s"
+          % (rr["max_relative_error"], rr["scale_values_changed"], rr["blocks"],
+             "identical" if same_codes else "CHANGED"))
+    rr2 = retable(rp, os.path.join(tmp, "retab2"), log=lambda *x: None)
+    check("a second retable moves no scale value: a set of tables comes back bit for bit",
+          rr2["scale_values_changed"] == 0 and rr2["max_relative_error"] == 0.0,
+          "%d of %d values moved" % (rr2["scale_values_changed"], rr2["blocks"]))
+    import contextlib
+    import io
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            main(["--pack", vary, "--out", os.path.join(tmp, "retab3"), "--retable", "--target", vary])
+        refused = ""
+    except SystemExit:
+        refused = err.getvalue()
+    check("a retable with a --target is refused, because keeping the values leaves nothing to fit",
+          "nothing to fit" in refused, refused.strip().splitlines()[-1][:70] if refused else "")
+
     # a target that cannot serve a tensor is refused by name, rather than leaving that tensor unfitted
     c_only = os.path.join(tmp, "half")
     quant.pack({"x.weight": w1}, c_only, log=lambda *x: None)
@@ -385,9 +503,16 @@ def selftest():
         refused = ""
     except SystemExit as e:
         refused = str(e)
+    try:
+        retable(a, os.path.join(tmp, "bad5"), log=lambda *x: None)
+        stale = ""
+    except SystemExit as e:
+        stale = str(e)
     os.remove(os.path.join(a, "pcodes.bin"))
     check("a pack whose pcodes.bin holds its own scales is refused, not left disagreeing with itself",
           "pcodes.bin" in refused and "stale" in refused, refused[:60])
+    check("a retable of a pack whose pcodes.bin holds its own scales is refused for the same reason",
+          "pcodes.bin" in stale and "stale" in stale, stale[:60])
 
     print("\n%d checks passed, %d failed" % (len(PASS), len(FAILED)))
     return 0 if len(FAILED) == 0 else 1
@@ -398,14 +523,24 @@ def main(argv=None):
     ap.add_argument("--pack", help="the source pack: its codes are what the output keeps")
     ap.add_argument("--target", help="the pack whose weights the scales are fitted to")
     ap.add_argument("--out", help="a new directory for the refitted pack")
+    ap.add_argument("--retable", action="store_true",
+                    help="keep the scale values too, and only re-encode them as 8-bit tables (the storage control "
+                         "for a refit, not a second fit)")
     ap.add_argument("--link", action="store_true", help="hard-link the files that do not change instead of copying")
     ap.add_argument("--chunk", type=int, default=512, help="rows a fit does at a time (default 512)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if a.retable:
+        if not (a.pack and a.out):
+            ap.error("--retable needs --pack and --out")
+        if a.target:
+            ap.error("--retable keeps the source's scale values, so a --target has nothing to fit; drop one")
+        retable(a.pack, a.out, link=a.link)
+        return 0
     if not (a.pack and a.target and a.out):
-        ap.error("--pack, --target and --out are all needed (or --selftest)")
+        ap.error("--pack, --target and --out are all needed (or --selftest, or --retable)")
     refit(a.pack, a.out, a.target, link=a.link, chunk=a.chunk)
     return 0
 
