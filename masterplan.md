@@ -58,7 +58,14 @@ Read `appendix.md` for links and numbers. Five conclusions that moved the plan:
 5. **The CPU wins that are measured are memory-side, not kernel-side.** On AVX2, a good ternary LUT kernel is ~2× a
    naive one but *nothing* over a good FMA kernel once decode is bandwidth-bound; the 6× figures are vs llama.cpp FP16
    on the same bytes. What is measured: pinning the small always-hot tensors (+26%), explicit merged reads instead of
-   page faults (+13–14%, up to +55% with a coalesced layout), thread count at physical cores. That is `P6`.
+   page faults (+13–14%, up to +55% with a coalesced layout), thread count at physical cores. That is `P6`. The one
+   exception, added 2026-11-05: **1.55× [1.45, 1.66]** from tiling the LUT GEMV at expert width, which is a layout and
+   occupancy win inside the compute path rather than arithmetic (`docs/TERNARY-LUT-AND-PAGING-2026.md`) — so "memory-side,
+   not kernel-side" is right about *what the win is*, and wrong to imply the kernel has none.
+   **The LUT is still the wrong decoder on this host**, measured in one process: the shipped pair table (`rows8`) is
+   1.5× the LUT at 2048×1920 and **2.0-2.9×** at 14336×4096, and the best tiled LUT arm (3.30 ms) is 1.38-1.44× slower
+   than the untiled pair table (2.29-2.40 ms). `tools/bitnet_gemm/libcompare.py`; `P5` is unaffected (it is a byte
+   cut), and no repack is justified by speed.
 
 ---
 
@@ -197,7 +204,10 @@ negative). If our expert slabs are ≥ 4 MB after P5 packing, coalescing will no
 **0.23 GB/s** cold, **100** random 4 KB IOPS — so a 14.7 MB expert read is **64 ms** there, not the 3.3-4.0 ms the
 research's C: number gave. The NVMe at **C:** does 1.65-3.33 GB/s. Until the packs live on C: or in RAM, no pipeline,
 merged read or pinning hides 64 ms, and the double-buffer ceiling is 2.7% rather than 33%
-(`docs/TERNARY-LUT-AND-PAGING-2026.md`). Placement is the first experiment; the rest of this item is after it.
+(`docs/TERNARY-LUT-AND-PAGING-2026.md`). Those two percentages carry a **1.8 ms** compute floor that the pinned harness
+has since measured at a **3.3 ms** median, which would move them to 4.9% and 47% and the break-even to ~1 token; the
+verdict does not turn on it (the read is 64 ms either way), but re-run the budget before committing anything to paging.
+Placement is the first experiment; the rest of this item is after it.
 
 ### P7 — Exact speculative decoding from an n-gram cache — **~2 days**
 

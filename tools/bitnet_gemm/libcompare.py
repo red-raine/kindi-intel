@@ -1,4 +1,4 @@
-"""Push one matrix through the pair-table kernel and the LUT kernel in a single process, and report both.
+"""One matrix, one activation vector, two decoders, one process - pinned and paired.
 
 The paging note claimed the T-MAC LUT kernel "matches the shipped pair table at parity, so a repack of the weight layout
 would buy nothing". That claim was made across sources: one number came from `tools/bitnet_gemm/tmac.py` and the other
@@ -6,8 +6,8 @@ from `kindi.cpu`, in different processes, on different matrices, with the packin
 could be the matrix, the pack layout, or the driver, and no amount of care in either file rules those out. This settles
 it the only way it can be settled - both kernels in one process, one matrix, one activation vector, one timing loop.
 
-    python -m tools.bitnet_gemm.libcompare
-    python -m tools.bitnet_gemm.libcompare --rows 2048 --cols 1920 --reps 9 --threads 8
+    python -m tools.bitnet_gemm.libcompare                          # 2048 x 1920 and 14336 x 4096
+    python -m tools.bitnet_gemm.libcompare --rounds 15 --runs 3 --threads 8
 
 What it builds: `kindi/kcpu.c` into the same library `kindi.cpu` uses (MSVC here, gcc elsewhere), and `tmac.cpp` as a
 torch extension. The pair-table arm runs `rows8` - the kernel the packs actually decode through - via `kc_rows8_gemv`,
@@ -15,21 +15,24 @@ a harness entry that takes the engine's own packed bytes so no model is needed. 
 
 Fairness, stated because it is easy to get wrong: both arms get the same ternary weights and the *same int8 activation
 vector*, with the activation scale carried the way each kernel expects it (as floats for `rows8`, as `scale_a` for the
-LUT), so the only difference left is how each kernel reads four weights at a time. Timing is best-of-N for each arm at
-one thread, and the pair-table arm additionally at the engine's thread count, since that is how it is really called.
+LUT), so the only difference left is how each kernel reads four weights at a time. Both arms get an explicit thread
+count at every row - the first version of this file left the LUT's count unset, so its "one thread" row was really an
+all-core LUT call against a one-thread pair table, and the 0.68x it printed was that mistake and not a kernel result.
+
+Timing method is the one in `tmac.py`, for the same reason: the process is pinned to physical cores, the two arms run
+back to back inside every round, and the number reported is the mean of the per-round paired ratios with a 95% bootstrap
+interval. A minimum would report the quietest draw of a distribution whose spread is the question.
 """
 import ctypes
 import os
-import shutil
-import subprocess
 import sys
-import time
 
 import numpy as np
 
 from kindi import cbuild, cpu
+from tools.bitnet_gemm import tmac
 
-ROWS, COLS = 2048, 1920
+SHAPES = [(2048, 1920), (14336, 4096)]        # a projection GEMV, and one MoE expert slab
 
 
 def lib():
@@ -46,25 +49,6 @@ def lib():
                                 P(ctypes.c_float), P(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int]
     L.kc_rows8_gemv.restype = ctypes.c_int
     return L, so
-
-
-def msvc_env():
-    """Put cl.exe on this process's PATH.
-
-    `kindi.cbuild` calls cl.exe through vcvarsall itself, but torch's cpp_extension shells out to `where cl`, so the
-    LUT arm needs the environment imported rather than a wrapped command. Skipped off Windows and when cl is already
-    reachable.
-    """
-    if os.name != "nt" or shutil.which("cl"):
-        return
-    vc = cbuild.find_vcvarsall()
-    if not vc:
-        raise SystemExit("kindi libcompare: no Visual Studio VC toolset to build the LUT extension")
-    out = subprocess.run('call "%s" x64 >nul && set' % vc, shell=True, capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            os.environ[k] = v
 
 
 def pack_pair(w):
@@ -102,77 +86,105 @@ def rows8_gemv(L, W, S, x, threads=1):
     return y
 
 
-def best_of(fn, reps):
-    fn()                                                              # warm
-    best = float("inf")
-    for _ in range(reps):
-        t0 = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t0)
-    return best
+def fixture(R, C, seed):
+    """the two arms' inputs, built once: a repack inside a timing loop is not the kernel and dominated it once"""
+    import torch
+
+    g = np.random.default_rng(seed)
+    w = g.integers(-1, 2, size=(R, C), dtype=np.int8)
+    a_int = np.clip(np.rint(g.standard_normal(C) * 40.0), -127, 127).astype(np.int8)
+    scale_a = 1.0 / 37.0
+    W, S = pack_pair(w)
+    return dict(w=w, a_int=a_int, scale_a=scale_a, W=W, S=S,
+                x=a_int.astype(np.float32) * np.float32(scale_a),
+                a_t=torch.from_numpy(a_int),
+                lut_packed=tmac.pack_for_tmac(torch.from_numpy(w)),
+                ones=torch.ones(R))
+
+
+def correctness(L, mod, fx, R, C):
+    """both kernels against an exact integer reference, and against each other"""
+    a_int, w, scale_a = fx["a_int"], fx["w"], fx["scale_a"]
+    y_pair = rows8_gemv(L, fx["W"], fx["S"], fx["x"], threads=1)
+    y_lut = mod.tmac_gemv_avx2(fx["a_t"], fx["lut_packed"], scale_a, fx["ones"]).numpy()
+    ref = (a_int.astype(np.int64) @ w.astype(np.int64).T).astype(np.float64) * scale_a
+    scale = float(np.abs(ref).max())
+    dp = float(np.abs(y_pair - ref).max())
+    dl = float(np.abs(y_lut - ref).max())
+    dpn = float(np.abs(y_pair - y_lut).max())
+    print("\n%d x %d ternary, one int8 activation vector (scale %.4f), %d rows' results each\n" % (R, C, scale_a, R))
+    print("  pair table (rows8)  max |y - exact| %.3e  (%.2e of the largest |y|)" % (dp, dp / scale))
+    print("  LUT (vpshufb)       max |y - exact| %.3e  (%.2e of the largest |y|)" % (dl, dl / scale))
+    print("  the two against each other           %.3e  (%.2e of the largest |y|)" % (dpn, dpn / scale))
+    return dpn / scale
+
+
+def compare(mod, L, fx, R, C, threads, rounds, runs):
+    """interleaved paired walk: every arm every round, ratio and interval against the pair table"""
+    mod.set_threads(threads)
+    arms = [("pair table (rows8)", lambda: rows8_gemv(L, fx["W"], fx["S"], fx["x"], threads)),
+            ("LUT (vpshufb)", lambda: mod.tmac_gemv_avx2(fx["a_t"], fx["lut_packed"], fx["scale_a"], fx["ones"]))]
+    pooled, per_run = {}, {name: [] for name, _ in arms}
+    for _ in range(runs):
+        t = tmac.paired(arms, rounds)
+        b = np.asarray(t[arms[0][0]], dtype=np.float64)
+        for name, _fn in arms:
+            pooled.setdefault(name, []).extend(list(t[name]))
+            per_run[name].append(float(np.mean(b / np.asarray(t[name], dtype=np.float64))))
+    rows = tmac.summarise(pooled)
+    print("    %-22s %9s %6s %9s %-15s %-16s %s"
+          % ("arm", "median ms", "CV", "vs pair", "95% CI", "per run", "verdict"))
+    for r in rows:
+        print("    %-22s %9.3f %5.1f%% %8.2fx [%5.2f, %5.2f] %-16s %s   %.1f G weights/s"
+              % (r["arm"], r["ms"], r["cv"], r["speedup"], r["lo"], r["hi"],
+                 " ".join("%.2f" % s for s in per_run[r["arm"]]), r["verdict"],
+                 R * C / (r["ms"] / 1e3) / 1e9))
+    return rows
 
 
 def main(argv):
     def arg(name, default):
         return argv[argv.index(name) + 1] if name in argv else default
 
-    R = int(arg("--rows", ROWS))
-    C = int(arg("--cols", COLS))
-    reps = int(arg("--reps", 9))
-    threads = int(arg("--threads", os.cpu_count() or 8))
+    rounds = int(arg("--rounds", 15))
+    runs = int(arg("--runs", 3))
+    threads = int(arg("--threads", 8))
     seed = int(arg("--seed", 0))
-    if R % 8 or C % 128:
-        raise SystemExit("kindi libcompare: the pair layout needs rows % 8 == 0 and cols % 128 == 0 (%d x %d)"
-                         % (R, C))
+    if "--rows" in argv or "--cols" in argv:
+        shapes = [(int(arg("--rows", 2048)), int(arg("--cols", 1920)))]
+    else:
+        shapes = SHAPES
+    for R, C in shapes:
+        if R % 8 or C % 128:
+            raise SystemExit("kindi libcompare: the pair layout needs rows %% 8 == 0 and cols %% 128 == 0 (%d x %d)"
+                             % (R, C))
 
     import torch
-    from tools.bitnet_gemm import tmac
+    torch.set_num_threads(1)                     # rows8 is already OpenMP; torch must not add a pool of its own
 
     L, so = lib()
     mask = L.kc_tier_mask()
     print("libkcpu: %s (tiers %s)" % (so, "avx2" if mask & 2 else "scalar"))
-
-    g = np.random.default_rng(seed)
-    w = g.integers(-1, 2, size=(R, C), dtype=np.int8)
-    a_int = np.clip(np.rint(g.standard_normal(C) * 40.0), -127, 127).astype(np.int8)
-    scale_a = 1.0 / 37.0
-
-    W, S = pack_pair(w)
-    x = a_int.astype(np.float32) * np.float32(scale_a)                # rows8 takes floats
-    y_pair = rows8_gemv(L, W, S, x, threads=1)
-
-    msvc_env()
     mod = tmac.build()
-    a_t = torch.from_numpy(a_int)
-    packed = tmac.pack_for_tmac(torch.from_numpy(w))                 # once: a repack inside the timing loop is not
-    ones = torch.ones(R)                                             # the kernel's cost, and it dominated it here
-    y_lut = mod.tmac_gemv_avx2(a_t, packed, scale_a, ones).numpy()
 
-    ref = (a_int.astype(np.int64) @ w.astype(np.int64).T).astype(np.float64) * scale_a
-    dp = float(np.abs(y_pair - ref).max())
-    dl = float(np.abs(y_lut - ref).max())
-    dpn = float(np.abs(y_pair - y_lut).max())
-    scale = float(np.abs(ref).max())
-    print("\n%d x %d ternary, one int8 activation vector (scale %.4f), %d rows' results each\n" % (R, C, scale_a, R))
-    print("  pair table (rows8)  max |y - exact| %.3e  (%.2e of the largest |y|)" % (dp, dp / scale))
-    print("  LUT (vpshufb)       max |y - exact| %.3e  (%.2e of the largest |y|)" % (dl, dl / scale))
-    print("  the two against each other           %.3e  (%.2e of the largest |y|)" % (dpn, dpn / scale))
+    worst = 0.0
+    for R, C in shapes:
+        fx = fixture(R, C, seed)
+        worst = max(worst, correctness(L, mod, fx, R, C))
 
-    t_pair = best_of(lambda: rows8_gemv(L, W, S, x, threads=1), reps)
-    t_lut = best_of(lambda: mod.tmac_gemv_avx2(a_t, packed, scale_a, ones), reps)
-    print("\n  %4.2f M weights a call, best of %d\n" % (R * C / 1e6, reps))
-    for name, t in (("pair table, 1 thread", t_pair), ("LUT, 1 thread", t_lut)):
-        print("  %-22s %7.3f ms  %6.1f G weights/s" % (name, t * 1e3, R * C / t / 1e9))
-    t_mt = best_of(lambda: rows8_gemv(L, W, S, x, threads=threads), reps)
-    print("  %-22s %7.3f ms  %6.1f G weights/s  (%d threads)" % ("pair table, engine", t_mt * 1e3,
-                                                                 R * C / t_mt / 1e9, threads))
-    print("\n  ratio at one thread: LUT / pair table = %.2fx" % (t_lut / t_pair))
+        print("\n  %d x %d, %d interleaved rounds x %d runs, paired against the pair table:"
+              % (R, C, rounds, runs))
+        for thr in sorted({1, threads}):
+            info = tmac.pin_affinity(thr)
+            print("\n    threads %d - %s" % (thr, tmac.affinity_line(info)))
+            compare(mod, L, fx, R, C, thr, rounds, runs)
+        print()
 
-    verdict = ("the two kernels agree to %.2e of the largest output, so the parity claim holds within float rounding"
-               % (dpn / scale) if dpn / scale < 1e-6 else
-               "the two kernels differ by %.2e of the largest output, which is more than float rounding" % (dpn / scale))
-    print("\n  %s" % verdict)
-    return 0 if dpn / scale < 1e-6 else 1
+    verdict = ("the two kernels agree to %.2e of the largest output - accumulation order, not a layout difference"
+               % worst if worst < 1e-6 else
+               "the two kernels differ by %.2e of the largest output, which is more than float rounding" % worst)
+    print("  %s" % verdict)
+    return 0 if worst < 1e-6 else 1
 
 
 if __name__ == "__main__":

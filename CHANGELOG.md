@@ -48,8 +48,12 @@
   9.5 ms it costs alone, and the captured router fetches 4.4 experts per token at that size. [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 - **`tools.bitnet_gemm.libcompare`, and `kc_rows8_gemv` in the CPU library.** Puts the pair-table kernel and the T-MAC
   LUT on one matrix in one process, which is the comparison the paging note had been making across sources. The two
-  agree to 1.9e-07 of their largest output, so parity holds; at one thread the LUT is 1.8x faster (0.219 against
-  0.396 ms on 2048 x 1920), while the pair table at 16 threads is 2.4x faster than the LUT. [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
+  agree to 2.2e-07 of their largest output, so correctness is not what separates them - speed is, and **the shipped pair
+  table wins**: 1.5x at 2048 x 1920 and 2.0-2.9x at 14336 x 4096, at one thread and at eight, pinned to physical cores
+  with 45 paired rounds an arm and reproduced in two runs. The first version of the harness left the LUT's OpenMP thread
+  count unset, and the "LUT 1.8x faster at one thread" it reported was that label rather than a kernel. No repack is
+  justified by speed: the best tiled LUT arm is still 1.38-1.44x behind the untiled pair table.
+  [docs/TERNARY-LUT-AND-PAGING-2026.md](docs/TERNARY-LUT-AND-PAGING-2026.md).
 - **`tools.expert_merge.prune`.** Which experts a layer can simply not have, under an exact per-layer byte budget,
   decided from the captured router log and solved by the RCO knapsack - `drop` for 0 bytes and the expert's routing
   mass as its error, `keep` for its bytes and no error. On Qwen3-Coder-30B-A3B (48x128 experts, 208.5 MB a layer)

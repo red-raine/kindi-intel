@@ -43,7 +43,9 @@ FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
 INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 EXPERT_BYTES = 14.7 * 1048576.0        # 14336 x 4096, packed at 2 bits a weight
-EXPERT_MS = 1.8                        # tmac_gemv_avx2_tiled, 8 threads, measured in tmac.py
+EXPERT_MS = 1.8                        # tmac_gemv_avx2_tiled as a best-of-N floor (tmac.py); its pinned median is
+                                       # 3.3 ms, so every ceiling printed here is conservative - see the tiling
+                                       # section of docs/TERNARY-LUT-AND-PAGING-2026.md before building on it
 MB = 1048576
 
 

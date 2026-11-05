@@ -5,10 +5,15 @@ ternary weight actually cost, first when the *activation* is quantised to int8 a
 second when the weight has to arrive from disk before it can be multiplied. Both were proposed to this branch as
 ready-to-use kernels; neither was usable as written, and the numbers below are what settled each one.
 
-**Four claims I made earlier in this branch are wrong, and all are flagged where they appear**: that the cache-blocked
-LUT beat the untiled kernel by "1.58x", that 1.67 GB/s was "the device", that clustering brings the streaming
-crossover to batch 1, and that a spinning disk was reading at 3 GB/s. None of them survives a second measurement. The
-corrections are collected in [Four corrections](#four-corrections) rather than folded quietly into the text.
+**Four claims I made earlier in this branch are wrong, and all are flagged where they appear**: that 1.67 GB/s was
+"the device", that clustering brings the streaming crossover to batch 1, that a spinning disk was reading at 3 GB/s, and
+that the LUT kernel matched the shipped pair table. None of them survives a second measurement. The corrections are
+collected in [Six corrections](#six-corrections) rather than folded quietly into the text.
+
+A fourth claim - that the cache-blocked LUT beats the untiled kernel by 1.58x - was withdrawn here and is now
+**reinstated with a proper interval**, at 1.55x: the original number came from one sample, and so did the withdrawal.
+[That section](#the-cache-blocked-variant-correct-and-at-the-expert-width-it-is-155x-faster) says what was wrong with
+both measurements, because getting the wrong answer twice is the part worth recording.
 
 **And one of those corrections was itself wrong**, which is the most useful thing in the note: the answer to "that
 spindle cannot read at 3 GB/s" was not "so B: is flash". B: *is* the 4 TB spindle, the 3 GB/s readings there were the
@@ -42,31 +47,36 @@ cmd //c 'call vcvars64.bat && python -m tools.bitnet_gemm.tmac --rebuild'
 python -m tools.bitnet_gemm.tmac            # once built
 ```
 
-Weights decoded from 2-bit codes inside the kernel, 0.25 bytes a weight, best of 9:
+Weights decoded from 2-bit codes inside the kernel, 0.25 bytes a weight. Pinned to the 8 physical cores, arms
+interleaved, per-call time = median of the rounds:
 
-| N x K | threads | ms | weights/s | packed stream |
-|---|---:|---:|---:|---:|
-| 1024 x 1024 | 1 | 0.115-0.125 | 8.4-9.1 G | 2.1-2.3 GB/s |
-| 2048 x 1920 | 1 | 0.379-0.437 | 9.0-10.4 G | 2.2-2.6 GB/s |
-| 4096 x 4096 | 1 | 1.57-2.22 | 7.6-10.6 G | 1.9-2.7 GB/s |
-| 1024 x 1024 | 8 | 0.066-0.068 | 15.5-15.8 G | 3.9 GB/s |
-| 2048 x 1920 | 8 | 0.170-0.190 | 20.8-23.0 G | 5.2-5.8 GB/s |
-| 4096 x 4096 | 8 | 0.61-0.68 | 25.1-27.3 G | 6.2-6.9 GB/s |
-| 14336 x 4096 | 8 | 1.38-2.59 | 23-43 G | 5.7-10.6 GB/s |
+| N x K | threads | median ms | CV | weights/s | packed stream |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024 | 1 | 0.100 | 5.8% | 10.5 G | 2.63 GB/s |
+| 2048 x 1920 | 1 | 0.406 | 8.8% | 9.7 G | 2.42 GB/s |
+| 4096 x 4096 | 1 | 1.764 | 46.3% | 9.5 G | 2.38 GB/s |
+| 1024 x 1024 | 8 | 0.243 | 24.8% | 4.3 G | 1.08 GB/s |
+| 2048 x 1920 | 8 | 0.275 | 9.8% | 14.3 G | 3.58 GB/s |
+| 4096 x 4096 | 8 | 1.024 | 28.0% | 16.4 G | 4.10 GB/s |
+| 14336 x 4096 | 8 | 5.146 | 21.7% | 11.4 G | 2.87 GB/s |
 
-The ranges are between runs, not within one: each figure is already a best-of-9 inside its process. **Even the
-cache-resident rows move by up to 40%** - the 4096 x 4096 single-thread case measured 1.57-1.58 ms in three runs and
-2.22 ms in a fourth, on this machine, with nothing changed. That is why the tiling section below reports a spread and
-refuses to rank arms that overlap, and it is the reason a one-sample comparison was able to produce a 1.58x that did not
-exist.
+The **CV column is the finding**. On this host a single call's time varies by 6-46% round to round even with nothing
+else running, so a "best of 9" is a floor on the distribution rather than an estimate of it: the same 4096 x 4096 row
+that read 0.61-0.68 ms as a best-of-9 reads **1.024 ms** as a median. Both are true and neither is wrong - they answer
+different questions - but only the median is what a token costs and only the median can be given an interval. This is
+what the earlier version of this table reported, and the two-hour disagreement about whether the tiling helped was one
+person reading a floor as a centre.
 
-**Against the pair table already in the engine** ([CPU-PERF-2026.md](CPU-PERF-2026.md) documents 0.18 ms for the same
-2048 x 1920 ternary GEMV, single- and 8-threaded alike): the LUT does **0.17-0.19 ms**. Parity, not a win - and a
-cross-source comparison, since that figure came from another machine of the same Coffee Lake class, not from this
-process. The honest reading is that the LUT family and the engine's `vpermps` pair table cost the same here, so there is
-no reason to switch: the cheaper single-shuffle version would be ~2x fewer ALU ops per group and would also be wrong.
+The 8-thread 1024 x 1024 row being **slower than one thread** (0.243 against 0.100 ms) is OpenMP's launch and barrier
+cost on a 1 M-weight matrix, and it is why every arm in the tiling table below is given a 14.7 MB expert to chew on.
 
-## The cache-blocked variant: correct, and it earns nothing
+**Against the pair table already in the engine**: this paragraph used to claim parity from a comparison across
+sources, and that comparison is withdrawn - see [The two kernels, in one process](#the-two-kernels-in-one-process-the-pair-table-wins-everywhere),
+where both decoders run in one process on one matrix. In one process the pair table is 1.5x faster at 2048 x 1920 and
+2.0-2.9x faster at the expert width. The single-shuffle version would be ~2x fewer ALU ops a group and would also be
+wrong; it is not the reason to skip a repack.
+
+## The cache-blocked variant: correct, and at the expert width it is 1.55x faster
 
 The follow-up proposal added `N_blk x K_blk` blocking, accumulators spilled to a per-tile buffer, and `_mm_prefetch` on
 the weight stream. It is implemented as `tmac_gemv_avx2_tiled(a, w, scale_a, scale_w, n_blk, k_grp_blk)` and it is
@@ -74,46 +84,96 @@ bit-exact over four blockings (`max |tiled - exact| = 0.0`), with the same wrapp
 not touch that bug.
 
 ```bash
-python -m tools.bitnet_gemm.tmac       # prints the tiling table after validating both arms
+python -m tools.bitnet_gemm.tmac --json B:/models/scratch/tmac_tiling.json   # validate both arms, then pair them
 ```
 
-K = 4096, 8 threads, min of 15 runs per arm, three runs of the whole table:
+**This section has now been wrong in both directions, so the method is part of the result.** It first reported 1.58x for
+the tiled arm from one sample against one sample; then withdrew that to "not separable from noise" on an unpinned arm
+whose baseline moved 1.38-2.59 ms run to run; and both of those measurements were taken as the *minimum* of their
+samples - the luckiest draw of the distribution whose width was the question. What follows pins the process to the
+physical cores, interleaves the arms inside every round, and reports a **paired** ratio with a bootstrap interval, the
+same statistic the NLL gates use.
 
-| N | arm | ms across runs | verdict |
-|---|---|---:|---|
-| 14336 | untiled kernel | 1.38, 1.70, 2.12, 2.14, 2.28, 2.59 | baseline |
-| 14336 | 1024 x 512 (the proposal's tiles) | 1.35, 1.52, 1.70, 1.80, 1.96, 1.96 | not separable from noise |
-| 14336 | 1024 x all K | 1.69, 2.08, 2.36, 2.64 | ~same as untiled |
-| 2048 | untiled kernel | 0.34, 0.34, 0.34, 0.34, 0.39, 0.40 | baseline |
-| 2048 | 1024 x 512 | 0.46, 0.47, 0.50, 0.51, 0.59 | **loses 25-42%** |
+Method: K = 4096, 8 OpenMP threads, process affinity `0xff` (one thread each of 8 physical cores, SMT siblings excluded,
+via `GetLogicalProcessorInformationEx`), 15 interleaved rounds per run with the arm order rotated each round, 3 runs of
+the whole table. Ratio = mean of the per-round paired ratios, CI = 95% bootstrap over the pooled rounds (10k resamples,
+seeded); `per run` is each run's own mean ratio, which is the column that says whether the answer comes back. The
++/-2% band is this host's noise floor - a ratio inside it is not called a result.
 
-**Corrected: my first run reported 1.58x for the tiled arm.** That was one sample against one sample on a machine whose
-untiled baseline moves 1.38-2.59 ms run to run. With the baseline measured under the same min-of-three as the other
-arms, the wide-shape difference disappears into the noise and the narrow shape is a clear loss.
+| N | arm | median ms | speedup | 95% CI | per run | verdict | packed stream |
+|---|---|---:|---:|---|---|---|---:|
+| 14336 | untiled kernel | 5.15 | 1.00x | | | baseline | 2.9 GB/s |
+| 14336 | **1024 x 512 (the proposal's tiles)** | **3.30** | **1.55x** | **1.45-1.66** | 1.59 1.70 1.37 | **faster** | 4.4 GB/s |
+| 14336 | 512 x 512 | 3.82 | 1.37x | 1.29-1.46 | 1.44 1.49 1.19 | faster | 3.8 GB/s |
+| 14336 | 1024 x all K | 4.34 | 1.16x | 1.06-1.25 | 1.19 1.23 1.06 | faster | 3.4 GB/s |
+| 14336 | 2048 x 1024 | 5.35 | 1.23x | 1.08-1.39 | 1.29 1.24 1.16 | faster | 2.7 GB/s |
+| 2048 | untiled kernel | 0.63 | 1.00x | | | baseline | 3.3 GB/s |
+| 2048 | 1024 x 512 | 0.65 | 0.91x | 0.84-0.98 | 0.93 0.91 0.89 | indistinguishable | 3.2 GB/s |
+| 2048 | **512 x 512** | **0.58** | **1.10x** | **1.03-1.18** | 1.12 1.08 1.11 | **faster** | 3.6 GB/s |
+| 2048 | 1024 x all K | 0.76 | 0.75x | 0.68-0.81 | 0.76 0.70 0.78 | slower | 2.8 GB/s |
+| 2048 | 2048 x 1024 | 1.15 | 0.55x | 0.52-0.57 | 0.56 0.53 0.55 | slower | 1.8 GB/s |
 
-Three mechanisms explain it, and they matter more than the numbers:
+The direction is stable where it matters and the magnitude is not: the note's tiles beat the unblocked kernel in **all
+three runs** (1.37-1.70), so this is a finding rather than a lucky run, but the per-run spread is wider than the pooled
+interval (1.45-1.66, so +/-0.10 within a run against 0.33 across runs), which means the size is "about 1.5x" and not a
+figure to quote to two decimals. The baseline row is the same arm as the 14336 x 4096 row of the throughput table above
+(5.146 ms), which is the check that the two tables are one measurement and not two.
 
-- **The kernel is not bandwidth-bound, so blocking has nothing to recover.** At 25-27 G weights/s the packed stream
-  moves only 6.2-6.9 GB/s. The limiter is `vpshufb` and int16 widening per group of 32 neurons. A GEMV reads each weight
-  exactly once - there is no reuse for a tile to create, which is why the blocking that is standard for a batched GEMM
-  buys nothing here.
-- **The premise behind the K tile is off by 4x once the table is correct.** A single-shuffle int8 table is 32 bytes a
-  group (the proposal's 32 KB at K = 4096); the two byte planes a *correct* table needs are 128 bytes a group, i.e.
-  **131 KB at K = 4096**. That still fits this core's 256 KB L2, which is why nothing stalls - and the proposal's
-  K_blk = 512 (16 KB) is safe by accident rather than by its own arithmetic.
-- **`N_blk` is a parallelism knob, not a cache knob.** The tiled arm parallelises over N tiles, so at N = 2048 a 1024-wide
-  tile gives two tiles for eight threads and half the machine idles - the 0.58-0.75x measured.
+What the shape dependence says, and it is the useful part:
 
-Where the blocking does show a consistent direction is the **K tile alone**, at fixed tile count: 1024 x 512 against
-1024 x all K is 1.52-1.96 ms against 1.69-2.64 ms, better in every run where both were measured. That is a ~10% lever at
-wide N, and it is not worth a repack on its own.
+- **`N_blk` splits the work across threads, and that dominates.** One tile for eight threads - 2048 x 1024 at N = 2048 -
+  loses 45% (0.55x, interval 0.05 wide, all three runs): seven threads idle while one does the whole GEMV. Two tiles
+  (1024 x 512 at N = 2048) sit inside the noise floor at 0.91x, and 7 tiles (2048 x 1024 at N = 14336) wins 1.23x. The
+  same 1024-wide tile at N = 14336 is 14 tiles for 8 threads and wins 1.55x. So the note's tile size is right *at expert
+  width* and wrong below it, and what tracks the win is roughly how many tiles there are for eight threads - not the
+  tile shape.
+- **512 x 512 is the only blocking that pays at both widths** - 1.37x at N = 14336 and 1.10x at N = 2048, the latter
+  faster in every run (1.12 1.08 1.11) with an interval that just clears the floor (1.03-1.18). That is 28 tiles and 4
+  tiles respectively, so tile count alone is not it either; a 512-neuron tile is 512 KB of packed weights at K = 4096,
+  which is the slice bound a thread can stream and reuse before it is evicted. If one blocking has to be chosen for a
+  pack, this is the arm to take, and it is a better default than the note's own 1024.
+- **The K block is most of the win, not a refinement.** At N = 14336, 1024 x all K is 1.16x and 1024 x 512 is 1.55x.
+  Holding the scheduling fixed, blocking K so a 512-group slice of the two-plane table (16 KB, inside L1) is reused by
+  a whole tile before eviction is worth a **further 34%** on top: about 60% of the total saving, against 40% from the
+  N tile. The proposal's ordering of priorities was backwards.
+
+**The repack is still not justified, and this is the number that decides it.** The tiled LUT reaches 3.30 ms at
+14336 x 4096; the shipped pair table, measured the same way in the same process, is **2.29-2.40 ms**
+([below](#the-two-kernels-in-one-process-the-pair-table-wins-everywhere)). So the best LUT arm is 1.38-1.44x slower
+than the kernel the engine already runs, and the tiling win is real but internal to a family that loses. Tiling the
+pair table is not the same experiment - `rows8` already walks two row blocks together with no per-tile rebuild - but
+it is the one worth running now, and it is cheaper than a pack-format change.
+
+**Withdrawn:** the previous text explained the (then null) result with "the kernel is not bandwidth-bound, so blocking
+has nothing to recover", and asserted that a correct 131 KB table "is why nothing stalls". Both were fitted to a
+difference that was noise, and the first is contradicted here: blocking recovers 35% of the time at the width we run.
+What is still true is the arithmetic behind it - a correct two-plane table is 128 bytes a group, **131 KB at K = 4096**,
+not the proposal's 32 KB - and that the stream moves only 2.9-4.4 GB/s, far under this machine's memory ceiling, so
+the limiter is on the compute path and what the tiles recover is table-slice reuse and thread occupancy, not DRAM
+traffic. The proposal's `K_blk = 512` (16 KB) is safe by the right arithmetic for the wrong reason: it is 4x smaller
+than the table it is supposed to tile.
+
+Still open: **which** of the tiled arm's three simultaneous differences does the work - dynamic scheduling across
+tiles, the per-tile table rebuild, or the blocked accumulator - because all three arrive together in this table. The
+one-factor arm (the untiled kernel with only its schedule changed) is the experiment that would attribute it, and it is
+cheap now that the harness exists. The repack is worth doing at expert widths without waiting for that answer.
+
+**One downstream number is now known to be a floor.** The paging sections below, and `stream_probe.py`,
+`prefetch_budget.py` and `cluster_budget.py`, hide a 14.7 MB read behind **1.8 ms** of expert GEMV. That 1.8 ms is the
+best-of-N figure this file used before pinning; the pinned median for the same call is **3.3 ms**, and the tiled arm is
+what a paging pipeline would actually run. The direction of the error is safe - a floor on compute makes a double
+buffer look *worse* than it is (ceiling `3.3 / (3.3 + 3.7) = 47%` at the idle read rate, not 33%) - so none of the
+"streaming does not pay here" verdicts reverses on it, and none of them is re-derived above. But the ceilings, the
+break-even batch counts and the 0.58 s/token figure all carry that constant, and they need re-running before anything
+is built on them. Choosing C_MS is also a per-architecture decision now: `tmac.py --threads 8` prints the machine's.
 
 Two defects in the proposal beyond the arithmetic, both cheap to check and both real: `_mm_prefetch(w_grp + 4 * N)` is
 in **bytes** where a group is N bytes, so it prefetches 4 groups - 57 KB, or **896 cache lines**, at N = 14336 - while
 its comment says "4 lines ahead", and 57 KB cannot survive a 32 KB L1. And the accumulator loop reads
 `local_acc[local_idx + 24 .. +31]` unconditionally, so it silently requires `N % 32 == 0`; the proposal checks neither.
+Neither defect is what makes the arm slow or fast, and neither is fixed by the measurement above.
 
-## The two kernels, in one process
+## The two kernels, in one process: the pair table wins everywhere
 
 Parity between the LUT and the shipped pair table was the weakest claim in this note, because it was made across
 sources: the LUT's number from `tools/bitnet_gemm/tmac.py`, the pair table's from `kindi.cpu`, in different processes,
@@ -122,31 +182,49 @@ drivers, and it is why the second half of the claim - that a repack would buy no
 measurement.
 
 ```bash
-python -m tools.bitnet_gemm.libcompare        # --rows / --cols / --reps / --threads
+python -m tools.bitnet_gemm.libcompare        # --rows / --cols / --rounds / --runs / --threads
 ```
 
-`kindi/kcpu.c` now exposes `kc_rows8_gemv`, a harness entry that runs the production `rows8` on caller-packed bytes, so
+`kindi/kcpu.c` exposes `kc_rows8_gemv`, a harness entry that runs the production `rows8` on caller-packed bytes, so
 both kernels load into one process: `libkcpu` through ctypes (built here with MSVC, `/arch:AVX2`), and
-`tmac_gemv_avx2` through its torch extension. Same 2048 x 1920 ternary matrix, same int8 activation vector, same timing
-loop, one run.
+`tmac_gemv_avx2` through its torch extension. Same ternary matrix, same int8 activation vector, same timing loop,
+pinned to the physical cores, 15 interleaved rounds x 3 runs per row, quoted from two independent runs.
 
-| arm | max abs error vs exact | share of the largest output | ms, 1 thread | G weights/s |
-|---|---:|---:|---:|---:|
-| pair table (`rows8`) | 2.01e-05 | 1.65e-07 | 0.396 | 9.9 |
-| LUT (`vpshufb`) | 5.98e-06 | 4.90e-08 | 0.219 | 18.0 |
-| the two against each other | 2.29e-05 | 1.87e-07 | - | - |
-| pair table, 16 threads | - | - | 0.093 | 42.3 |
+**The first version of this harness was not a comparison and its numbers are replaced, not adjusted.** It left the
+LUT's OpenMP thread count at whatever the process default was, so the row it labelled "LUT, 1 thread" (0.219 ms) was
+an all-core call, and the conclusion drawn from it - "at one thread the LUT is 1.8x faster than the pair table" - was
+a label, not a kernel result. Both arms now get an explicit thread count on every row.
 
-**Parity holds, and it is the only half of the old claim that does.** The kernels agree to 1.9e-07 of their largest
-output - float accumulation order, not a layout difference. But at one thread the LUT is **1.8x faster** than the pair
-table (0.219 against 0.396 ms), so a repack would buy something. What it would not buy is the thing that matters here:
-the shipped kernel threaded reaches 42.3 G weights/s, **2.4x** the LUT's single-threaded 18.0. So "a repack would buy
-nothing" was true of the engine and false of the kernels, and the gap is threads, not layouts.
+| shape | arm | 1 thread, ms | 8 threads, ms | vs pair, 1 thr | vs pair, 8 thr | G weights/s |
+|---|---|---:|---:|---:|---:|---:|
+| 2048 x 1920 | pair table (`rows8`) | 0.70-0.76 | 0.18-0.26 | 1.00x | 1.00x | 15-22 |
+| 2048 x 1920 | LUT (`vpshufb`) | 1.17 | 0.28-0.49 | **0.62x** | **0.61-0.69x** | 8-14 |
+| 14336 x 4096 | pair table (`rows8`) | 9.63-9.79 | 2.29-2.40 | 1.00x | 1.00x | 24.5-25.6 |
+| 14336 x 4096 | LUT (`vpshufb`) | 27.8-28.0 | 5.13-5.29 | **0.34-0.36x** | **0.43-0.49x** | 11.1-11.4 |
 
-Caveats, since this is now a number rather than a claim: the arms see the same integer activations but carry the scale
-differently (floats into `rows8`, `scale_a` into the LUT); the matrix is 3.93 M weights against a pack's 14.4 M an
-expert, so per-call overhead is relatively larger here; and these are best-of-9 on one host. The LUT arm has no
-threaded mode, so the multi-thread comparison the engine actually runs cannot be made from this extension as it stands.
+Every ratio is the paired mean with a 95% bootstrap interval over 45 rounds, and in all four rows the interval excludes
+1.0 and both runs reproduce the direction: 0.63 [0.59, 0.67] and 0.62 [0.59, 0.66] at 2048 one thread, 0.69 [0.64, 0.75]
+and 0.61 [0.57, 0.66] at 2048 eight, 0.36 [0.35, 0.37] and 0.34 [0.33, 0.35] at 14336 one, 0.49 [0.46, 0.52] and 0.43
+[0.40, 0.46] at 14336 eight. The LUT's own median repeats to a few percent between runs (1.165, 5.13-5.29, 27.8-28.0);
+it is the pair table's 8-thread time that moves 40% (0.178 to 0.258), which is why the ratio is quoted as a range and
+not a point.
+
+**So the parity claim is dead, in the direction that needs saying: the shipped kernel is faster.** At the width we run
+- 14336 x 4096, one expert - the pair table is **2.0-2.9x** the LUT, and it is not a thread trick any more: at one
+thread it is 2.8-2.9x, at eight it is 2.0-2.3x. One mechanism is in the kernel's own comment: `rows8` walks two row
+blocks together, so a group's table is loaded once for 16 rows instead of once for 8, which halves the table traffic and
+gives the scheduler two independent accumulator chains to overlap with the shuffle latency. The LUT has one chain per
+group. The rest of the gap is not attributed here - the tile experiment above shows how much a layout change inside the
+LUT is worth (34%), and the same experiment has not been run on `rows8`.
+
+**What survives is the correctness half, and it agrees to float rounding.** The arms differ by **2.2e-07** of the
+largest output on both shapes (each is 5.9e-08 and 2.3e-07 from the exact integer answer), which is accumulation
+order, not a layout difference. A LUT kernel would not change an answer; it would only make it later.
+
+Caveats: the arms carry the activation scale the way each kernel expects it (floats into `rows8`, `scale_a` into the
+LUT), which is the interface, not a difference in work; and these are one host's AVX2 tier - the picture is expected
+to invert where `vpshufb` timing is good and widening is cheap, which is the Apple-silicon result in the literature,
+and has not been measured here.
 
 ## The disk: an expert read is 3.3-4.0 ms, and the 9 ms figure was a read racing a write
 
@@ -519,11 +597,15 @@ B:, where the device does **0.23 GB/s** and a 14.7 MB expert costs **64 ms**, no
 `--settle` was added to `copytest` for this: in `--src` mode the copy arm used to copy a slice the tool had just written,
 so it measured that slice's commit - the exact artifact the tool exists to name.
 
-## Four corrections
+## Six corrections
 
-1. **"Cache blocking wins 1.58x."** Withdrawn: one sample against one sample, on a baseline that moves ±45% run to run.
-   Re-measured with matched sampling, the wide shape is indistinguishable from the untiled kernel and the narrow shape
-   loses 25-42%. The K tile alone is still worth ~10% at wide N; the N tile is a parallelism knob.
+1. **"Cache blocking wins 1.58x."** Withdrawn, then **reinstated at 1.55x [1.45, 1.66]** - and the withdrawal is worth
+   more than the number. The original was one sample against one sample; the withdrawal used an unpinned min-of-N whose
+   baseline moved 45% run to run, which is the same mistake with more arithmetic. Pinned to 8 physical cores with the
+   arms interleaved and a paired interval, the note's tiles beat the untiled kernel in all three runs (1.59 1.70 1.37)
+   at N = 14336 and sit inside the noise floor at N = 2048 (0.91x). `512 x 512` pays at both widths (1.37x, 1.10x) and
+   is the better default. The "kernel is not bandwidth-bound so blocking cannot help" mechanism that explained the
+   withdrawal is also withdrawn: the limiter is on the compute path, but the tiles still recover a third of the time.
 2. **"1.67 GB/s is the device."** Withdrawn, and now placed rather than merely doubted: it is what a read costs while
    the drive is committing its own fresh write. Measured directly, reads of a 2 GB file run at 0.14 GB/s for the 30 s
    its commit takes, then return to 3.68 GB/s; with the drive idle the same 14.7 MB reads run at 3.1-3.5 GB/s. The
@@ -545,17 +627,23 @@ so it measured that slice's commit - the exact artifact the tool exists to name.
 5. **The 1.66 GB/s figure is a genuine device number - for the other drive.** Reproduced today at 1.62 GB/s on C:, and
    confirmed by a direct copy there (1.2-2.4 GB/s one-way, 2.4-4.7 GB/s read+write). It is not the I/O path and it is
    not a cache: it is what this NVMe does. It is also irrelevant to a pack stored on B:, which moves 0.23 GB/s.
+6. **"The LUT matches the shipped pair table at parity, so a repack would buy nothing."** True conclusion, false
+   reason, and the false reason mattered: the comparison was made across documents, and its "LUT" side was a best-of-9
+   minimum whose thread count was never set. In one process, pinned and paired, the pair table is **1.5x** the LUT at
+   2048 x 1920 and **2.0-2.9x** at 14336 x 4096, at every thread count measured. No repack: the best tiled LUT arm
+   still trails the untiled pair table by 1.38-1.44x.
 
-None of these change the operating recommendation, which is the useful part: **do not port either kernel.** Parity is
-real - the LUT agrees with the pair table to float rounding on the same matrix in one process - but the repack is not
-free and not obviously a win: the LUT is 1.8x faster at one thread, while the shipped kernel is 2.4x faster on this
-machine's threads. Paging is a batched design and this engine decodes at batch 1.
+None of these change the operating recommendation, which is the useful part: **do not port either kernel.** The pair
+table is faster than the LUT on this host by 1.5-2.9x, so a repack would buy a slow kernel in a new layout; the LUT's
+one advantage - fewer bytes touched per group by a single shuffle - is also the version that overflows an int8 table.
+Paging is a batched design and this engine decodes at batch 1.
 
 ## What would settle the rest
 
-- **The comparison against the pair table now happens in one process** (`tools/bitnet_gemm/libcompare.py`, above): both
-  kernels on one matrix agree to 1.9e-07, and the LUT is 1.8x faster single-threaded. What is still missing is the LUT
-  at 8-16 threads, which its extension does not offer - until that exists, the threaded comparison stays one-armed.
+- **The comparison against the pair table now happens in one process** (`tools/bitnet_gemm/libcompare.py`, above):
+  both kernels on one matrix, both given an explicit thread count, agree to 2.2e-07, and the pair table is faster at
+  every setting (0.34-0.69x for the LUT). What is still open is whether the pair table's own `rows8` gains anything
+  from the kind of tiling that took 1.55x off the LUT - that is the same harness with a different pair of arms.
 - **The device has been measured, and the answer was not "bare metal".** `copytest.py` (above) separates the three
   things the old probe conflated - medium, path, cache state - and the depressed rate turned out to be a read racing
   the drive's commit of a write, reproducible on demand (3.80 -> 0.14 -> 3.68 GB/s). What a bare-metal run would add

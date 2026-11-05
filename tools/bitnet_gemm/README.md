@@ -112,25 +112,31 @@ instead of one. That doubling is exactly the margin the LUT was supposed to win 
 **The build flags are GCC-only.** `-mavx2 -mfma -fopenmp -march=native` cannot build on the MSVC toolchain this
 repository ships for Windows (`/arch:AVX2`, `/openmp`). `tmac.py` picks the flags per platform.
 
-Corrected, it is bit-exact against the integer reference (`max |LUT - exact| = 0.0`) and it runs at:
+Corrected, it is bit-exact against the integer reference (`max |LUT - exact| = 0.0`) and it runs at (median of
+interleaved rounds, pinned to the physical cores - a minimum of the same rounds sits 30-40% below this, and that floor
+is what this table used to quote):
 
-| N x K | threads | ms | weights/s | packed stream |
-|---|---:|---:|---:|---:|
-| 1024 x 1024 | 1 | 0.119 | 8.8 G | 2.20 GB/s |
-| 2048 x 1920 | 1 | 0.422 | 9.3 G | 2.33 GB/s |
-| 4096 x 4096 | 8 | 0.648 | 25.9 G | 6.47 GB/s |
-| 2048 x 1920 | 8 | **0.189** | 20.8 G | 5.20 GB/s |
+| N x K | threads | median ms | CV | weights/s | packed stream |
+|---|---:|---:|---:|---:|---:|
+| 1024 x 1024 | 1 | 0.100 | 5.8% | 10.5 G | 2.63 GB/s |
+| 2048 x 1920 | 1 | 0.406 | 8.8% | 9.7 G | 2.42 GB/s |
+| 4096 x 4096 | 1 | 1.764 | 46.3% | 9.5 G | 2.38 GB/s |
+| 1024 x 1024 | 8 | 0.243 | 24.8% | 4.3 G | 1.08 GB/s |
+| 2048 x 1920 | 8 | 0.275 | 9.8% | 14.3 G | 3.58 GB/s |
+| 4096 x 4096 | 8 | 1.024 | 28.0% | 16.4 G | 4.10 GB/s |
 
-Against the pair table already in the engine (`docs/CPU-PERF-2026.md`: **0.18 ms** for 2048 x 1920 ternary weights,
-single- and 8-threaded alike): **0.189 ms**. That is parity, not a win - and a cross-source one, since that figure came
-from another machine instance of the same Coffee Lake class. The honest reading is that the LUT and the pair table cost
-the same here, so there is no reason to switch: the note's single-shuffle version would be ~2x fewer ALU ops per group and
-would also be wrong, because int8 activations do not fit a single-shuffle int8 table.
+Against the pair table already in the engine, this harness compares a documented figure, so the number that counts is
+from [libcompare.py](libcompare.py): both kernels in one process, one matrix, one activation vector, pinned and paired.
+**The pair table wins**: 1.5x at 2048 x 1920 and **2.0-2.9x** at 14336 x 4096, at one thread as well as eight, with
+45 paired rounds an arm and the direction reproduced in two runs. The kernels agree to 2.2e-07 of their largest output,
+so that is speed and not correctness. The earlier "parity" reading came from comparing this harness's figure, taken as a
+minimum of nine, against a documented one - and there is nothing here to pay for a repack.
 
-A like-for-like number needs `libkcpu` built here and the same matrix run through `rows8`; this harness compares against a
-documented figure, not a measurement taken in the same process.
+The single-shuffle version the note proposes would be ~2x fewer ALU ops per group and would also be wrong, because int8
+activations do not fit a single-shuffle int8 table. That argument is about the LUT family, not about which kernel to
+ship: the pair table is ahead on both counts.
 
-## The cache-blocked T-MAC: built, exact, and it earns nothing
+## The cache-blocked T-MAC: built, exact, and 1.55x faster at expert width
 
 The next note adds tiling: an `N_blk` tile of outputs with the accumulators spilled to a per-tile buffer, a `K_blk`
 tile so the tables fit L1, and `_mm_prefetch` on the weight stream. It is now the second entry point,
@@ -140,35 +146,42 @@ are still built in `int8` and still wrap, so the same 4.5% of activation pairs a
 that bug.
 
 Building it needs an MSVC environment (`vcvars64.bat`); `torch.utils.cpp_extension.load` fails before it compiles if `cl`
-is not on `PATH`, which is the normal state of a shell here.
+is not on `PATH`, which is the normal state of a shell here - `tmac.py` now calls `kindi.cbuild.find_vcvarsall` and
+imports that environment, so the documented command runs from Git Bash.
 
-Same process, 8 threads, K = 4096, min of 15 runs per arm, 3 runs of the whole table:
+`python -m tools.bitnet_gemm.tmac` measures it properly: pinned to the 8 physical cores, the arms interleaved inside
+each round, and a **paired** ratio with a 95% bootstrap interval instead of a min-of-N. On this host, K = 4096, 15 rounds
+x 3 runs:
 
-| N | arm | ms (3 runs) | vs untiled |
-|---|---|---:|---:|
-| 14336 | untiled kernel | 1.38, 1.70, 2.12, 2.14, 2.28, 2.59 | 1.00x |
-| 14336 | 1024 x 512 (the note's tiles) | 1.35, 1.52, 1.70, 1.80, 1.96, 1.96 | median ~1.13x |
-| 14336 | 1024 x all K | 1.69, 2.08, 2.36, 2.64 | 1.00x |
-| 2048 | untiled kernel | 0.34, 0.34, 0.34, 0.34, 0.39, 0.40 | 1.00x |
-| 2048 | 1024 x 512 | 0.46, 0.47, 0.50, 0.51, 0.59 | **0.58-0.75x** |
+| N | arm | median ms | speedup | 95% CI | per run |
+|---|---|---:|---:|---|---|
+| 14336 | untiled kernel | 5.15 | 1.00x | | |
+| 14336 | 1024 x 512 (the note's tiles) | **3.30** | **1.55x** | 1.45-1.66 | 1.59 1.70 1.37 |
+| 14336 | 512 x 512 | 3.82 | 1.37x | 1.29-1.46 | 1.44 1.49 1.19 |
+| 2048 | untiled kernel | 0.63 | 1.00x | | |
+| 2048 | 1024 x 512 | 0.65 | 0.91x | 0.84-0.98 | 0.93 0.91 0.89 |
+| 2048 | 512 x 512 | **0.58** | **1.10x** | 1.03-1.18 | 1.12 1.08 1.11 |
+| 2048 | 2048 x 1024 | 1.15 | 0.55x | 0.52-0.57 | 0.56 0.53 0.55 |
 
-The wide shape is the honest answer: **the tiled arm's best run and the untiled arm's worst run overlap**, so on this
-machine the tiling cannot be separated from noise at N = 14336 (the per-call working set is 14.7 MB, which makes the
-baseline itself swing 1.38-2.59 ms; the 2048 shape fits and is stable to +-15%). The narrow shape is unambiguous: tiling
-**loses 25-42%**.
+The note's tiles win in every run at the expert width and sit inside the noise floor at N = 2048 (0.91x). The 45% loss
+in that table belongs to the single-tile arm - 2048 x 1024 at N = 2048 is one tile for eight threads, and seven of them
+idle. `512 x 512` is the blocking that pays at both widths, so it is the better default. These milliseconds are not
+comparable with the ranges this file used to quote: those were unpinned min-of-N, these are pinned medians paired
+within a round. `docs/TERNARY-LUT-AND-PAGING-2026.md` has the full method and the retractions.
 
-Three things explain it, and they matter more than the numbers:
+**A mechanism I had for why this would not work is withdrawn too**: that the kernel is not bandwidth-bound, so there is
+nothing for blocking to recover. The stream does move only 2.9-4.4 GB/s against several times that in DRAM headroom, and
+the limiter is on the compute path (`vpshufb`, int16 widening, a GEMV that reads each weight once) - but the tiles still
+recover 35% of the time, so the compute path was losing something to layout and occupancy that the theory did not model.
+What the two shapes do say is consistent with two facts that survive:
 
-* **The kernel is not bandwidth-bound, so there is nothing for blocking to recover.** At 25-27 G weights/s the packed
-  stream moves 6.2-6.9 GB/s - this i9 streams several times that. The limiter is `vpshufb` and widening throughput per
-  group of 32 neurons, so reordering the stream changes nothing. A GEMV reads each weight exactly once: there is no
-  reuse for a tile to create, which is why the same blocking that is standard for a batched GEMM buys nothing here.
 * **The premise that motivated the K tile is off by 4x once the table is correct.** A single-shuffle int8 table is
   32 bytes a group (the note's 32 KB at K = 4096); the two byte planes a correct table needs are 128 bytes a group, i.e.
-  **131 KB at K = 4096**. That still fits this core's 256 KB L2 comfortably, which is why nothing stalls - and why the
-  note's own K_blk = 512 (16 KB) is safe by accident rather than by its arithmetic.
-* **`N_blk` is a parallelism knob, not a cache knob.** The tiled arm parallelises over N tiles, so at N = 2048 the note's
-  1024-wide tile gives 2 tiles for 8 threads and half the machine idles - exactly the 0.6-0.75x measured.
+  **131 KB at K = 4096** - so the note's own K_blk = 512 (16 KB) is safe by accident rather than by its arithmetic. At
+  16 KB a slice is L1-resident, which is the one part of the argument that does hold up.
+* **`N_blk` splits the work across threads, and that dominates.** One tile for 8 threads is 0.55x (seven of them idle),
+  two tiles is 0.91x, and 14 tiles is 1.55x. So the note's tile width is right at expert width and wrong below it, and
+  what decides is tiles-per-thread, not the tile shape - except that `512 x 512` (28 and 4 tiles) wins at both.
 
 Two concrete defects in that note besides the arithmetic: `_mm_prefetch(reinterpret_cast<const char*>(w_grp + 4 * N),
 _MM_HINT_T0)` is `w_grp + 4 * N` **bytes**, and a group is N bytes, so it prefetches 4 groups - 57 KB, or **896 cache
