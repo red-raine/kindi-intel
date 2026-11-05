@@ -193,6 +193,12 @@ a file mapping *plus* an anonymous buffer for the same bytes, which has produced
 *Kill:* do not touch hugepages (measured ~0% twice) and do not add `MADV_WILLNEED` on the mapping (measured 0% or
 negative). If our expert slabs are ≥ 4 MB after P5 packing, coalescing will not pay — check the size before building it.
 
+*Measured first (2026-11-05), and it changes the order of this item:* the packs are on **B:**, which is a 4 TB SATA HDD —
+**0.23 GB/s** cold, **100** random 4 KB IOPS — so a 14.7 MB expert read is **64 ms** there, not the 3.3-4.0 ms the
+research's C: number gave. The NVMe at **C:** does 1.65-3.33 GB/s. Until the packs live on C: or in RAM, no pipeline,
+merged read or pinning hides 64 ms, and the double-buffer ceiling is 2.7% rather than 33%
+(`docs/TERNARY-LUT-AND-PAGING-2026.md`). Placement is the first experiment; the rest of this item is after it.
+
 ### P7 — Exact speculative decoding from an n-gram cache — **~2 days**
 
 *Hypothesis:* the only technique in the research with a large, *quality-free* speedup: draft from an n-gram cache over
@@ -338,6 +344,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
 | P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |
 | P10 group rotation before rounding | **measured, parked** | −2.6% weight error mean, +2.1% on experts, sequency exactly inert; no NLL walk run |
+| volume identity / read floor (done) | **measured** | packs sit on B: = 4 TB SATA **HDD** (0.23 GB/s, 100 IOPS, 64 ms an expert), not C: = NVMe (1.65-3.33 GB/s); the 1.66 GB/s under test is C:'s own rate |
 | super-expert audit (done) | **measured** | 4 outliers at 210–2,152× their layer; mass ranks 27–92; the 64 plan drops L1E68 |
 | merge cost split (done) | **measured** | router ≤0.17, arithmetic ≥1.08 |
 | prune 112 (done) | **measured** | +0.0045, certified lossless at 1,785 tokens |

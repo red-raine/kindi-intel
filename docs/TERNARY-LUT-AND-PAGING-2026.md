@@ -10,6 +10,12 @@ LUT beat the untiled kernel by "1.58x", that 1.67 GB/s was "the device", that cl
 crossover to batch 1, and that a spinning disk was reading at 3 GB/s. None of them survives a second measurement. The
 corrections are collected in [Four corrections](#four-corrections) rather than folded quietly into the text.
 
+**And one of those corrections was itself wrong**, which is the most useful thing in the note: the answer to "that
+spindle cannot read at 3 GB/s" was not "so B: is flash". B: *is* the 4 TB spindle, the 3 GB/s readings there were the
+page cache, and the 1.66 GB/s figure under test turns out to be a real rate of the *other* drive - the NVMe at C:, which
+is not where any pack lives. [Which volume, and what it actually is](#which-volume-and-what-it-is) has the hardware
+identity, the three arms that agree, and the numbers a streaming design has to use instead.
+
 The harness is [tools/bitnet_gemm](../tools/bitnet_gemm/README.md): `tmac.cpp` (the kernels), `tmac.py` (build,
 validation, timings), `stream_probe.py` and `copytest.py` (the disk - the second exists because the first measured its
 own file mid-write). Nothing under `kindi/` imports it; this is a measurement tool, not a shipped path.
@@ -170,8 +176,12 @@ python -m tools.bitnet_gemm.copytest --path E:/ --src E:/Windows.iso --size 2048
 | 4 KB random | 3.9-5.7 k IOPS | **24.8 k IOPS** | 110 IOPS |
 | buffered write: into cache, then commit | 1.84, then 0.068 GB/s | - | - |
 
-**It is not the medium.** The same volume, the same 14.7 MB unbuffered reads, when nothing else is happening: 3.1-3.5
-GB/s, 3.3-4.0 ms a read. The 1.6 GB/s figure was not the drive's speed.
+**On C: it is not the medium.** The same volume, the same 14.7 MB unbuffered reads, when nothing else is happening:
+3.1-3.5 GB/s, 3.3-4.0 ms a read. The 1.6 GB/s figure was not [that drive's](#which-volume-and-what-it-is) speed.
+
+> **Re-measured 2026-11-05, and this section was reading the wrong volume.** `stream_probe` writes to `%TEMP%`, which is
+> on **C:**, while every pack and GGUF this branch ships lives on **B:**. They are not the same device and they differ by
+> 7x. The `2.64` and `3.29` GB/s rows below are B:, and they are cache: see [Which volume](#which-volume-and-what-it-is).
 
 **It is not the Windows I/O path either.** The buffered path a copy uses reaches 2.80-3.33 GB/s on C: and 3.29 on B: -
 above the claim, not below it. On the genuinely slow device the fast arm is the *warm* buffered one (3.88-4.03 against
@@ -202,16 +212,24 @@ than the device. A copy is therefore a floor on the device - it proves the mediu
 directions at once - and never a ceiling on reads. Quoting one as a read rate is this note's original mistake with the
 sign flipped.
 
-**And it corrects a label on the control.** The B: arm used to be described as a 4 TB spinning disk, and "a spindle
-cannot read at 2.5-3.6 GB/s" was the argument that the whole table had to be cache. Measured at 4 KB random over 33.9
-GB, B: does **24,820 IOPS** against the USB spindle's 110 - 225x - so B: is flash and its 2.6-3.3 GB/s are its own. The
-argument was sound in form and wrong in its premise. E: is the spindle, and it is the arm that does the work: 0.12-0.14
-GB/s cold, 3.88-4.03 warm, a 32x gap that shows exactly what a cache adds and why a warm number says nothing about a
-device.
+**The label on the control was right the first time, and the correction to it was wrong.** B: *is* a 4 TB SATA
+spindle (WD4005FZBX), and the 24,820 IOPS that were used to call it flash are not reproducible and cannot be the device.
+The evidence and the three arms that agree today are in [Which volume, and what it actually is](#which-volume-and-what-it-is).
+E: is the USB Seagate, and its 0.12-0.14 GB/s cold against 3.88-4.03 warm is still the arm that shows what a cache
+adds - it was never the only one.
 
-So the rate to build on is the device's own, and only when the drive is idle: **3.3-4.0 ms per 14.7 MB**. That moves the
-double-buffer ceiling from `1.8 / (1.8 + 9) = 17%` to `1.8 / (1.8 + 3.7) = 33%`, and the tokens needed to make one
-expert read free from 5.3 to 2.1. It does **not** move the batch-8 result below, because that result never used this
+So the rate to build on is the device's own, and only when the drive is idle. It was written as **3.3-4.0 ms per 14.7
+MB**, which is a C: number, and C: is not where the weights are. Per volume, at the device's own cold rate:
+
+| volume | what it is | cold unbuffered read | 14.7 MB expert | double-buffer ceiling |
+|---|---|---:|---:|---:|
+| **C:** | KIOXIA XG8 NVMe, 2 TB | 1.65-3.33 GB/s | 4.4-8.9 ms | 17-29% |
+| **B:** | WD4005FZBX, 4 TB SATA HDD | **0.23 GB/s** | **64 ms** | **2.7%** |
+
+On the volume every pack actually sits on, the expert read is **64 ms**, not 3.3-4.0, and the double-buffer ceiling is
+**2.7%**, not 33%. That does not change the batched conclusion (which rests on the 19-25 ms measured under a running
+gemm), and it makes model placement - packs on the NVMe, or resident - the first question any streaming design here
+has to answer. It does **not** move the batch-8 result below, because that result never used this
 rate: `batch_stream.py` times the read *while* sixteen threads of GEMV are running, and gets 19-25 ms - 5x the idle
 device cost - because the reader and the kernel share memory bandwidth. Those are two different costs, and the pipeline
 is the one that decides the design. The arithmetic above is unchanged in form: compute is 32.6 G weights/s and 3.7 ms of
@@ -435,17 +453,71 @@ k of them cost what k multiplies cost.
 
 Caveats: the expert pool is 32 matrices, so a batch fetching more than 32 re-reads experts that are already in the page
 cache; and the GEMVs run at the machine's 16 threads, so the streamed arm's timing includes the reader's contention,
-which is the point of the measurement rather than an artifact of it. The third caveat this gained last time - that the
-host's reads come from behind a cache nothing could bypass - is withdrawn: the drive reads at 3.1-3.5 GB/s on its own,
-and the 0.14 GB/s and 9 ms figures were reads racing a write commit (`copytest.py`, above).
+which is the point of the measurement rather than an artifact of it.The third caveat this gained last time - that the host's reads come from behind a cache nothing could bypass - was
+withdrawn because "the drive reads at 3.1-3.5 GB/s on its own". **It is back, and it applies to B: specifically.** B: is a
+4 TB SATA HDD that reads at 0.23 GB/s cold and does 100 IOPS random; the 3.1-3.5 GB/s readings there are the page cache,
+and a volume counter run beside one of them shows 38-90 MB/s on the wire ([Which volume](#which-volume-and-what-it-is)).
+The 0.14 GB/s and 9 ms figures were reads racing a write commit - that part stands - but so does the caveat, for a
+different reason than the one it was withdrawn for.
 
 ### The disk claims, resolved
 
 These were the least trustworthy numbers in the note, and the two rounds of measurement above are what settled them. A
 warm cache and a running write commit both depress the read rate, and the second one is what the original 1.6 GB/s and
-9.5 ms were: a probe reading the file it had just written. With the drive idle, the medium does 3.1-3.5 GB/s and an
-expert read is 3.3-4.0 ms; the USB spindle in the control does 0.12-0.14 GB/s cold against 3.9-4.0 warm, which is the
-same effect at 32x and on a device whose cold rate is unambiguous.
+9.5 ms were: a probe reading the file it had just written. With the drive idle, C: does 3.1-3.5 GB/s and an expert read
+there is 3.3-4.0 ms; the USB spindle in the control does 0.12-0.14 GB/s cold against 3.9-4.0 warm, which is the same
+effect at 32x and on a device whose cold rate is unambiguous.
+
+This paragraph was written when B: was believed to be flash. It is not, so the same sentences on B: describe the page
+cache: buffered reads there report 3.4-3.5 GB/s while `\LogicalDisk(B:)\Disk Read Bytes/sec` reports 38-90 MB/s for the
+same interval. The volume, not the state, is the difference.
+
+### Which volume, and what it actually is
+
+Re-measured 2026-11-05 after the question "is 1.66 GB/s this disk, or the I/O path?", and the answer is neither of the
+things the note assumed, because the note had been comparing two different disks.
+
+```powershell
+Get-PhysicalDisk | Select DeviceId,FriendlyName,MediaType,BusType,Size
+Get-Partition | Where DriveLetter -in 'B','C','E' | Select DriveLetter,DiskNumber
+```
+
+| volume | disk | device | spec read |
+|---|---|---|---|
+| **C:** | 1 | KIOXIA KXG8AZNV2T04, 2 TB | NVMe, PCIe 4.0, flash | ~6 GB/s |
+| **B:** | 0 | WDC WD4005FZBX, 4 TB | **SATA, HDD, 7200 rpm** | ~0.23 GB/s |
+| **E:** | 2 | Seagate BUP Portable, 5 TB | USB, HDD | ~0.14 GB/s |
+
+Measured today, same box, drive idle, each arm cold (a region nothing had read, window larger than the drive cache):
+
+| arm | B: (HDD) | C: (NVMe) |
+|---|---:|---:|
+| unbuffered sequential, 14.7 MB reads | **0.23 GB/s** | 1.65-3.33 GB/s |
+| direct copy, one-way share | **0.025 GB/s** | 1.2-2.4 GB/s |
+| direct copy, read+write | 0.05 GB/s | 2.4-4.7 GB/s |
+| 4 KB random over 35 GB | **100 IOPS** | - |
+| buffered read (the copy path) | 3.4-3.5 GB/s **from cache** | 2.9-3.6 GB/s |
+
+```bash
+# B: is the volume the packs live on, and it is a spindle
+python -m tools.bitnet_gemm.copytest --path B:/ --src B:/models/llama/Mixtral-8x22B-v0.1.Q8_0-00002-of-00005.gguf \
+    --offset 20000 --size 2048 --copy 1 --passes 2 --rand 500
+# C: the NVMe, with the copy arm run on settled data instead of a slice it just wrote
+python -m tools.bitnet_gemm.copytest --path C:/ --src B:/models/retired/Bonsai-8B-Q1_0.gguf \
+    --size 1152 --copy 1024 --settle 45 --passes 2
+```
+
+Three arms agree on B: and all three say the same thing: **0.23 GB/s sequential, 100 IOPS random** is a 7200 rpm disk,
+and no reading of this volume can be 1.66 GB/s let alone 3.3. The buffered arm disagrees only because it is not touching
+the disk - instrumenting `\LogicalDisk(B:)` during it shows 38-90 MB/s on the wire while the pass claims 2.97 GB/s.
+
+So, answering the question directly: **1.66 GB/s is a real sequential read rate of this machine's NVMe (C:), not the I/O
+path** - it reproduces at 1.62 GB/s from a settled file, and a direct copy on that volume sustains 1.2-2.4 GB/s one-way
+while doing both directions. It is *also* not the number any streaming design here should use, because the weights are on
+B:, where the device does **0.23 GB/s** and a 14.7 MB expert costs **64 ms**, not 3.3-4.0.
+
+`--settle` was added to `copytest` for this: in `--src` mode the copy arm used to copy a slice the tool had just written,
+so it measured that slice's commit - the exact artifact the tool exists to name.
 
 ## Four corrections
 
@@ -462,11 +534,17 @@ same effect at 32x and on a device whose cold rate is unambiguous.
    It divides the table by five, to 5.5 GB, which is a residency win and does reach batch 1 that way. The read is
    divided by 1.5 at best (8 -> 5.24 distinct matrices at batch 1), and the streaming crossover lands at B=8 (B=2 at
    the idle read rate), not B=1 - and a random partition of the same size lands close behind (B=4).
-4. **"A 4 TB spinning disk cannot read at 2.5-3 GB/s, so this table is not a device measurement."** The argument is
-   sound and its premise was wrong: B: is flash. It does **24,820 random 4 KB IOPS** over 33.9 GB against the USB
-   spindle's 110, so its 2.6-3.3 GB/s are its own, and the control that proves a cache exists is E: (0.12-0.14 GB/s
-   cold, 3.9-4.0 warm) rather than B:. The conclusion that the old numbers were not device numbers survives, for a
-   different reason: they were reads racing a write commit.
+4. **"A 4 TB spinning disk cannot read at 2.5-3 GB/s, so this table is not a device measurement."** The argument was
+   right and so was its premise. Its *refutation* was wrong: B: is not flash. It is disk 0 in
+   `Get-PhysicalDisk`/`Get-Partition`, a **WD4005FZBX 4 TB SATA HDD**, which reads at **0.23 GB/s** cold and does **100
+   random 4 KB IOPS** over 35.4 GB - the 24,820 IOPS recorded here are not reproducible and were page-cache hits. The
+   2.6-3.3 GB/s B: rows in the table above are therefore cache too, and the whole table's B: column has to be read as an
+   upper bound on nothing. Detail and the arms that agree today: [Which volume](#which-volume-and-what-it-is). The
+   conclusion that the old numbers were not device numbers survives, for a different reason - they were reads racing a
+   write commit - but it now applies to *this section's own* corrections as well.
+5. **The 1.66 GB/s figure is a genuine device number - for the other drive.** Reproduced today at 1.62 GB/s on C:, and
+   confirmed by a direct copy there (1.2-2.4 GB/s one-way, 2.4-4.7 GB/s read+write). It is not the I/O path and it is
+   not a cache: it is what this NVMe does. It is also irrelevant to a pack stored on B:, which moves 0.23 GB/s.
 
 None of these change the operating recommendation, which is the useful part: **do not port either kernel.** Parity is
 real - the LUT agrees with the pair table to float rounding on the same matrix in one process - but the repack is not

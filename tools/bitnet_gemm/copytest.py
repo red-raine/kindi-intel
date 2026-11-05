@@ -162,7 +162,11 @@ def _copy(win, src, dst):
 
 
 def _slice(src, dst, size, offset=0):
-    """materialise the first `size` bytes of `src` at `offset` - untimed setup for a kernel copy of a big file"""
+    """materialise the first `size` bytes of `src` at `offset` - untimed setup for a kernel copy of a big file
+
+    This is a *write*, and on a write-back device it is still committing when the arms below start. That is what
+    `--settle` is for: without it, the copy arm measures this slice's own commit rather than a copy of settled data.
+    """
     with open(src, "rb", buffering=0) as fi, open(dst, "wb", buffering=0) as fo:
         fi.seek(offset)
         left = size
@@ -172,6 +176,8 @@ def _slice(src, dst, size, offset=0):
                 break
             fo.write(b)
             left -= len(b)
+        fo.flush()
+        os.fsync(fo.fileno())
     return os.path.getsize(dst)
 
 
@@ -276,6 +282,7 @@ def _evict(win, path, size, block, offset=0):
 def main(argv):
     where, evict_path, evict_off, src_override = None, None, 0, None
     size_mb, chunk_mb, copy_mb, passes, offset, n_rand, flush_mb = 4096, 14.7, None, 3, 0, 0, None
+    settle = 0.0
     for i, a in enumerate(argv):
         if a == "--path":
             where = argv[i + 1]
@@ -297,6 +304,8 @@ def main(argv):
             n_rand = int(argv[i + 1])
         elif a == "--flush":
             flush_mb = int(argv[i + 1])
+        elif a == "--settle":
+            settle = float(argv[i + 1])
     if os.name != "nt":
         print("this probe is Windows-only: the question is about the Windows I/O path")
         return 2
@@ -358,6 +367,12 @@ def main(argv):
             c_mb = _slice(src, slice_path, copy_mb * MB, offset)   # untimed: this is just the payload
         else:
             slice_path = src
+        if settle:
+            # Let the device finish committing before the arms read it. A copy of a file that is still being written
+            # measures the commit, which is the exact artifact this tool exists to name: on this host 2 GB of fresh
+            # write leaves reads of that file at 0.14 GB/s for ~30 s.
+            print("  %-30s %7.1f s   (letting the device commit before the arms start)" % ("settle", settle))
+            time.sleep(settle)
         c_dt, c_moved = _copy(win, slice_path, dst)
         c_rate = c_moved / c_dt / 1e9
         print("  %-30s %7.2f s   %6.2f GB/s   (%.2f GB/s read+write, %d MB via CopyFileEx)"
