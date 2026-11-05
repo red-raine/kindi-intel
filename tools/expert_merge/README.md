@@ -17,6 +17,8 @@ python -m tools.expert_merge.real --summary merge.json                    # the 
 python -m tools.expert_merge.prune --routes routes.npz --keep 96          # which experts to drop, per layer
 python -m tools.expert_merge.prune --routes routes.npz --pack MODEL.gguf --frac 0.75 --gate --corpus A,B
 python -m tools.expert_merge.prune --selftest                             # the solve, the mask and the verdict
+python -m tools.expert_merge.prunegate --json wide.json keep96.json keep64.json   # one table, one verdict an arm
+python -m tools.expert_merge.prunegate --selftest                         # the four verdicts and the merge's checks
 ```
 
 `merge`, `permtest` and `fetch` are all in `python -m tools.selftest`, so none of them needs a pack or a GPU.

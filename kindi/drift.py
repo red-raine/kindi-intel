@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 
-from . import packio, ptload, quant
+from . import autotune, packio, ptload, quant
 
 PROBES = 32
 
@@ -155,10 +155,20 @@ def run(a, log=print):
 
 
 def verify_pack(sd, pack_dir, scheme="lsq", log=print):
-    """read the pack back through its own index and compare against the quantiser in memory"""
+    """read the pack back through its own index and compare against the quantiser in memory
+
+    `scheme` is one global choice, `"auto"` (the policy in the pack's autotune.json), or that map itself: with more
+    than one scheme in a pack there is no single quantiser to compare against, so the per-tensor map is what defines
+    what the bytes should be.
+    """
     import json
+    policy = autotune.policy_for(scheme, sd, pack_dir) if (not isinstance(scheme, str)
+                                                          or scheme == "auto") else None
     idx = json.load(open(os.path.join(pack_dir, "bcodes_index.json")))["tensors"]
-    bc = np.memmap(os.path.join(pack_dir, "bcodes.bin"), dtype=np.uint8, mode="r")
+    # a pack whose budget bought f32 for every tensor has no codes at all, and an empty file cannot be mmapped:
+    # that is a valid pack, not a broken one (verify_pack is also how the round trip is checked before serving)
+    codes_path = os.path.join(pack_dir, "bcodes.bin")
+    bc = np.memmap(codes_path, dtype=np.uint8, mode="r") if os.path.getsize(codes_path) else np.zeros(0, np.uint8)
     dp = packio.load_scales(pack_dir)
     bad = 0
     for name, rec in idx.items():
@@ -167,7 +177,11 @@ def verify_pack(sd, pack_dir, scheme="lsq", log=print):
         got = quant.dequantise(bc[o:o + (C // 4) * R].reshape(C // 4, R),
                                packio.tensor_scales(dp, rec).reshape(C // 128, R), R, C)
         w = np.ascontiguousarray(sd[name][:R], dtype=np.float32)
-        want = quantise_at(w, 128, scheme)
+        if policy is not None and name not in policy:
+            log("  pack round trip FAILED for %s: no policy entry" % name)
+            bad += 1
+            continue
+        want = quantise_at(w, 128, policy[name] if policy is not None else scheme)
         if not np.array_equal(got[:w.shape[0], :w.shape[1]], want):
             log("  pack round trip FAILED for %s" % name)
             bad += 1

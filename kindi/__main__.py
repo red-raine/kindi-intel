@@ -128,7 +128,7 @@ def cmd_qat_pack(cfg, a):
     out = a.out or os.path.join(os.path.expanduser("~"), ".kindi", os.path.splitext(os.path.basename(a.pt))[0])
     quant.selftest()
     man = quant.pack(sd, out, log=log, name=os.path.basename(a.pt), source=a.pt, scheme=a.scheme,
-                     budget=getattr(a, "budget", None))
+                     budget=getattr(a, "budget", None), within=getattr(a, "within", 0.0))
     log("kindi qat-pack: %d tensors (%d ternary, %s scale) -> %s, %.0f MB codes + %.1f MB f32"
         % (man["tensors"], man["ternary_tensors"], a.scheme, out, man["bcodes_bytes"] / 2 ** 20,
            man["f32_bytes"] / 2 ** 20))
@@ -319,11 +319,15 @@ def main(argv=None):
     s = sub.add_parser("qat-pack", help="ternarise a float torch checkpoint into a Kindi pack")
     s.add_argument("pt", help="a .pt state dict of float weights")
     s.add_argument("--out", help="pack directory (default: ~/.kindi/<checkpoint name>)")
-    s.add_argument("--scheme", choices=("absmean", "lsq", "gsq"), default="lsq",
+    s.add_argument("--scheme", choices=("absmean", "lsq", "gsq", "auto"), default="lsq",
                    help="absmean is the PTQ1_0/GGUF convention; lsq searches the minimum-error scale; gsq fits the "
-                        "codes and the scale together (kindi.gsq) - 11%% closer than lsq on heavy-tailed weights")
+                        "codes and the scale together (kindi.gsq) - 11%% closer than lsq on heavy-tailed weights; "
+                        "auto measures all three a tensor and takes the best (kindi.autotune)")
     s.add_argument("--budget", type=int, metavar="BYTES",
                    help="spend a size budget: choose which tensors stay f32 to minimise squared error (kindi.rco)")
+    s.add_argument("--within", type=float, default=0.0, metavar="FRAC",
+                   help="with --scheme auto: take a cheaper scheme when it is within FRAC of the best error a "
+                        "tensor (absmean is one pass, lsq a 33-point grid, gsq an alternation to a fixed point)")
     s = sub.add_parser("moe-check", help="check the CPU Mixture-of-experts FFN against a NumPy reference")
     s.add_argument("--experts", type=int, default=4)
     s.add_argument("--active", type=int, default=2)

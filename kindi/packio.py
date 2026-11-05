@@ -133,7 +133,10 @@ def load_scales(pack, manifest=None, bindex=None):
     """
     man = manifest if manifest is not None else json.load(open(os.path.join(pack, "kindi_pack.json")))
     if int(man.get("pack_format") or 1) < 2:
-        return np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.float16, mode="r")
+        # a pack that kept every tensor at f32 (a budget can buy exactly that) has no scales to map, and an empty
+        # file cannot be mmapped - the empty array is the honest answer, not an error
+        path = os.path.join(pack, "dpm.bin")
+        return np.memmap(path, dtype=np.float16, mode="r") if os.path.getsize(path) else np.zeros(0, np.float16)
     bi = bindex if bindex is not None else json.load(open(os.path.join(pack, "bcodes_index.json")))
     bi = bi.get("tensors", bi)
     idx = np.memmap(os.path.join(pack, "dpm.bin"), dtype=np.uint8, mode="r")

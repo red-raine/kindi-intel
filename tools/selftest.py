@@ -89,6 +89,7 @@ SUITES = [
     ("suite:expert_perm", [sys.executable, "-m", "tools.expert_merge.permtest"], "checks passed"),
     ("suite:packfetch", [sys.executable, "-m", "tools.expert_merge.fetch", "--selftest"], "checks passed"),
     ("suite:expert_prune", [sys.executable, "-m", "tools.expert_merge.prune", "--selftest"], "checks passed"),
+    ("suite:prunegate", [sys.executable, "-m", "tools.expert_merge.prunegate", "--selftest"], "checks passed"),
     ("suite:mergepack", [sys.executable, "-m", "tools.expert_merge.mergepack", "--selftest"], "checks passed"),
     ("suite:prefetch_budget", [sys.executable, "-m", "tools.bitnet_gemm.prefetch_budget"], "over-fetch"),
     ("suite:cluster_budget", [sys.executable, "-m", "tools.bitnet_gemm.cluster_budget", "--selftest"],
@@ -110,6 +111,7 @@ SUITES = [
     ("suite:kvq_sweep", [sys.executable, "-m", "tools.kvq.sweep", "--selftest"], "checks passed"),
     ("suite:recipes", [sys.executable, "-m", "kindi.recipes"], "checks passed"),
     ("suite:gsq", [sys.executable, "-m", "kindi.gsq"], "checks passed"),
+    ("suite:autotune", [sys.executable, "-m", "kindi.autotune", "--selftest"], "checks passed"),
     ("suite:rco", [sys.executable, "-m", "kindi.rco"], "checks passed"),
     ("suite:refit", [sys.executable, "-m", "kindi.refit", "--selftest"], "checks passed"),
 ]

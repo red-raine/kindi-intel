@@ -335,6 +335,8 @@ of 295 agent turns were the same). The details are in [docs/PROMPT-CACHE.md](doc
 | | |
 |---|---|
 | `kindi convert MODEL.gguf [--out DIR] [--force] [--paircodes] [--rope-factor F]` | build the weight pack (default: the configured `pack`); `--paircodes` adds `pcodes.bin`, the expert staging file a paged MoE pack copies from; `--rope-factor` builds the pack's rotary table at F instead of the factor the file declares (2 for a 16k stretch of an 8k window, 1 for the plain table) |
+| `kindi qat-pack CKPT.pt [--out DIR] [--scheme absmean\|lsq\|gsq\|auto] [--budget BYTES] [--within FRAC]` | ternarise a float QAT checkpoint into a pack; `auto` measures every scheme on every tensor and takes the best, and `--within` takes a cheaper scheme when it is within FRAC of the best error |
+| `python -m kindi.autotune CKPT.pt [--budget BYTES]` | the same policy on its own, per tensor and per scheme, without writing a pack |
 | `kindi fast-head [--clusters N]` | build the fast-head cluster file (stop the server first: needs ~300 MB of GPU memory) |
 | `kindi verify` | check greedy output against llama.cpp's reference |
 | `kindi bench` | speed at several context positions, prompt read speed, GPU memory |

@@ -122,13 +122,18 @@ def _pad8(a):
 
 
 def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, extra=None, scheme="lsq",
-         budget=None):
+         budget=None, within=0.0):
     """write bcodes.bin / dpm.bin / f32.bin / index.json / bcodes_index.json / kindi_pack.json for a float state dict
 
     `budget` (bytes) spends a size allowance through `kindi.rco`: each tensor's ternary error is measured first, then
     the subset of tensors that stays f32 is chosen exactly under the budget, so a pack that has room for more
     precision puts it where it buys the most. Without a budget every 2-D weight is ternary, which is the old
     behaviour.
+
+    `scheme="auto"` is `kindi.autotune`: each tensor gets the scale scheme that measured least error on it (free -
+    a tensor is the same bytes whatever scheme picked its codes), and the budget is then spent with that error, so
+    the pack's own precision decision is measured rather than assumed. The per-tensor map is written beside the pack
+    as autotune.json, because with more than one scheme the bytes are not readable without it.
     """
     os.makedirs(out_dir, exist_ok=True)
     order = sorted(sd)
@@ -136,7 +141,14 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
     if not tern:
         raise SystemExit("kindi quant: no 2-D weight matrices in this checkpoint, so there is nothing to ternarise")
     chosen = {}
-    if budget is not None:
+    picks = None
+    if scheme == "auto":
+        from . import autotune
+        pol = autotune.tune(sd, budget=budget, group=group, within=within, log=log)
+        autotune.write(pol, out_dir)
+        picks = pol["schemes"]
+        chosen = dict((k, f) for k, f in pol["formats"].items() if f != "ternary")
+    elif budget is not None:
         from . import rco
         entries = []
         for k in tern:
@@ -149,6 +161,14 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
         p = rco.plan(entries, int(budget))
         rco.summary(p, log)
         chosen = dict((k, f) for k, f in p["plan"].items() if f != "ternary")
+    def scheme_for(k):
+        """the scheme this tensor is written with: its own, under `auto`, and the one global choice otherwise"""
+        if picks is None:
+            return scheme
+        if k not in picks:
+            raise SystemExit("kindi quant: the autotune policy has no scheme for %s" % k)
+        return picks[k]
+
     n_tern = sum(1 for k in tern if chosen.get(k, "ternary") == "ternary")
     index = {"tensors": {}, "base": 0, "hadamard": {}}
     bindex = {"tensors": {}}
@@ -162,7 +182,7 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
         if k in tern and chosen.get(k, "ternary") == "ternary":
             R0, C0 = a.shape
             ap, rows = _pad8(np.ascontiguousarray(a, dtype=np.float32))
-            codes, sc, _ = quantise(ap, group, scheme)
+            codes, sc, _ = quantise(ap, group, scheme_for(k))
             fb.write(codes.tobytes())                       # [slot][row], as convert.py writes it
             fd.write(np.ascontiguousarray(sc.view(np.uint16)).tobytes())
             n = codes.shape[0] * rows
@@ -191,6 +211,10 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
            "tensors": len(order), "ternary_tensors": n_tern, "bcodes_bytes": bc_off, "dpm_bytes": dpm_off,
            "f32_bytes": f32_off,           "quant": {"scheme": scheme, "group": group, "scale": "fp16", "values": [-1, 0, 1]},
            "hadamard": {"enabled": False}, "dimensions": infer_dims(sd)}
+    if picks is not None:
+        # the aggregate is in the manifest, the map is in autotune.json: a reader of the manifest learns that this
+        # pack is not one scheme, without carrying a thousand-entry table in a header
+        man["quant"]["per_tensor"] = dict((s, sum(1 for v in picks.values() if v == s)) for s in sorted(set(picks.values())))
     if extra:
         man.update(extra)
     with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:
