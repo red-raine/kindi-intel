@@ -377,3 +377,12 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | prune 96 (done) | measured, **not established** | +0.0164, CI covers… is inside tolerance on the estimate only |
 
 Update this file when an item moves. An item that is measured gets its numbers into `docs/`, not only here.
+
+---
+
+## Recovery note (2026-11-05, from Freebuff session cache)
+Session `5b5aa0d9-f359-4bae-960d-4e41966d24c5` (plan, `deepseek/deepseek-v4-flash`, completed 2026-11-01 UTC) was recovered after a Freebuff desktop session-load failure. **Pending/unsent prompts:** none found in parseable local profile storage.
+
+**Recovered objective:** branch to support Intel **CPU/GPU/NPU** (9th-gen i9; 2× i9 Ultra mini PCs with iGPU/NPU/CPU; 1× with Intel Arc B50). Find hardware docs/features; adapt kindi for accelerated model running (fastest per hardware profile); consider disk I/O/p2p/memory, improved inference; evaluate libraries including OpenVINO, llama.cpp (SYCL/Vulkan), oneAPI/Level Zero and bleeding-edge options. This extends beyond the current CPU/AVX2 focus in §1–§3 and should be planned as additional measured profiles once P6/P5/P7 CPU-path priorities are settled.
+
+**Resume:** see `HANDOFF.md`. Code moved to `E:\viber_coding\freebuff\kindi-fork` (clean clone, HEAD `fee7bb0`, pushed to `origin`/`gitea` freebuff branch at recovery time).
