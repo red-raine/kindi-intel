@@ -164,11 +164,12 @@ written in the type its source used. Writing the merged experts at Q4_0 while me
 compare the merge with a *coarser* model and flatter it. Both arms are therefore written by the same code path at
 Q4_0, and `--groups 128` is the control: no merge, the same re-quantisation of the same dequantised weights.
 
-| pack | experts | type | size | NLL, 94 held-out tokens |
-|---|---:|---|---:|---:|
-| source | 128 | Q2_K / Q3_K | 11.26 GB | 4.9563 (reference, not paired) |
-| control | 128 | Q4_0 | 17.03 GB | 4.9053 |
-| merged | 64 pairs | Q4_0 | 8.87 GB | 6.2641 |
+| pack | experts | k | type | size | NLL, 94 held-out tokens |
+|---|---:|---:|---|---:|---:|
+| source | 128 | 8 | Q2_K / Q3_K | 11.26 GB | 4.9563 (reference, not paired) |
+| control | 128 | 8 | Q4_0 | 17.03 GB | 4.9053 |
+| merged | 64 pairs | 8 | Q4_0 | 8.87 GB | 6.2641 |
+| merged, matched fraction | 64 pairs | 4 | Q4_0 | 8.87 GB | 6.3071 |
 
 | | change | 95% interval | verdict |
 |---|---:|---|---|
@@ -189,14 +190,41 @@ only thing that stood between the pipeline and it.
 What the number still mixes together: the group's pooled router row changes which experts are chosen, and the averaged
 matrix changes what the chosen one computes. This measurement cannot attribute the 1.36 between the two; separating
 them needs a pack whose router keeps 128 rows while its expert stacks hold 64, which this reader could map and which
-nothing here does.
+nothing here does. The arm below prices one half of that mixture - how many of the merged experts a token reads - and
+leaves the pooled row in both arms.
+
+## At the control's own routing fraction
+
+The shipped merged pack reads **8 of 64** experts where the control reads **8 of 128**, so a token spends twice the
+share of its pool on the merged model - the capacity asymmetry the limits section used to call the merge cost a lower
+bound. `mergepack --retopk` writes the same weights at another k: `expert_used_count` is a header uint32, and the copy
+differs from its source in those four bytes and nothing else (8,871,398,560 bytes, every tensor still decoding), so
+the two merged arms are one model at two routing breadths.
+
+| arm | experts | k | share of the pool | NLL, 94 tokens | delta vs control | 95% interval |
+|---|---:|---:|---:|---:|---:|---|
+| control | 128 | 8 | 6.25% | 4.9053 | - | - |
+| merged, as shipped | 64 | 8 | 12.5% | 6.2641 | +1.3588 | +0.8984..+1.8029 |
+| merged, matched fraction | 64 | 4 | 6.25% | 6.3071 | **+1.4018** | +0.9031..+1.8329 |
+
+Per document the matched-fraction arm moves the same way as its sibling: 5.7448 and 6.8694 against 5.6721 and 6.8561.
+It is also **half the expert arithmetic a token** - four merged matrices instead of eight - so at equal pool share it
+is the cheaper end of the same pack, and it is the comparison the shipped arm was not making.
+
+**The breadth effect has the predicted sign and does not resolve.** Walked against each other token by token, the two
+merged arms differ by **+0.0430 nats, interval -0.1414..+0.2073** over the same 94 tokens: matching the control's
+fraction costs slightly more than the shipped arm, as "more relative capacity flatters the merge" says it should, but
+this sample cannot separate 0.043 from zero. What the arm does establish is the quantity the shipped comparison left
+open - **the merge costs +1.4018 at the control's own routing fraction**, not +1.3588 at twice it - and that the
+breadth difference is at most a sixth of the cost, not the explanation of it.
 
 ## What this does not establish
 
-- **k is held fixed while N halves.** Both packs read `expert_used_count = 8`, so a token spends 8 of 128 experts
-  (6.2%) in the control and 8 of 64 (12.5%) in the merged pack: the merged model gets twice the relative expert
-  capacity per token. More capacity should flatter the merge, so **+1.36 nats is a lower bound** on what merging at the
-  source's own routing fraction would cost, not a ceiling on it.
+- **The paired walk resolves the merge, not the breadth behind it.** The shipped arm reads 8 of 64 experts against the
+  control's 8 of 128; the matched-fraction arm reads 4 of 64 (the same 6.25%) and costs **+1.4018**. That is +0.0430
+  more than the shipped arm, with an interval of -0.1414..+0.2073 that covers zero: the capacity argument has the right
+  sign, the size of the breadth effect is not measured by these 94 tokens, and +1.36 and +1.40 are two readings of one
+  merge rather than a bound and a better bound.
 - **The two halves ran at different precisions.** The permutation test is on the Q2_K pack's own ternary rows; the NLL
   arm re-quantises both sides to Q4_0, so it measures the merge at a finer residual than the pack it read (which is the
   only way to keep the comparison fair here, and not the same question as a merged pack written in K-quants).
@@ -252,6 +280,17 @@ python -m tools.expert_merge.mergepack --pack MODEL.gguf --routes routes.npz --g
     --expert-type Q4_0 --out MERGED.gguf \
     --gate --baseline CONTROL.gguf --corpus docs/BENCHMARKS.md,kindi/tp.py --docs 2 --tokens 48 \
     --json merge64.json
+
+# the same merged weights at the control's own routing fraction: 4 of 64 is the same 6.25% as 8 of 128
+python -m tools.expert_merge.mergepack --retopk MERGED.gguf --used 4 --out MERGED-k4.gguf
+
+# all three arms against the control, the baseline walked once (~2 h on this machine), then the two merged arms
+# against each other for the breadth effect's own interval (~1 h)
+python -m tools.expert_merge.mergepack --compare CONTROL.gguf --against MERGED.gguf,MERGED-k4.gguf \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py --docs 2 --tokens 48 --json merge64-arms.json
+python -m tools.expert_merge.mergepack --compare MERGED.gguf --against MERGED-k4.gguf \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py --docs 2 --tokens 48 --json merge64-k4-vs-k8.json
 ```
 
-`python -m tools.selftest` runs both suites (`suite:expert_merge`, `suite:expert_perm`) as part of the repository gate.
+`python -m tools.selftest` runs these suites (`suite:expert_merge`, `suite:expert_perm`, `suite:mergepack`) as part of
+the repository gate.

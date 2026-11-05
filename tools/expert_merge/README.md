@@ -57,7 +57,16 @@ python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --gro
     --out CONTROL.gguf                                    # the unmerged control, same path, same quantisation
 python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --groups 64 --expert-type Q4_0 \
     --out MERGED.gguf --gate --baseline CONTROL.gguf --corpus A,B --docs 2 --tokens 48
-python -m tools.expert_merge.mergepack --selftest         # grouping, fusion, and a written pack read back
+python -m tools.expert_merge.mergepack --retopk MERGED.gguf --used 4 --out MERGED-k4.gguf   # same weights, k=4
+The same weights at another routing breadth: `--retopk` (or `--used N` when a pack is being built) rewrites the
+`expert_used_count` header field and copies everything else, so a paired walk of the copy against its source prices
+routing breadth with the merge held fixed. `--compare BASE --against A.gguf,B.gguf` gates packs that already exist,
+loading and scoring the baseline once for every arm:
+
+```
+python -m tools.expert_merge.mergepack --compare CONTROL.gguf --against MERGED.gguf,MERGED-k4.gguf \
+    --corpus A,B --docs 2 --tokens 48 --json arms.json
+python -m tools.expert_merge.mergepack --selftest         # grouping, fusion, a written pack read back, and the k rewrite
 ```
 
 Run end to end on the 48-layer pack: 128 experts, top-8, `routes.npz` from 384 tokens of this repository. `--groups
@@ -70,16 +79,20 @@ applied to the router rows too.
 Because this build of `gguf` decodes K-quants but cannot encode them, both arms are written at the same type through
 the same code path, and the unmerged control is the only fair comparison:
 
-| pack | experts | type | size | NLL, 94 held-out tokens |
-|---|---:|---|---:|---:|
-| source | 128 | Q2_K / Q3_K | 11.26 GB | 4.9563 (reference) |
-| control | 128 | Q4_0 | 17.03 GB | 4.9053 |
-| merged | 64 pairs | Q4_0 | 8.87 GB | 6.2641 |
+| pack | experts | k | type | size | NLL, 94 held-out tokens |
+|---|---:|---:|---|---:|---:|
+| source | 128 | 8 | Q2_K / Q3_K | 11.26 GB | 4.9563 (reference) |
+| control | 128 | 8 | Q4_0 | 17.03 GB | 4.9053 |
+| merged | 64 pairs | 8 | Q4_0 | 8.87 GB | 6.2641 |
+| merged, matched fraction | 64 pairs | 4 | Q4_0 | 8.87 GB | 6.3071 |
 
 **+1.3588 nats/token** against the control (95% interval +0.8984..+1.8029), i.e. perplexity about 3.9x worse at half
 the expert bytes *of that control* (8.16 GB against 16.32 GB; against the source's own 11.26 GB the merged file is
 8.87 GB, 21% smaller, and the source is Q2_K, so only the control is like-for-like); both documents move the same way
-(+1.44 and +1.28). The router grouping is real - the same pairs co-fire 10.8x more often than independence (median
+(+1.44 and +1.28). Read at the control's own fraction (4 of 64, the same 6.25% as 8 of 128) it is **+1.4018**
+(+0.9031..+1.8329): the shipped arm's extra relative capacity was flattering the merge by about 0.043 nats, so the
+merge cost is +1.40 and not +1.36 - and the matched-fraction arm is also half the expert arithmetic a token. The router
+grouping is real - the same pairs co-fire 10.8x more often than independence (median
 10.75, mean 12.75 over the 144 pairs) - and averaging them is still ruinous, which is what
 [docs/EXPERT-MERGE.md](../../docs/EXPERT-MERGE.md) measures from the weight side: a co-activated pair is not a
 relabelled function, so there is nothing for a merge to preserve. The 0.85 gate is load-bearing, not conservative.

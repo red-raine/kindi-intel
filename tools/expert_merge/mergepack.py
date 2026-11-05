@@ -179,7 +179,7 @@ def _add(writer, name, ne, ty, flat):
     writer.add_tensor(name, arr, raw_shape=tuple(int(d) for d in reversed(ne)), raw_dtype=t)
 
 
-def write_pack(src, dst, gids, mass, expert_type=None, log=print, progress=None):
+def write_pack(src, dst, gids, mass, expert_type=None, used=None, log=print, progress=None):
     """Write `dst` as `src` with each group of experts replaced by one mass-weighted average.
 
     Non-expert tensors are copied as bytes, not re-quantised: a copy that dequantised and re-quantised the attention
@@ -202,6 +202,13 @@ def write_pack(src, dst, gids, mass, expert_type=None, log=print, progress=None)
         raise SystemExit("mergepack: this gguf cannot write type %d; pick one it can (e.g. Q8_0, Q5_0, Q4_0, F16)" % et)
     kv = dict(g.kv)
     kv["%s.expert_count" % pack.arch] = n_groups
+    if used is not None:
+        # how many experts a token reads is a routing decision, so a pack can carry fewer groups than the source's k
+        # "same fraction" arm; it is written here rather than patched afterwards when the merge is being built anyway
+        if not 1 <= int(used) <= n_groups:
+            raise SystemExit("mergepack: --used %d of %d groups is not a routing breadth this pack can have"
+                             % (int(used), n_groups))
+        kv["%s.expert_used_count" % pack.arch] = int(used)
     writer = GGUFWriter(dst, pack.arch, use_temp_file=True)   # this writes general.architecture itself
     for k in sorted(kv):
         if k == "general.architecture":
@@ -255,37 +262,146 @@ def from_type(ty):
 
 # --- the comparison --------------------------------------------------------------------------------------------
 
+def compare_arms(base_pack, arms, docs, max_delta=0.02, block=8, log=print):
+    """One baseline walk, one walk a pack, one verdict each.
+
+    The baseline is loaded and scored once, which is what makes several arms affordable: the Q4_0 control is 17 GB and
+    each merged arm 8.9 GB, while the 94 scored tokens are the cheap part. Every walk sees the same tokenisation and
+    the same positions, so an arm's difference from the baseline is comparable with another arm's.
+    """
+    from .moe import Qwen3Moe
+    from .prune import gate, nll_moe
+
+    b = Qwen3Moe(base_pack, log=lambda *a: None)
+    per, b_docs = [], []
+    for name, ids in docs:
+        r = nll_moe(b, ids)
+        per.append(r["per_token"])
+        b_docs.append((name, r["nll"], r["tokens"]))
+        log("    baseline %-24s %8d tokens  nll %.4f" % (name, r["tokens"], r["nll"]))
+    del b
+    baseline = np.concatenate(per)
+
+    out = []
+    for path in arms:
+        arm = Qwen3Moe(path, log=lambda *a: None)
+        aps, a_docs = [], []
+        for name, ids in docs:
+            r = nll_moe(arm, ids)
+            aps.append(r["per_token"])
+            a_docs.append((name, r["nll"], r["tokens"]))
+            log("    %-12s %-24s %8d tokens  nll %.4f" % (os.path.basename(path)[:12], name, r["tokens"], r["nll"]))
+        del arm
+        after = np.concatenate(aps)
+        v = gate(dict(per_token=baseline), [dict(per_token=after)], max_delta=max_delta, block=block)[0]
+        out.append(dict(pack=path, baseline_nll=float(baseline.mean()), merged_nll=float(after.mean()),
+                        tokens=int(baseline.size), baseline_docs=b_docs, merged_docs=a_docs, gate=v))
+    return out
+
+
 def compare(src, merged, docs, max_delta=0.02, block=8, log=print):
     """NLL of both packs on the same tokens, paired token by token, with a moving-block interval.
 
     One process, two models, the same `forward`: the source is the baseline and the merged pack is the arm, and the
     difference is indexed by position so a document cannot contribute to one side only.
     """
-    from .moe import Qwen3Moe
-    from .prune import gate, nll_moe
+    return compare_arms(src, [merged], docs, max_delta=max_delta, block=block, log=log)[0]
 
-    base = Qwen3Moe(src, log=lambda *a: None)
-    b_per, b_tok, b_docs = [], [], []
-    for name, ids in docs:
-        r = nll_moe(base, ids)
-        b_per.append(r["per_token"])
-        b_tok.append(r["tokens"])
-        b_docs.append((name, r["nll"], r["tokens"]))
-        log("    %-28s %8d tokens  nll %.4f" % (name, r["tokens"], r["nll"]))
-    del base
-    baseline = np.concatenate(b_per)
 
-    arm = Qwen3Moe(merged, log=lambda *a: None)
-    a_per, a_docs = [], []
-    for name, ids in docs:
-        r = nll_moe(arm, ids)
-        a_per.append(r["per_token"])
-        a_docs.append((name, r["nll"], r["tokens"]))
-        log("    %-28s %8d tokens  nll %.4f  (merged)" % (name, r["tokens"], r["nll"]))
-    after = np.concatenate(a_per)
-    v = gate(dict(per_token=baseline), [dict(per_token=after)], max_delta=max_delta, block=block)[0]
-    return dict(baseline_nll=float(baseline.mean()), merged_nll=float(after.mean()), tokens=int(baseline.size),
-                baseline_docs=b_docs, merged_docs=a_docs, gate=v)
+# --- routing breadth --------------------------------------------------------------------------------------------
+
+_SCALAR_BYTES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def _kv_uint32_offset(path, key):
+    """The byte offset of a uint32 metadata value, read from the header alone - so it can be rewritten in place.
+
+    A GGUF key/value is a length-prefixed key, a type, then the value; only a scalar value can be rewritten without
+    shifting everything after it, which is why this insists on type 4 and refuses a string or an array.
+    """
+    import struct
+
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise SystemExit("mergepack: %s is not a GGUF file" % path)
+        ver = struct.unpack("<I", f.read(4))[0]
+        if ver not in (2, 3):
+            raise SystemExit("mergepack: %s is GGUF v%d, and this reader knows v2 and v3" % (path, ver))
+        _n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+        for _ in range(n_kv):
+            n = struct.unpack("<Q", f.read(8))[0]
+            k = f.read(n).decode("utf-8", errors="replace")
+            ty = struct.unpack("<I", f.read(4))[0]
+            pos = f.tell()
+            if k == key:
+                if ty != 4:
+                    raise SystemExit("mergepack: %s holds %r as metadata type %d, not a uint32" % (path, key, ty))
+                return pos
+            _skip_value(f, ty, k, path)
+    raise SystemExit("mergepack: %s has no %r in its header, so there is no routing breadth to rewrite" % (path, key))
+
+
+def _skip_value(f, ty, key, path):
+    import struct
+
+    if ty == 8:                                              # string
+        f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+        return
+    if ty == 9:                                              # array
+        et = struct.unpack("<I", f.read(4))[0]
+        n = struct.unpack("<Q", f.read(8))[0]
+        if et == 8:
+            for _ in range(n):
+                f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+            return
+        size = _SCALAR_BYTES.get(et)
+        if size is None:
+            raise SystemExit("mergepack: %s: array %r has element type %d, which this reader cannot skip"
+                             % (path, key, et))
+        f.seek(size * n, 1)
+        return
+    size = _SCALAR_BYTES.get(ty)
+    if size is None:
+        raise SystemExit("mergepack: %s: %r has metadata type %d, which this reader cannot skip" % (path, key, ty))
+    f.seek(size, 1)
+
+
+def retopk(src, dst, used, log=print):
+    """The same pack at a different routing breadth: every byte copied, `expert_used_count` rewritten.
+
+    k is a header field, not a weight. Changing it changes how many of the (already merged) experts a token reads and
+    renormalises over, and nothing else in the file moves - so a paired walk of the copy against its source prices
+    routing breadth with the merge held fixed. That is the arm the k/N asymmetry needs: 8 of 128 experts and 4 of 64
+    are the same fraction of the pool.
+    """
+    import shutil
+    import struct
+
+    if os.path.abspath(src) == os.path.abspath(dst):
+        raise SystemExit("mergepack: --retopk writes a new pack; it does not patch its source in place")
+    pack = Moepack(src)
+    n, used = pack.n_expert, int(used)
+    if not 1 <= used <= n:
+        raise SystemExit("mergepack: %d of %d experts is not a routing breadth this pack can have" % (used, n))
+    key = "%s.expert_used_count" % pack.arch
+    off = _kv_uint32_offset(src, key)
+    shutil.copyfile(src, dst)
+    with open(dst, "r+b") as f:
+        f.seek(off)
+        f.write(struct.pack("<I", used))
+    out = Moepack(dst)
+    if (out.n_expert, out.n_expert_used) != (n, used):
+        raise SystemExit("mergepack: %s reads back as %d of %d experts, not %d of %d"
+                         % (dst, out.n_expert_used, out.n_expert, used, n))
+    if os.path.getsize(dst) != os.path.getsize(src):
+        raise SystemExit("mergepack: %s is %d bytes where its source is %d, so a copy went wrong"
+                         % (dst, os.path.getsize(dst), os.path.getsize(src)))
+    if not out.payload_report()["ok"]:
+        raise SystemExit("mergepack: %s does not decode after the rewrite" % dst)
+    log("  %s: %d experts, %d used -> %d used; %d bytes, every tensor still decodes"
+        % (dst, n, pack.n_expert_used, used, os.path.getsize(dst)))
+    return dict(path=dst, source=src, experts=n, used_before=pack.n_expert_used, used_after=used,
+                bytes=int(os.path.getsize(dst)), offset=int(off))
 
 
 # --- the checks ------------------------------------------------------------------------------------------------
@@ -417,6 +533,34 @@ def selftest():
         check("mergepack: the source forward is finite", np.isfinite(before).all())
         check("mergepack: the merged forward is finite too", np.isfinite(after).all())
         check("mergepack: and it is not the same model any more", not np.allclose(before, after, atol=1e-4))
+
+        # routing breadth is a header field: the same weights at another k, with nothing else moving
+        k1 = os.path.join(td, "merged-k1.gguf")
+        rr = retopk(dst, k1, 1)
+        m1 = Moepack(k1)
+        with open(dst, "rb") as f:
+            raw = f.read()
+        with open(k1, "rb") as f:
+            raw2 = f.read()
+        moved = [i for i in range(len(raw)) if raw[i] != raw2[i]]
+        check("mergepack: --retopk moves one four-byte field and nothing else",
+              m1.n_expert == 2 and m1.n_expert_used == 1 and rr["used_before"] == 2 and len(raw) == len(raw2)
+              and moved and min(moved) >= rr["offset"] and max(moved) < rr["offset"] + 4,
+              "%d bytes differ" % len(moved))
+        check("mergepack: and the copy still decodes and runs at its new breadth",
+              m1.payload_report()["ok"]
+              and np.isfinite(Qwen3Moe(k1, log=lambda *a: None).forward(ids)["logits"]).all())
+        try:
+            retopk(dst, os.path.join(td, "too-wide.gguf"), 3)
+            refused = ""
+        except SystemExit as e:
+            refused = str(e)
+        check("mergepack: a breadth wider than the expert count is refused", "3 of 2 experts" in refused, refused[:60])
+
+        # the gate over existing packs: one baseline walk, one a pack, a verdict each
+        reps = compare_arms(src, [src], [("synthetic", ids)], log=lambda *a: None)
+        check("mergepack: --compare walks the baseline and every arm, and a pack against itself is zero",
+              len(reps) == 1 and reps[0]["gate"]["delta"] == 0.0 and reps[0]["tokens"] > 0, str(reps[0]["gate"]))
     finally:
         shutil.rmtree(td, ignore_errors=True)
     return 0
@@ -433,12 +577,53 @@ def main(argv):
         selftest()
         print("checks passed")
         return 0
+    if "--retopk" in argv:
+        src = _arg(argv, "--retopk")
+        dst, used = _arg(argv, "--out"), _arg(argv, "--used")
+        if not (src and dst and used):
+            print("usage: python -m tools.expert_merge.mergepack --retopk PACK.gguf --used 4 --out PACK-k4.gguf")
+            return 2
+        retopk(src, dst, used)
+        return 0
+
+    if "--compare" in argv:
+        base = _arg(argv, "--compare")
+        arms = [p for p in (_arg(argv, "--against") or "").split(",") if p.strip()]
+        names = [n for n in (_arg(argv, "--corpus") or "").split(",") if n.strip()]
+        if not (base and arms and names):
+            print("usage: python -m tools.expert_merge.mergepack --compare BASE.gguf --against A.gguf[,B.gguf] "
+                  "--corpus A,B --docs 2 --tokens 48 --json out.json")
+            return 2
+        from .moe import tokenizer
+        from .routes import corpus
+
+        docs = corpus(tokenizer(Moepack(base)), names, per_doc=int(_arg(argv, "--tokens", 48)))[:int(_arg(argv, "--docs", 2))]
+        if not docs:
+            raise SystemExit("mergepack --compare: no corpus to gate on")
+        print("  gate corpus: %s" % ", ".join("%s(%d tokens)" % (n, len(i)) for n, i in docs))
+        reps = compare_arms(base, arms, docs, max_delta=float(_arg(argv, "--max-delta", 0.02)))
+        for r in reps:
+            v = r["gate"]
+            print("  %s: nll %.4f -> %.4f (%+.4f, 95%% CI %+.4f..%+.4f) over %d tokens, tolerance %+.3f: %s"
+                  % (os.path.basename(r["pack"]), r["baseline_nll"], r["merged_nll"], v["delta"], v["ci_lo"],
+                     v["ci_hi"], v["tokens"], v["max_delta"], "ACCEPTED" if v["passed"] else "REJECTED"))
+        js = _arg(argv, "--json")
+        if js:
+            with open(js, "w", encoding="utf-8") as f:
+                json.dump(dict(baseline=base, corpus=names, per_doc=int(_arg(argv, "--tokens", 48)), arms=reps),
+                          f, indent=1, sort_keys=True)
+            print("  wrote %s" % js)
+        return 0
+
     src = _arg(argv, "--pack")
     routes_path = _arg(argv, "--routes")
     out = _arg(argv, "--out")
     if not (src and routes_path and out):
         print("usage: python -m tools.expert_merge.mergepack --pack SRC.gguf --routes ROUTES.npz --groups 64 "
-              "--out MERGED.gguf [--gate --corpus A,B --docs 2 --tokens 48 --json out.json] [--selftest]")
+              "--out MERGED.gguf [--used N] [--gate --corpus A,B --docs 2 --tokens 48 --json out.json]\n"
+              "       python -m tools.expert_merge.mergepack --retopk PACK.gguf --used 4 --out PACK-k4.gguf\n"
+              "       python -m tools.expert_merge.mergepack --compare BASE.gguf --against A.gguf[,B.gguf] "
+              "--corpus A,B --docs 2 --tokens 48 --json out.json [--selftest]")
         return 2
     from .routes import corpus, load
 
@@ -461,7 +646,7 @@ def main(argv):
         from gguf import GGMLQuantizationType as T
 
         et = int(T[et_name])
-    rep = write_pack(src, out, gids, mass, expert_type=et,
+    rep = write_pack(src, out, gids, mass, expert_type=et, used=_arg(argv, "--used"),
                      progress=lambda il: il % 8 == 7 and print("    merged through layer %d" % il))
     if et_name:
         print("  expert stacks and router written as %s (the source's K-quants cannot be re-quantised by this build)"
@@ -471,7 +656,8 @@ def main(argv):
              100.0 * rep["bytes"] / rep["source_bytes"], n_expert, n_groups))
 
     payload = dict(source=src, merged=out, groups=n_groups, gids=[int(x) for x in gids],
-                   merged_mass=exposed, write=rep, expert_type=et_name or "as the source")
+                   merged_mass=exposed, write=rep, expert_type=et_name or "as the source",
+                   used=int(_arg(argv, "--used")) if _arg(argv, "--used") else None)
     if "--gate" in argv:
         from .moe import tokenizer
 

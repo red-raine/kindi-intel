@@ -60,6 +60,12 @@
   `--groups 128 --expert-type Q4_0` is the unmerged control. On 94 held-out tokens: control 4.9053, merged 64 pairs
   **6.2641**, i.e. **+1.3588 nats/token** (+0.8984..+1.8029) and ~3.9x the perplexity for half the expert bytes
   (8.16 GB against the control's 16.32 GB). [docs/EXPERT-MERGE.md](docs/EXPERT-MERGE.md).
+- **`mergepack --retopk` / `--used N` and `--compare`.** The first rewrites `expert_used_count` and copies every other
+  byte, so the same merged weights can be walked at another routing breadth; the second gates packs that already exist
+  with one baseline walk for every arm. On the 64-pair pack, read at the control's own fraction (4 of 64 = 8 of 128 =
+  6.25%) instead of the shipped 8 of 64: **6.3071**, i.e. **+1.4018** (+0.9031..+1.8329) against the control. Matching
+  the fraction costs another ~0.043 nats, so the k/N asymmetry was flattering the merge and +1.36 was a lower bound -
+  by about a thirtieth of the claimed cost, not a large share of it.
 - **`tools.bitnet_gemm.cluster_budget`.** Measures whether clustering experts cuts paged bytes enough to stream at
   batch 1, from a captured router log rather than from an assumption about overlap: 12 clusters take the streaming
   crossover from B=64 to B=8 and the table from 58.8 GB to 5.5 GB, but a random partition of the same size reaches
