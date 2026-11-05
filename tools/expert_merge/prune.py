@@ -154,7 +154,7 @@ def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=N
     return out
 
 
-def summary(plans, per_expert, active=None, priced="bytes", log=print):
+def summary(plans, per_expert, active=None, priced="bytes", sized=None, log=print):
     """One block an operator can act on: what each layer kept, and what that costs in the pack's own bytes.
 
     The bytes come from the keeping ids and the pack's price list, not from the solver's `bytes` field: under `--keep`
@@ -165,12 +165,20 @@ def summary(plans, per_expert, active=None, priced="bytes", log=print):
     spent = sum(int(per_expert[l][p["keep"]].sum()) for l, p in enumerate(plans))
     total = int(per_expert.sum())
     dropped = [1.0 - (p["total_mass"] - p["dropped_mass"]) / p["total_mass"] for p in plans]
-    if priced == "count":
+    if priced == "count" and not sized:
         log("  %d layers, %d experts a layer, priced as a count (no pack given)"
             % (len(plans), int(per_expert.shape[1])))
         log("  keep %d-%d of %d a layer: %d of %d expert slots (%.1f%%), dropped routing mass %.1f%%"
             % (kept.min(), kept.max(), int(per_expert.shape[1]), spent, total, 100.0 * spent / total,
                100.0 * float(np.mean(dropped))))
+    elif priced == "count":
+        # the solve spent a count, but the plan has a size: the pack was read, so report both rather than a count
+        # labelled as a slot while the file it names is 208 MB a layer
+        log("  %d layers, %d experts a layer, %s bytes an expert"
+            % (len(plans), int(per_expert.shape[1]), "{:,}".format(int(per_expert[0, 0]))))
+        log("  keep %d-%d of %d a layer: %.2f GB of %.2f GB expert weights (%.1f%%), dropped routing mass %.1f%%"
+            % (kept.min(), kept.max(), int(per_expert.shape[1]), spent / 2 ** 30, total / 2 ** 30,
+               100.0 * spent / total, 100.0 * float(np.mean(dropped))))
     else:
         log("  %d layers, %d experts a layer, %s bytes an expert"
             % (len(plans), int(per_expert.shape[1]), "{:,}".format(int(per_expert[0, 0]))))
@@ -180,10 +188,18 @@ def summary(plans, per_expert, active=None, priced="bytes", log=print):
     if active and int(kept.min()) < int(active):
         log("  %d layers keep fewer than the model's %d active experts, so they route to %d slots there"
             % (int((kept < int(active)).sum()), int(active), int(kept.min())))
-    return {"kept": int(kept.sum()), "layers": len(plans), "pricing": priced,
-            "bytes_kept" if priced == "bytes" else "slots_kept": int(spent),
-            "bytes_all" if priced == "bytes" else "slots_all": int(total),
-            "dropped_mass": float(np.mean(dropped)), "min_kept": int(kept.min()), "max_kept": int(kept.max())}
+    # both prices are recorded when both are known: `slots_*` is what the solve spent, `bytes_*` is what the plan
+    # weighs in the pack. Under `--keep` they are a count and a size of the same plan - and a merged table that only
+    # has the count reads "-" for the size, which is the wrong way round for a note about bytes.
+    if sized is None:
+        sized = priced == "bytes"
+    out = {"kept": int(kept.sum()), "layers": len(plans), "pricing": priced,
+           "dropped_mass": float(np.mean(dropped)), "min_kept": int(kept.min()), "max_kept": int(kept.max())}
+    if sized:
+        out.update({"bytes_kept": int(spent), "bytes_all": int(total)})
+    if priced != "bytes":
+        out.update({"slots_kept": int(spent), "slots_all": int(total)})
+    return out
 
 
 def top_m_by_mass(mass, m):
@@ -216,12 +232,44 @@ def nll_moe(model, ids, log=None):
     got = model.forward(np.asarray(ids, dtype=np.int64), log=log)
     if got.get("logits") is None:
         raise SystemExit("prune: the pack does not decode every layer, so it has no next-token distribution to gate")
-    z = np.asarray(got["logits"], dtype=np.float64)
-    m = z.max(axis=1, keepdims=True)
-    lp = z - (m + np.log(np.exp(z - m).sum(axis=1, keepdims=True)))
-    targets = np.asarray(ids[1:], dtype=np.int64)
-    per = -lp[:-1][np.arange(targets.size), targets]
+    per = _per_token(got["logits"], ids)
     return dict(nll=float(per.mean()), tokens=int(per.size), per_token=per)
+
+
+def _per_token(logits, ids, rows=128):
+    """Teacher-forced NLL a token: log-softmax of the distribution at i-1 read at token i.
+
+    Only one number a row is needed - the target's log-probability - so the vocabulary is reduced a block of rows at
+    a time. That matters once a gate batches its corpus: 1,800 tokens over a 152k vocabulary is 1.1 GB of logits, and
+    promoting all of it to float64 for a log-sum-exp would double it for a difference no measurement can see.
+    """
+    targets = np.asarray(ids[1:], dtype=np.int64)
+    n = int(targets.size)
+    per = np.empty(n, dtype=np.float64)
+    for a in range(0, n, int(rows)):
+        b = min(a + int(rows), n)
+        z = np.asarray(logits[a:b], dtype=np.float64)
+        m = z.max(axis=1, keepdims=True)
+        lse = (m + np.log(np.exp(z - m).sum(axis=1, keepdims=True)))[:, 0]
+        per[a:b] = lse - z[np.arange(b - a), targets[a:b]]
+    return per
+
+
+def nll_moe_batch(model, docs, log=None):
+    """The same per-token NLL for a list of `(name, ids)` documents in **one** forward.
+
+    The gate used to walk the corpus a document at a time, which pays the dequantiser for a layer's experts once a
+    document because that is the expensive half of the pass. Batched, the expert union is taken over the corpus and
+    paid once; the tokens come back in the order they were given, so the arms stay paired token for token and the
+    bootstrap in `gate` never sees the difference.
+    """
+    got = model.forward_docs([np.asarray(i, dtype=np.int64) for _, i in docs], log=log)
+    if got["per_doc"][0].get("logits") is None:
+        raise SystemExit("prune: the pack does not decode every layer, so it has no next-token distribution to gate")
+    per_doc = [_per_token(g["logits"], i) for g, (_, i) in zip(got["per_doc"], docs)]
+    per = np.concatenate(per_doc) if per_doc else np.zeros(0)
+    return dict(per_token=per, tokens=int(per.size), nll=float(per.mean()) if per.size else float("nan"),
+                per_doc=[float(p.mean()) if p.size else float("nan") for p in per_doc])
 
 
 def gate(baseline, plans, max_delta=NLL_TOL, block=GATE_BLOCK, iters=2000, seed=7):
@@ -316,7 +364,7 @@ def main(argv):
     results = []
     for name, plans, pricing in named:
         print(" %s" % name)
-        tot = summary(plans, per_expert, active=active, priced=pricing)
+        tot = summary(plans, per_expert, active=active, priced=pricing, sized=pack is not None)
         results.append((name, plans, tot, pricing))
 
     model = None
@@ -351,12 +399,11 @@ def main(argv):
         print("    %s" % ", ".join("%s(%d tokens)" % (n, len(i)) for n, i in docs))
         model = Qwen3Moe(pack_path, log=lambda *a: None)
         model.set_prune(None)
-        per_token, scored = [], 0
-        for name, ids in docs:
-            r = nll_moe(model, ids)
-            per_token.append(r["per_token"])
-            scored += r["tokens"]
-            print("    %-28s nll %.4f over %d tokens" % (name, r["nll"], r["tokens"]))
+        r = nll_moe_batch(model, docs)
+        per_token = [r["per_token"]]
+        scored = r["tokens"]
+        for (name, ids), d_nll in zip(docs, r["per_doc"]):
+            print("    %-28s nll %.4f over %d tokens" % (name, d_nll, max(1, len(ids) - 1)))
         baseline = dict(per_token=np.concatenate(per_token), nll=float(np.concatenate(per_token).mean()),
                         tokens=scored)
         print("    baseline nll %.4f over %d tokens" % (baseline["nll"], baseline["tokens"]))
@@ -370,11 +417,8 @@ def main(argv):
         row = dict(spec=name, summary=tot, **plan)
         if model is not None:
             model.set_prune(plan["keep_per_layer"])
-            per_token, scored = [], 0
-            for dname, ids in docs:
-                r = nll_moe(model, ids)
-                per_token.append(r["per_token"])
-                scored += r["tokens"]
+            r = nll_moe_batch(model, docs)
+            per_token, scored = [r["per_token"]], r["tokens"]
             model.set_prune(None)
             v = gate(dict(per_token=baseline["per_token"]), [dict(per_token=np.concatenate(per_token))],
                      max_delta=tol)[0]

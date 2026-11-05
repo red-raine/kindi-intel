@@ -11,8 +11,11 @@ the measurement needs: for every layer and token, the 128 router logits, the eig
 weights, and the vector `x_n` the experts saw (`ffn_norm(x)`), which is the input distribution any merge has to
 be judged on.
 
-Costs, measured on this host: ~80M dequantised values/s, so one 48-layer pass over 128 tokens is a few minutes,
-and only the experts a token actually routes to are unpacked.
+Costs, measured on this host: the dequantiser runs at ~14-65M values/s and is nearly all of a document's cost, so a
+48-layer pass over a document is ~17 minutes *whatever its token count* - the experts its tokens route to saturate
+near all 128 within a couple of hundred tokens. `forward_docs` (and `tools.expert_merge.docbatch`, which prices it)
+takes that union over a batch of documents instead, so the same ~13 minutes scores 1,785 tokens rather than 256, at
+the price of holding one layer's f32 experts and the batch's logits.
 
 A plan from `tools.expert_merge.prune` is applied with `set_prune`: the router's logits are masked and the top-k
 renormalised, so the weights are untouched and the two arms of an NLL gate can share one loaded pack.
@@ -87,6 +90,27 @@ def masked_route(logits, k):
     idx = np.argsort(-probs, axis=-1)[:, :k]
     w = np.take_along_axis(probs, idx, axis=1)
     return idx, w / w.sum(axis=1, keepdims=True)
+
+
+def spans_of(seqs):
+    """The (start, stop) of each sequence in a batch they are concatenated into, in the order given."""
+    spans, off = [], 0
+    for s in seqs:
+        spans.append((off, off + len(s)))
+        off += len(s)
+    return spans
+
+
+def per_doc(x, spans, fn):
+    """Apply a per-sequence layer to each document of a batch in place, so nothing crosses a document boundary.
+
+    Attention is the one part of a batched forward that must **not** be batched: token 0 of the second document
+    has no business seeing the last token of the first. Passing each document's slice through the same code a
+    single-document forward runs is what makes the batch exactly the serial computation rather than nearly it.
+    """
+    for a, b in spans:
+        x[a:b] = fn(x[a:b])
+    return x
 
 
 class Qwen3Moe(object):
@@ -209,6 +233,42 @@ class Qwen3Moe(object):
             out.update(dict(route_logits=np.stack(cap["logits"]), route_ids=np.stack(cap["ids"]),
                             route_wts=np.stack(cap["wts"]), xn=np.stack(cap["xn"])))
         return out
+
+    def forward_docs(self, seqs, log=None):
+        """Several documents in one forward, sharing each layer's expert work.
+
+        Attention is per document - a document must not attend to its neighbour - but the sparse block is one batch,
+        and the experts a layer unpacks are the union over it. For a single 256-token document that union already
+        runs close to all 128, so adding a second document costs a GEMV rather than another dequant: the expensive
+        half of the forward is paid once a layer for the corpus instead of once a layer a document. That is the whole
+        cost model of a gate - `docs/EXPERT-PRUNE.md` priced a document at ~17 minutes for this reason.
+
+        Positions restart at 0 for each document, which is what makes this the same computation as scoring them one
+        at a time: a document's second token sees its own first token and nothing from the document before it. The
+        arithmetic per token is the same operations in the same order, so the logits agree to fp32 rounding rather
+        than bit for bit - a GEMV over 256 rows and one over 768 block differently inside BLAS.
+        `tools.expert_merge.docbatch` measures that difference on the real pack and prices the batching; its
+        `--selftest` covers the part that is a property rather than a measurement, that a batched forward keeps
+documents apart and returns them in the order given.
+        """
+        p = self.pack
+        seqs = [np.asarray(s, dtype=np.int64) for s in seqs]
+        if not seqs:
+            raise ValueError("no documents to forward")
+        if any(len(s) > 4096 for s in seqs):
+            raise ValueError("rope tables cover 4096 positions")
+        spans = spans_of(seqs)
+        x = np.concatenate([p.rows("token_embd.weight", s) for s in seqs], axis=0)
+        for il in range(self.n_layers):
+            per_doc(x, spans, lambda xs: self.attend(xs, il))       # per document: no cross-document attention
+            x = self.moe(x, il, None)                               # one batch: one expert union a layer
+            if log:
+                log("    layer %d/%d" % (il + 1, self.n_layers))
+        if self.truncated:
+            return dict(per_doc=[dict(logits=None, hidden=x[a:b]) for a, b in spans])
+        h = rmsnorm(x, p.tensor("output_norm.weight"), p.eps)
+        z = h @ p.tensor("output.weight").T
+        return dict(per_doc=[dict(logits=z[a:b], hidden=x[a:b]) for a, b in spans])
 
     def next_tokens(self, ids, k=8, log=None):
         if self.truncated:

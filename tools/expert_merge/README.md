@@ -19,6 +19,7 @@ python -m tools.expert_merge.prune --routes routes.npz --pack MODEL.gguf --frac 
 python -m tools.expert_merge.prune --selftest                             # the solve, the mask and the verdict
 python -m tools.expert_merge.prunegate --json wide.json keep96.json keep64.json   # one table, one verdict an arm
 python -m tools.expert_merge.prunegate --selftest                         # the four verdicts and the merge's checks
+python -m tools.expert_merge.docbatch --pack MODEL.gguf --layers 8 --docs 3  # serial vs batched corpus forward
 ```
 
 `merge`, `permtest` and `fetch` are all in `python -m tools.selftest`, so none of them needs a pack or a GPU.
@@ -119,10 +120,13 @@ On the 48-layer Qwen3-Coder-30B-A3B pack (1,708,032 bytes an expert, 208.5 MB a 
 
 `--frac F` prices each expert from the pack instead of counting it, and agrees with `--keep` where they coincide
 (0.75 x 218,628,096 bytes is exactly 96 experts). The plan is applied as a mask on the router, so the two arms of an
-NLL gate can share one loaded pack. On 94 held-out tokens (two documents the log never saw) NLL went 4.9563 ->
-4.9391 at 96 experts and -> 4.8850 at 64, with intervals -0.0625..+0.0469 and -0.2194..+0.0595: no measurable cost,
-and no evidence of a gain either. [docs/EXPERT-PRUNE.md](../../docs/EXPERT-PRUNE.md) has the gate's numbers and what
-they do not establish.
+NLL gate can share one loaded pack. On 1,785 held-out tokens (seven documents the log never saw) NLL went 3.6742 ->
+3.6787 at 112 experts a layer, interval -0.0082..+0.0174: **lossless within 0.02**, certified, for 82.9% of the expert
+bytes. At 96 it went to 3.6906, interval -0.0023..+0.0356 - inside the tolerance on the estimate and not established.
+The corpus is that wide because `forward_docs` batches it: the dequantiser is paid once a layer for the corpus instead
+of once a layer a document, which is 3.6x on three documents and grows with the corpus. A document at a time it is
+17 minutes whatever its token count, which is why the first gate was 94 tokens and read the wrong way.
+[docs/EXPERT-PRUNE.md](../../docs/EXPERT-PRUNE.md) has the numbers, the cost model and what they do not establish.
 
 ## What the real pack says
 

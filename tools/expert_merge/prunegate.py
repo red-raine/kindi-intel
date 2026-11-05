@@ -108,13 +108,15 @@ def report(merged, log=print):
         % (merged["tokens"], len(merged["docs"]), ", ".join("%s(%d)" % (n, t) for n, t in merged["docs"])))
     log("  baseline %d experts: nll %.4f; tolerance +/-%.3f nats/token" % (128, base, tol))
     log("")
-    log("  | keep | expert bytes | routing mass | nll | change | 95%% interval | width | verdict |")
+    log("  | keep | expert bytes | routing mass | nll | change | 95% interval | width | verdict |")
     log("  |---:|---:|---:|---:|---:|---|---:|---|")
     for r in merged["arms"]:
         s = r["summary"]
         log("  | %s | %s | %s | %.4f | %+.4f | %+.4f..%+.4f | %.4f | %s |"
-            % (str(r["spec"]).split("=")[-1], s.get("bytes_human") or _mb(s.get("expert_bytes")),
-               _pct(s.get("mass_dropped")), r["nll"], r["delta"], r["lo"], r["hi"], r["hi"] - r["lo"],
+            % (str(r["spec"]).split("=")[-1],
+               s.get("bytes_human") or _mb(s.get("bytes_kept") or s.get("expert_bytes")),
+               _pct(s.get("dropped_mass", s.get("mass_dropped"))), r["nll"], r["delta"], r["lo"], r["hi"],
+               r["hi"] - r["lo"],
                r["verdict"]))
     log("")
     for v in (LOSSLESS, NOT_WORSE, LOSS, UNRESOLVED):

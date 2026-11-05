@@ -114,6 +114,7 @@ SUITES = [
     ("suite:autotune", [sys.executable, "-m", "kindi.autotune", "--selftest"], "checks passed"),
     ("suite:rco", [sys.executable, "-m", "kindi.rco"], "checks passed"),
     ("suite:refit", [sys.executable, "-m", "kindi.refit", "--selftest"], "checks passed"),
+    ("suite:docbatch", [sys.executable, "-m", "tools.expert_merge.docbatch", "--selftest"], "checks passed"),
 ]
 
 
