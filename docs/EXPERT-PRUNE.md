@@ -201,14 +201,62 @@ the summary cannot see it.
 |---|---|---|
 | 112 of 128 | none | +0.0045 (lossless) |
 | 96 of 128 | none | +0.0164 (unresolved) |
-| 64 of 128 | **L1E68** | +0.0965 (loss) |
+| 96 of 128, guarded | none | +0.0173 (unresolved; same plan, re-measured) |
+| 64 of 128 | **L1E68** | +0.0965 (loss, certified above); +0.0963 re-measured beside the guarded arm |
+| 64 of 128, guarded | none | +0.0914 (loss) |
 | 32 of 128 | **L1E68, L2E92** | not gated |
 
-So the 64 arm's fifth of a nat has a mechanism, not just a magnitude, and the 96 plan survives this test only because
-96 > 92. That is a budget comparison, not a guard: a different corpus re-ranks mass, and a slightly tighter plan drops
+The 64 arm's fifth of a nat has a mechanism, not just a magnitude **- but the mechanism is not the flagged expert.**
+Removing L1E68 costs **0.0049 nats of the 0.0963** (the guarded and unguarded 64 arms differ by that on identical
+tokens), so the outlier is 5% of the loss and the rest is ordinary expert capacity. The earlier version of this
+paragraph read the overlap as causation; the guard experiment is what separates them. And the 96 plan survives the
+outlier test only because 96 > 92. That is a budget comparison, not a guard: a different corpus re-ranks mass, and a slightly tighter plan drops
 the expert at rank 92 while reporting the same sub-percent mass loss. The fix is to make it a guard - `prune
 --protect` forcing the flagged set into the keep set before the DP runs (3 or 4 experts of 6,144, 0.05% of expert
 bytes) - which is item **P0** in [the master plan](../masterplan.md).
+
+### The guard, and what it costs
+
+`prune --protect L:E,...` and `--protect-json superex.json` take the flagged experts out of the layer's budget first and
+keep them unconditionally; the same knapsack is then solved over the experts that are left, at the smaller budget. Two
+properties follow, and `--selftest` asserts both: the guard **spends** budget rather than raising it (a 96 plan with
+four protected experts holds 96, not 100), and a guard that does not fit the budget **stops the run** rather than being
+dropped quietly - a protection that can be silently ignored is the failure the flag exists to prevent.
+
+| plan | unguarded | guarded | what the guard costs |
+|---|---|---|---|
+| 96 of 128 | 4,597 slots, 7.31 GB, mass dropped 0.5874% | 4,597 slots, 7.31 GB, 0.5874% | **nothing** - 96 > 92 keeps E68 anyway |
+| 64 of 128 | 3,072 slots, 4.89 GB, 5.6100%, **drops L1E68** | 3,072 slots, 4.89 GB, 5.6160%, keeps it | E68's slot: 0.006 points of mass, **0.0049 nats** |
+| the guard itself | | | 6,832,128 bytes, **0.07% of the expert weights** |
+
+Those are plans, not losses: the mass column is the currency that cannot see the hazard, so it is reported to show what
+the guard costs and not to argue that it pays. The NLL walk is what decides.
+
+**The walk, on 1,785 held-out tokens (seven documents, `--tokens 256`).** At 96 the guarded plan is byte-identical to
+the plan certified above, so that arm is a reproducibility check as much as a P0 one: NLL 3.6670 → 3.6843,
+**+0.0173, 95% CI −0.0012..+0.0361** - the same verdict as the +0.0164 recorded above, on text that has since moved.
+One of the seven documents was edited after that certification, so this baseline reads 3.6670 where the earlier run read
+3.6742; the two are not the same corpus, and only this run's pairing is quoted. At 64 the guard does **not** rescue the
+plan: 3.6670 → 3.7584, **+0.0914 [+0.0445, +0.1401]**, rejected across the whole interval.
+
+**The unguarded 64 arm on the same 1,785 tokens is +0.0963 [+0.0505, +0.1443]** (a second process, baseline
+3.6670 bit for bit - the forward is deterministic, so the two arms are quoted against the same tokens, and this also
+**reproduces the certified +0.0965 to 0.0002** on the same seven documents a day later). So keeping the
+expert that layer 1 would otherwise drop is worth **0.0049 nats**, 5% of that plan's cost, and both arms fail the
+tolerance by a wide margin. The difference is well inside either interval: this is a point estimate in the direction
+the hazard argument predicts, not a resolved effect, and no A/B interval is quoted because the per-token deltas of the
+two processes were not stored against each other.
+
+That is the result worth saying plainly: protecting the four outliers is **necessary and not sufficient**. It costs
+0.07% of the expert bytes and it keeps the guard honest for the plans we ship, but at 50% expert reduction the loss is
+not in those four experts, and a plan that keeps them still costs a tenth of a nat.
+
+**`--protect-json` re-derives the set instead of trusting a stored mask.** `superex` has written two masks, and an
+artifact older than the relative threshold carries the *global* 10%-of-peak cut under `flagged` - on this pack that is
+31 experts, 23 of them in layer 47 at 1.7x their own layer's median, with L1E68 absent. Reading that key would have
+guarded the wrong 31 experts and spent 31 of a 96-plan's slots on them. A file with an `output` profile is therefore
+re-thresholded by `superex.flagged` at 100x the expert's own layer's median, and the tool prints which of the two it
+took.
 
 **The threshold has to be relative to the layer, which is why the tool's first version was wrong.** The literature's
 stated cut is global (P99.5 and 10% of the largest output anywhere). On this pack the layer median rises 150x with
@@ -305,6 +353,12 @@ python -m tools.expert_merge.superex --from-json superex.json --plan plans.json
 python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 112,96 --gate \
     --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md,tools/nll.py \
     --docs 7 --tokens 255 --json gate-112-96.json
+
+# the same gate with the outlier guard: 96 and 64, the flagged experts forced into every layer's keep set
+python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 96,64 \
+    --protect-json superex.json --gate \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md,tools/nll.py,docs/EXPERT-MERGE.md \
+    --docs 7 --tokens 255 --json gate-guard-96-64.json
 # then the verdicts, from the shards (refuses shards whose baseline disagrees)
 python -m tools.expert_merge.prunegate gate-112-96.json
 ```

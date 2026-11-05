@@ -653,7 +653,7 @@ so it measured that slice's commit - the exact artifact the tool exists to name.
    fell further behind the pair table. The direction of every earlier conclusion held; the sizes did not.
 
 None of these change the operating recommendation, which is the useful part: **do not port either kernel.** The pair
-table is faster than the LUT on this host by 1.5-2.9x, so a repack would buy a slow kernel in a new layout; the LUT's
+table is faster than the LUT on this host by 1.7-2.9x, so a repack would buy a slow kernel in a new layout; the LUT's
 one advantage - fewer bytes touched per group by a single shuffle - is also the version that overflows an int8 table.
 Paging is a batched design and this engine decodes at batch 1.
 

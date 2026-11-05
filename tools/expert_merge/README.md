@@ -143,6 +143,18 @@ of once a layer a document, which is 3.6x on three documents and grows with the 
 17 minutes whatever its token count, which is why the first gate was 94 tokens and read the wrong way.
 [docs/EXPERT-PRUNE.md](../../docs/EXPERT-PRUNE.md) has the numbers, the cost model and what they do not establish.
 
+**Mass is the wrong currency for a hazard, so `--protect` is a guard rather than a weight.** `superex` finds four
+experts writing 210-2,152x their own layer's median output on 0.28-1.4% of its routing mass - the lowest at mass rank 92
+of 128, which is exactly where the 64 plan cuts. `--protect L:E,...` (or `--protect-json superex.json`, which
+re-thresholds a profile instead of trusting whichever mask the artifact stored) takes those experts out of the budget
+first and keeps them unconditionally; the same knapsack then runs over what is left. It spends budget rather than
+raising it, it refuses a guard that does not fit, and on this pack the four cost 0.07% of the expert weights. At 96 the
+guarded plan is byte-identical to the unguarded one; at 64 it swaps **one expert in one layer** (L1E68 in, L1E73 out).
+On 1,785 held-out tokens that swap is worth **0.0049 nats** - 64 unguarded +0.0963 [+0.0505, +0.1443] against 64
+guarded +0.0914 [+0.0445, +0.1401], both against the same baseline - so the outlier is 5% of the 64 plan's cost and not
+its cause. The guard is a guard: it stops a catastrophe on a corpus that re-ranks mass, and it does not make a 50%
+reduction lossless.
+
 ## What the real pack says
 
 Qwen3-Coder-30B-A3B-Instruct Q2_K, layers 0-12, 384 tokens of this repository's text, top-8 of 128 experts; the rows

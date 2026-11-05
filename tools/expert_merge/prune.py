@@ -28,11 +28,20 @@ tested; `solve()` reports which one it is on.
 
     python -m tools.expert_merge.prune --routes routes.npz --keep 96                 # 96 of 128 a layer
     python -m tools.expert_merge.prune --routes routes.npz --pack MODEL.gguf --frac 0.75
+    python -m tools.expert_merge.prune --routes routes.npz --keep 96 --protect-json superex.json --gate
     python -m tools.expert_merge.prune --routes routes.npz --pack MODEL.gguf --frac 0.75 --gate --docs 2
     python -m tools.expert_merge.prune --selftest
 
 `--keep N` prices every expert at one byte, so the budget is a count and no pack is needed. `--frac F` prices each
 expert from the pack's own tensor table, so the budget is bytes and the answer is what fits.
+
+**`--protect` is a guard, not a preference.** Routing mass is the wrong currency for an expert that is not a small
+linear map: `tools.expert_merge.superex` finds four experts that write 210-2,152x their own layer's median output while
+carrying 0.28-1.4% of its routing mass, and the lowest of them ranks 92 of 128 by mass. A mass budget keeping 64 drops
+it and reports the loss as a fraction of a percent of mass - correctly, and blind to the mechanism. So the flagged set
+is forced into the keep set *before* the solve, priced in the same budget, and the tool says what the guard cost. If
+the guard alone does not fit the budget the run stops: a protection that is silently dropped is the failure this flag
+exists to prevent. Ids are `layer:expert`, 0-based, the same indexing `superex` and the plan JSON use.
 
 The gate: pruning is applied as a mask on the router - the kept ids keep their logits, the rest go to -inf and the
 top-k renormalisation runs as it always does - so the two arms differ only in which experts exist, with no
@@ -102,31 +111,52 @@ def expert_bytes(pack, n_layer=None):
 
 # --- the solve ------------------------------------------------------------------------------------------------
 
-def plan_layer(mass, sizes, budget, unit=1024, max_cells=40 << 20):
+def plan_layer(mass, sizes, budget, unit=1024, max_cells=40 << 20, protect=None):
     """One layer: choose which experts to keep so the kept bytes fit `budget` and the dropped mass is minimal.
 
     `mass` is one layer's row from `mass_per_expert`; `sizes` its per-expert byte counts. `kindi.rco.plan` is asked
     for a two-format choice a expert - `drop` at 0 bytes with the expert's mass as its error, `keep` at its bytes
     with no error - which is the pruning problem written as RCO's.
+
+    `protect` is a set of expert ids this layer may not drop. They are taken out of the budget first and kept
+    unconditionally, so the solve is the same knapsack over what is left, at a smaller budget - the guard spends
+    bytes rather than overriding the price. That ordering is the point: with `protect` applied inside the DP's error
+    term the result would depend on how the solver happened to break a tie.
     """
     mass = np.asarray(mass, dtype=np.float64)
     sizes = np.asarray(sizes, dtype=np.int64)
+    forced = sorted({int(e) for e in (protect or ())})
+    if forced and (forced[0] < 0 or forced[-1] >= mass.size):
+        raise SystemExit("prune: expert %d does not exist in a layer of %d" % (forced[-1], mass.size))
+    forced_bytes = int(sizes[forced].sum()) if forced else 0
+    if forced_bytes > int(budget):
+        raise SystemExit("prune: the %d protected expert(s) cost %d, over the layer's budget of %d by %d - a "
+                         "protection that does not fit is refused rather than dropped quietly"
+                         % (len(forced), forced_bytes, int(budget), forced_bytes - int(budget)))
+    rest = [e for e in range(mass.size) if e not in set(forced)]
+    if not rest:
+        return dict(keep=forced, bytes=forced_bytes, budget=int(budget), dropped_mass=0.0, method="protected",
+                    gap=0.0, protected=forced, protected_bytes=forced_bytes)
     entries = [dict(name=str(e), weights=1.0, err={"drop": float(mass[e]), "keep": 0.0},
                     bytes={"drop": 0, "keep": int(sizes[e])})
-               for e in range(mass.size)]
-    p = rco.plan(entries, int(budget), formats=("drop", "keep"), unit=int(unit), max_cells=int(max_cells))
-    keep = sorted(int(n) for n, f in p["plan"].items() if f == "keep")
-    return dict(keep=keep, bytes=int(p["bytes"]), budget=int(p["budget"]), dropped_mass=float(p["error"]),
-                method=p["method"], gap=float(p["gap"]))
+               for e in rest]
+    p = rco.plan(entries, int(budget) - forced_bytes, formats=("drop", "keep"), unit=int(unit),
+                 max_cells=int(max_cells))
+    keep = sorted(set(forced) | {int(n) for n, f in p["plan"].items() if f == "keep"})
+    return dict(keep=keep, bytes=int(p["bytes"]) + forced_bytes, budget=int(budget),
+                dropped_mass=float(p["error"]), method=p["method"], gap=float(p["gap"]),
+                protected=forced, protected_bytes=forced_bytes)
 
 
-def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=None):
+def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=None, protect=None):
     """Every layer, solved on its own budget: `frac` of the pack's expert bytes, or exactly `keep` experts.
 
     The budget is per layer and exact - each layer may spend its allowance and no more - so a layer that needs
     more experts than its allowance buys does not borrow from a layer that needs fewer. That is the constraint a
     paged or a size-capped serving layout actually has (layer L's experts are its own tensors), and it is why the
     answer is 48 independent knapsacks rather than one big one.
+
+    `protect` is `{layer: {expert, ...}}` - the guard from `superex`, forced into every layer's keep set.
     """
     mass, _count = mass_per_expert(routes, per_expert.shape[1])
     L = mass.shape[0]
@@ -134,6 +164,10 @@ def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=N
         raise SystemExit("prune: the log has %d layers and the pack prices %d" % (L, per_expert.shape[0]))
     if keep is None and frac is None:
         raise SystemExit("prune: give --keep N or --frac F")
+    protect = protect or {}
+    bad = sorted(set(protect) - set(range(L)))
+    if bad:
+        raise SystemExit("prune: --protect names layer(s) %s and the log has %d" % (bad, L))
     out = []
     for l in range(L):
         sizes = np.asarray(per_expert[l], dtype=np.int64)
@@ -141,7 +175,7 @@ def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=N
             budget = int(frac * int(sizes.sum()))
         else:
             budget = int(keep)
-        p = plan_layer(mass[l], sizes, budget, unit=unit)
+        p = plan_layer(mass[l], sizes, budget, unit=unit, protect=protect.get(l))
         if len(p["keep"]) < int(min_keep):
             raise SystemExit("prune: layer %d: a budget of %d bytes keeps %d experts, below the floor of %d "
                              "(%d bytes an expert)" % (l, budget, len(p["keep"]), int(min_keep), int(sizes[0])))
@@ -299,7 +333,7 @@ def gate(baseline, plans, max_delta=NLL_TOL, block=GATE_BLOCK, iters=2000, seed=
 
 # --- the CLI --------------------------------------------------------------------------------------------------
 
-def _plans_from_spec(routes, per_expert, argv):
+def _plans_from_spec(routes, per_expert, argv, protect=None):
     """every `--keep` / `--frac` value becomes its own plan, so one process can gate a curve of them"""
     keeps = float_list(argv, "--keep", int)
     fracs = float_list(argv, "--frac", float)
@@ -309,10 +343,71 @@ def _plans_from_spec(routes, per_expert, argv):
     plans = []
     for k in keeps:
         # one byte an expert: the budget is a count, and the solve is the same solve
-        plans.append(("keep=%d" % k, solve(routes, np.ones_like(per_expert), keep=k, unit=1), "count"))
+        plans.append(("keep=%d" % k, solve(routes, np.ones_like(per_expert), keep=k, unit=1, protect=protect),
+                      "count"))
     for f in fracs:
-        plans.append(("frac=%g" % f, solve(routes, per_expert, frac=f, unit=unit), "bytes"))
+        plans.append(("frac=%g" % f, solve(routes, per_expert, frac=f, unit=unit, protect=protect), "bytes"))
     return plans
+
+
+def parse_protect(spec):
+    """`1:68,2:92` -> {1: {68}, 2: {92}}; 0-based, the indexing `superex` and the plan JSON use"""
+    out = {}
+    for item in str(spec).replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise SystemExit("prune: --protect wants layer:expert pairs, not %r" % item)
+        l, e = item.split(":", 1)
+        out.setdefault(int(l), set()).add(int(e))
+    return out
+
+
+def load_protect(path, ratio=100.0):
+    """Read a flagged set rather than a hand-typed list: a `superex` profile, a pair list, or {layer: [ids]}.
+
+    The point of the flag is that the set is a measurement. Re-typing it into `--protect` is how a guard stops
+    matching the run it came from, so the artifact is the accepted input.
+
+    **A stored mask is not accepted as the set when the profile is there.** `superex` writes both its masks, and an
+    artifact older than the relative threshold carries the global 10%-of-peak cut under the same key - 31 experts here,
+    23 of them in layer 47 at 1.7x their own layer's median, and the layer-1 expert at 210x missing from it. So a
+    file with `output` is re-thresholded by `superex.flagged` at `ratio` (100x the expert's own layer's median, the cut
+    that separates the population cleanly), and a file that only carries a mask is used as given.
+    """
+    with open(path, encoding="utf-8") as f:
+        got = json.load(f)
+    if isinstance(got, dict) and got.get("output") is not None and got.get("layers") is not None:
+        from .superex import flagged
+
+        out = np.asarray(got["output"], dtype=np.float64)
+        mask, _peak = flagged(out, float(got.get("frac", 0.10)), ratio=float(ratio))
+        pairs = [[int(l), int(e)] for l, e in zip(*np.nonzero(mask))]
+        stored = got.get("flagged")
+        note = ""
+        if stored is not None and len(stored) != len(pairs):
+            note = "; its stored `flagged` mask is the %d-expert global cut, not this set" % len(stored)
+        print("  guard: %d expert(s) above %.0fx their own layer's median in %s%s"
+              % (len(pairs), float(ratio), os.path.basename(path), note))
+    else:
+        if isinstance(got, dict):
+            pairs = got.get("flagged", got.get("protect"))
+            if pairs is None and got and all(str(k).lstrip("-").isdigit() for k in got):
+                return {int(k): {int(e) for e in v} for k, v in got.items()}
+        elif isinstance(got, list):
+            pairs = got
+        else:
+            pairs = None
+        if pairs is None:
+            raise SystemExit("prune: %s has no `output` profile, `flagged`/`protect` mask, or {layer: [ids]}" % path)
+        print("  guard: %d stored pair(s) from %s, used as given" % (len(pairs), os.path.basename(path)))
+    out = {}
+    for pair in pairs:
+        if len(pair) != 2:
+            raise SystemExit("prune: %s: %r is not a (layer, expert) pair" % (path, pair))
+        out.setdefault(int(pair[0]), set()).add(int(pair[1]))
+    return out
 
 
 def _arg(argv, name, default=None):
@@ -335,8 +430,8 @@ def main(argv):
     path = _arg(argv, "--routes")
     if not path:
         print("usage: python -m tools.expert_merge.prune --routes ROUTES.npz --keep N[,N...] "
-              "| --frac F[,F...] [--pack MODEL.gguf] [--json out.json] [--gate --docs 2 --tokens 96 "
-              "--max-delta 0.02] [--selftest]")
+              "| --frac F[,F...] [--pack MODEL.gguf] [--protect L:E,...] [--protect-json superex.json] "
+              "[--json out.json] [--gate --docs 2 --tokens 96 --max-delta 0.02] [--selftest]")
         return 2
     from .routes import load
 
@@ -360,7 +455,28 @@ def main(argv):
         per_expert = np.ones((n_layer, n_expert), dtype=np.int64)
 
     active = int(meta.get("active", 0)) or None
-    named = _plans_from_spec(got, per_expert, argv)
+
+    protect = {}
+    for flag, loader in (("--protect", parse_protect), ("--protect-json", load_protect)):
+        raw = _arg(argv, flag)
+        if raw is None:
+            continue
+        for l, ids in loader(raw).items():
+            protect.setdefault(l, set()).update(ids)
+    if protect:
+        pairs = [[l, e] for l in sorted(protect) for e in sorted(protect[l])]
+        over = sorted(l for l in protect if l >= n_layer or max(protect[l]) >= n_expert)
+        if over:
+            raise SystemExit("prune: --protect names layer %d, and this log is %d layers of %d experts"
+                             % (over[0], n_layer, n_expert))
+        print("  guard: %d expert(s) forced into the keep set: %s"
+              % (len(pairs), ", ".join("L%dE%d" % (l, e) for l, e in pairs)))
+        if pack is not None:
+            cost = int(sum(per_expert[l][sorted(ids)].sum() for l, ids in protect.items()))
+            print("  guard costs %s bytes, %.2f%% of the expert weights"
+                  % ("{:,}".format(cost), 100.0 * cost / float(per_expert.sum())))
+
+    named = _plans_from_spec(got, per_expert, argv, protect=protect or None)
     results = []
     for name, plans, pricing in named:
         print(" %s" % name)
@@ -411,7 +527,9 @@ def main(argv):
     tol = float(_arg(argv, "--max-delta", NLL_TOL))
     accepted = []
     payload = {"routes": path, "pack": pack_path, "n_layer": n_layer, "n_expert": n_expert,
-               "tokens_logged": int(got["route_wts"].shape[1]), "plans": []}
+               "tokens_logged": int(got["route_wts"].shape[1]),
+               "protect": ([[l, e] for l in sorted(protect) for e in sorted(protect[l])] if protect else []),
+               "plans": []}
     for name, plans, tot, pricing in results:
         plan = as_plan(plans, pricing=pricing)
         row = dict(spec=name, summary=tot, **plan)
@@ -543,6 +661,58 @@ def selftest():
     noisy = gate(base, [dict(per_token=np.full(32, 0.0).tolist() + np.full(32, 0.04).tolist())], max_delta=0.02)[0]
     check("prune: an interval that straddles the tolerance is marginal, not accepted", noisy["marginal"],
           str(noisy))
+
+    # --- the guard: a flagged expert is kept even when a mass budget would drop it, and that is the whole of P0
+    massp = np.linspace(1.0, 128.0, 128)                  # expert 0 carries the least routing mass
+    sizesp = np.full(128, 1668 * 1024, dtype=np.int64)
+    plain = plan_layer(massp, sizesp, budget=96 * sizesp[0])
+    check("prune: without the guard, the least-mass experts are the ones dropped", 0 not in plain["keep"])
+    guarded = plan_layer(massp, sizesp, budget=96 * sizesp[0], protect=[0])
+    check("prune: a protected expert survives the budget that would have dropped it", 0 in guarded["keep"],
+          str(guarded["keep"][:5]))
+    check("prune: the guard spends the budget rather than raising it",
+          guarded["bytes"] <= guarded["budget"] and guarded["protected_bytes"] == int(sizesp[0]),
+          "%d of %d" % (guarded["bytes"], guarded["budget"]))
+    check("prune: and it takes a kept slot from the unprotected, so the count is unchanged",
+          len(guarded["keep"]) == len(plain["keep"]) and len(guarded["keep"]) == 96, str(len(guarded["keep"])))
+    # protecting the lightest expert displaces the heaviest one the plain plan kept - the guard is paid for in mass,
+    # and the amount it pays is exactly the difference between those two, not a number the solver chose
+    check("prune: the guard trades routing mass for the flagged expert, by exactly one slot's worth",
+          guarded["dropped_mass"] > plain["dropped_mass"]
+          and abs((guarded["dropped_mass"] - plain["dropped_mass"]) - (massp[32] - massp[0])) < 1e-6,
+          "%.6g vs %.6g" % (guarded["dropped_mass"], plain["dropped_mass"]))
+    top = plan_layer(massp, sizesp, budget=96 * sizesp[0], protect=[127])
+    check("prune: protecting an expert the solve keeps anyway changes nothing",
+          127 in top["keep"] and len(top["keep"]) == 96
+          and abs(top["dropped_mass"] - plain["dropped_mass"]) < 1e-9, str(top["keep"][:4]))
+    try:
+        plan_layer(massp, sizesp, budget=sizesp[0], protect=[0, 1])
+        check("prune: a guard that does not fit the budget is refused, not dropped quietly", False)
+    except SystemExit as exc:
+        check("prune: a guard that does not fit the budget is refused, not dropped quietly",
+              "refused" in str(exc), str(exc))
+
+    # --- the spec and the artifact: 0-based, the same indexing superex and the plan JSON use
+    check("prune: --protect parses layer:expert pairs", parse_protect("1:68,2:92,1:114") == {1: {68, 114}, 2: {92}},
+          str(parse_protect("1:68,2:92,1:114")))
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(dict(flagged=[[2, 92], [1, 114], [3, 82], [1, 68]]), f)
+        check("prune: --protect-json reads superex's flagged set",
+              load_protect(tmp) == {1: {68, 114}, 2: {92}, 3: {82}}, str(load_protect(tmp)))
+        # a profile is re-thresholded, not trusted: the stored mask here is a stale global cut that names an expert the
+        # relative cut does not, and the relative cut names one the stored mask omits
+        out = np.ones((2, 4))
+        out[0, 2] = 500.0
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_TRUNC), "w", encoding="utf-8") as f:
+            json.dump(dict(layers=[0, 1], output=out.tolist(), flagged=[[0, 2], [1, 0]]), f)
+        check("prune: --protect-json derives the relative set from a profile instead of its stored mask",
+              load_protect(tmp) == {0: {2}}, str(load_protect(tmp)))
+    finally:
+        os.unlink(tmp)
     return 0
 
 

@@ -27,7 +27,7 @@ Anything that trades 1 for 2 has to say which nats it spent and quote the interv
 | …of which **routing** costs | **≤ +0.17**, point +0.128 *in the pooled router's favour*, CI −0.0139..+0.1695 | kept-router arm, `mergepack --keep-router` |
 | …of which **arithmetic** costs | **≥ +1.08** | same |
 | Super experts in this pack | 4 experts at **210–2,152× their own layer's median output**: L2E92 (947, 2,152×), L1E114 (283, 927×), L3E82 (179, 525×), L1E68 (64, 210×). Next largest in the pack is 42.7×. **Mass ranks them 27, 27, 38 and 92 of 128** | `tools/expert_merge/superex.py`, `docs/EXPERT-PRUNE.md` |
-| Their fate in our plans | 112 and 96 keep all four; **64 drops L1E68** (mass rank 92, 0.28% of its layer's mass) and 32 drops L1E68 and L2E92. So the 64 arm's +0.0965 has a mechanism, and 96 survives only because 96 > 92 | same |
+| Their fate in our plans | 112 and 96 keep all four; **64 drops L1E68** (mass rank 92, 0.28% of its layer's mass) and 32 drops L1E68 and L2E92. 96 survives only because 96 > 92; the 64 arm's +0.0965 is **not** caused by dropping E68 — keeping it is worth 0.0049 (P0, below) | same |
 
 The merge row is the most important: at 50% expert reduction the merge costs 1.08–1.20 nats, and the router is not
 where the money went. That result is now corroborated externally (§3, REAP), which changes the plan: **merging is not
@@ -96,6 +96,18 @@ than 96 without it, and the protect set costs ≤ 0.1% of expert bytes (3 of 6,1
 
 *Kill:* if protecting changes nothing at 96, the guard is still correct — it stays, and the finding is recorded as "the
 mass plan already had this right on this corpus, by luck of the ranking".
+
+*Result (2026-11-05, 1,785 held-out tokens):* the guard costs **6,832,128 bytes, 0.07% of the expert weights**, and at
+96 the guarded plan is **byte-identical** to the unguarded one — all four outliers survive at 96 because 96 > 92. The
+re-gate is therefore a reproducibility check: **+0.0173 [−0.0012, +0.0361]**, the same `marginal` verdict as the
++0.0164 already recorded. At 64 the guard swaps **one expert in one layer** (L1E68 in, L1E73 out) and the plan still
+fails: **+0.0914 [+0.0445, +0.1401]** against the unguarded arm's **+0.0963 [+0.0505, +0.1443]** on the same 1,785
+tokens (both baselines 3.6670, bit for bit). So the protection is necessary, cheap and insufficient: E68 is **0.0049
+of a 0.0963** loss, and the other 95% is ordinary expert capacity. That also retracts the earlier reading that the 64
+arm's cost was *caused* by the flagged expert. The unguarded arm also reproduces the certified +0.0965 to 0.0002, so
+the difference is the guard and not drift. `--protect-json` also had to be built to *re-derive* the set from a `superex` profile: the
+stored artifact carries the global 10%-of-peak cut (31 experts) under `flagged`, and reading it would have guarded 31
+slots instead of 4.
 
 ### P1 — Prune on saliency, not mass, and not uniformly across layers — **~1 day**
 
@@ -348,7 +360,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 
 | item | status | next action |
 |---|---|---|
-| P0 protect super experts | **open** | add `--protect`/`--protect-json` to `prune`, re-gate 96 |
+| P0 protect super experts | **measured** | `--protect`/`--protect-json` in `prune`; guard 0.07% of bytes; 96 identical to unguarded (**+0.0173 [−0.0012, +0.0361]**, marginal); 64 guarded **+0.0914** vs unguarded **+0.0963** on the same tokens — the outlier is 5% of that loss, not its cause |
 | P1 saliency + non-uniform budgets | open | needs P0 and P2 |
 | P2 functional screen | open | wrap `astvalid` around 40 fixed prompts |
 | P3 mitigated merge | open, likely kill | compare against prune-at-96, not just the control |

@@ -72,6 +72,18 @@
   router mask, so the two arms of the NLL gate share one loaded pack; on 94 held-out tokens the 96-expert plan scores
   -0.0171 nats/token (-0.0625..+0.0469) and the 64-expert plan -0.0712 (-0.2194..+0.0595), so neither costs anything
   measurable and neither interval settles the sign. [docs/EXPERT-PRUNE.md](docs/EXPERT-PRUNE.md).
+  **`--protect L:E,...` / `--protect-json superex.json`** is the guard routing mass cannot provide: the flagged experts
+  are taken out of each layer's budget first and kept unconditionally, so the solve is the same knapsack at a smaller
+  budget. It spends budget rather than raising it and refuses a guard that does not fit. On this pack the four experts
+  `superex` flags at 100x their layer's median cost **0.07% of the expert weights** to protect, and 0.006 points of mass
+  at 64 of 128 - which is where the guard earns its place, since the unguarded 64 plan drops L1E68 at mass rank 92. A
+  `superex` profile passed here is re-thresholded rather than read from its stored mask, because the older artifacts
+  carry the global 10%-of-peak cut (31 experts) under the same key. **Gated on 1,785 held-out tokens:** at 96 the guarded
+  plan is byte-identical to the unguarded one (**+0.0173, CI -0.0012..+0.0361**, marginal - the same verdict as before);
+  at 64 it keeps E68 for **+0.0914 (+0.0445..+0.1401)** against the unguarded arm's **+0.0963 (+0.0505..+0.1443)** on the
+  same tokens. So the outlier is 0.0049 of that 0.0963 loss: the guard stops a catastrophe on a corpus that re-ranks
+  mass, it does not make a 50% reduction lossless - and the earlier reading that E68 *caused* the 64 arm's cost is
+  retracted.
 - **`tools.expert_merge.mergepack`.** Writes the pack the merge question needs: each co-activated group becomes one
   expert, every non-expert tensor copied byte for byte, the router one pooled row a group, `expert_count` patched to
   match - so the before/after is two models read by the same reader, not two settings. Co-activation is partitioned by
