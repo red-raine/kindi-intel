@@ -85,6 +85,76 @@ Grouped by the question it answers. `masterplan.md` §2 says which of these chan
 
 ---
 
+## G. Symbolic, LUT and graph layers: cheaper, or better?
+
+The question this section exists to answer: can a symbolic/LUT/action-graph layer on top of a small quantised model give
+**better answers**, not just fewer flops? The honest split is: *selection with a verifier* is measured to help;
+*representation without one* is not.
+
+| source | what it says | what it implies here |
+|---|---|---|
+| Wang et al., *Grouped Sequency-arranged Rotation* (2025, arXiv 2505.03810) **[measured]** | A **grouped** rotation (GSR) before 2-bit quantisation: Llama-2-7B WikiText-2 PPL 20.29 → **11.59** at W2; rotating in sequency order is what they credit for part of it | The rotation half is real; the *sequency* half is not transferable to us — at a group-local quantiser a within-group permutation is exactly inert (§H, measured) |
+| ISPASS'24 NSAI slides (Zishen Wan) **[measured]** | Accelerator architecture for neuro-symbolic AI: efficiency from putting symbolic work on dedicated hardware, benchmarked on control/games-style tasks | Nothing about CPU or language-model quality. A hardware-architecture claim, not an accuracy result |
+| Wang et al. 2024, arXiv 2412.10390 **[measured]** | Graph/structured reasoning with LLMs: gains where the graph or the checker is supplied | The gain is the *checker*, not the graph: on tasks with no external verifier the reported advantage shrinks or vanishes |
+| OpenReview s1I5R4b3KX **[measured]** | LUT-style / compressed table inference: throughput and memory wins on small task benchmarks | Throughput only; no LM-quality result at 1B+ scale, so it cannot price a pack change here |
+| Self-consistency (Wang et al. 2023) **[replicated]** | PaLM-540B GSM8K 56.5 → **74.4** by sampling k and majority-voting; requires no new model, no graph, no index | The cheapest "better answers" mechanism that exists, and the one this plan keeps (`P9`) |
+| Program-of-thought / PAL, CodeT-style test filtering **[measured]** | Executing candidate programs and filtering on tests beats free-form CoT on arithmetic and code benchmarks | A verifier is a *checker*, so it is cheap on a CPU and adds no bytes a token. It also cannot fire where nothing is checkable |
+| Tsetlin machines, weightless networks (WiSARD/Randen), tries, n-gram caches **[measured, small scale]** | Real speedups on classification and pattern tasks; ternary/LUT kernels are fast on AVX2 | No published LM-quality result at our scale. Fast, not better; and "LUT backbone" is not a mechanism anyone has shown to reason |
+| Oracle-retrieval experiments (see §E) **[replicated]** | With retrieval made **oracle**, models ≤7B still failed 85–100% of the questions they could not answer alone, and retrieval destroyed 42–100% of answers they had right | A knowledge graph in front of a small model is a prompt-budget cost, not a capability upgrade. This is what closes the "symbolic backbone" proposal |
+
+What this changes: `P9` exists because of the first column's one positive row — selection over samples with a
+**deterministic checker**, which is P2's `astvalid` pointed at k samples. The rest of the proposal is answered in `P8`.
+
+One thing worth stating plainly, because it is the request this section came from: "surfs the web and matches the right
+answer" is not a symbolic-layer question at all. It is tool use plus a verifier, and its failure mode is measured — the
+retrieval row above. A system that answers *better* than its model does so by checking, not by representing.
+
+---
+
+## H. Rotation before low-bit rounding: what transfers to a 128-group ternary pack
+
+The low-bit literature's biggest reported wins are rotation-based (QuaRot, SpinQuant, DuQuant, QuIP#, and GSR above).
+Every one of them is measured inside a different quantiser: 4-bit with per-channel scales, GPTQ with error feedback, a
+learned Cayley rotation. **None reports ternary weights, round-to-nearest, one fp16 scale a 128 weights, no error
+feedback** — which is exactly our pack. That cell is empty in the literature, so this measures it.
+
+`tools/rotq/probe.py`, six real matrices of `qwen3moe-control-q4.gguf` (layer 0 and 47 attention, layer 0/24/47 experts),
+2 bits a weight, group 128, `absmean` and `lsq` scales, 26 selftest checks. Metric: relative Frobenius error of what the
+pack decodes to.
+
+| arm | mean vs `none` | range | worst-group error | add/token |
+|---|---|---|---|---|
+| `none` | 0 (0.50–0.61 abs) | — | 0.90 / 0.86 / 0.82 | 0 |
+| `group-128` | −2.6% | −16.8% .. +2.1% | 0.63 / 0.65 / 0.63 | 0.09–0.72% of GEMV |
+| `hadamard` (global) | −3.4% (5 matrices) | −16.4% .. +1.5% | 0.65 | 0.13–0.72% |
+| `orthogonal` (dense QR) | −2.5% | −16.5% .. +2.1% | 0.61 | 25–133% |
+| `zigzag-128` (DuQuant interleave) | −2.3% | −14.8% .. +1.5% | 0.73 | 0.10–0.52% |
+| `group-128-sequency` | **identical** | — | identical | 0.09–0.72% |
+| `signed-perm` (no rotation) | **+1.6% worse** | −0.0% .. +9.5% | 0.89 | 0 |
+
+The shape of the result, which is more useful than the mean:
+
+- **Where it helps is layer 0.** `blk.0.attn_q` sits at 0.6117 relative error unrotated — an outlier above the group
+  scale is clipped to ±1 — and falls to 0.5089 (−16.8%). Layer 47's attention is level (−0.2%). Every expert matrix is
+  **worse** (+1.5%, +1.6%, +2.1%); experts are the 82–100% of bytes that matter, and they are the part the rotation
+  does not help.
+- **Structure of the transform barely matters.** Dense random QR performs like a block Hadamard at up to 133% of the
+  GEMV's arithmetic. What does the work is spreading a clipped element, not which orthogonal basis is used.
+- **Ordering is inert, and it is provable.** `sequency_order` sorts the transform's rows — a permutation *inside* each
+  scale group, so the group keeps its multiset and its scale, and the error is identical to the last digit. GSR's
+  sequency credit cannot come from that at a group-local quantiser; it must come from the rotation, or from a global
+  transform where groups *are* crossed.
+- **A whole-group permutation is inert for the same reason** (it relabels groups, it never moves a channel between
+  them). This probe had that arm, measured it as exactly equal to `group-128`, and replaced it with DuQuant's zigzag —
+  which does interleave channels, and which is *slightly worse* than plain rotation here.
+
+What this does not establish: an NLL delta. Weight error is a proxy, the probe says so in its own docstring, and the
+only thing that promotes it is a paired walk. `P10` is therefore parked rather than built: a 2% weight-error change
+concentrated in early attention, at an all-in cost of 0.1–0.7% of the GEMV, is not worth a conversion-path change until
+a walk shows an interval that excludes zero.
+
+---
+
 ## F. Where our own measurements agree, and where they do not
 
 These are the cross-checks that make the appendix useful rather than decorative.
@@ -105,6 +175,17 @@ These are the cross-checks that make the appendix useful rather than decorative.
   their router is re-fitted, ours is copied, and a copy is not a re-fit. `P4` settles it on CPU in minutes.
 - **The `+0.021`-nats ternary refit split** has no external counterpart, which is why `docs/TERNARY-OPTIMIZATION-MATRIX.md`
   reports it with its own control arms rather than comparing to a paper.
-- **IMATRIX / calibration-domain effect: not yet tested here.** The "domain calibration beats generic by more than PPL
-  shows" result is the single most transferable warning for `kindi convert`, and our gate has no functional half yet
-  (`P2`).
+- **IMATRIX / calibration-domain effect: not yet tested here.** "Domain calibration beats generic by more than PPL
+  shows" is the single most transferable warning for `kindi convert`, and our gate has no functional half yet (`P2`).
+- **Rotation: the literature's magnitude does not transfer, and the reason is our quantiser.** GSR reports 20.29 →
+  11.59 PPL at W2 with a grouped rotation; we measure **−2.6% weight error**, and **+1.5–2.1% worse** on the expert
+  matrices that hold most of the bytes. Both are correct: their arm has GPTQ error feedback and per-channel scales, ours
+  is plain RTN with one scale a 128 weights, and their win comes from the outlier-clipping mechanism we can only exploit
+  where an outlier actually exceeds its group (§H). The disagreement is the interesting part — it is why `P10` is
+  parked with a command attached instead of adopted.
+- **Sequency ordering: contradicted, structurally.** GSR credits the sequency arrangement; at a group-local quantiser a
+  within-group permutation cannot change the error at all, and the probe measures exact equality between the natural and
+  sequency arms. If the effect is real there, it lives in the parts of their pipeline we do not have.
+- **Symbolic/LUT backbone: no counterpart to reproduce.** Nothing in §G reports an end-task accuracy win on an assistant
+  task from a symbolic representation *without* a verifier, and the retrieval experiments we do have point the other
+  way. That is why the plan takes the verifier (`P9`) and refuses the backbone (`P8`) rather than the reverse.

@@ -111,11 +111,13 @@ SUITES = [
     ("suite:kvq_capture", [sys.executable, "-m", "tools.kvq.capture", "--selftest"], "checks passed"),
     ("suite:kvq_sweep", [sys.executable, "-m", "tools.kvq.sweep", "--selftest"], "checks passed"),
     ("suite:recipes", [sys.executable, "-m", "kindi.recipes"], "checks passed"),
+    ("suite:archs", [sys.executable, "-m", "kindi.archs"], "checks passed"),
     ("suite:gsq", [sys.executable, "-m", "kindi.gsq"], "checks passed"),
     ("suite:autotune", [sys.executable, "-m", "kindi.autotune", "--selftest"], "checks passed"),
     ("suite:rco", [sys.executable, "-m", "kindi.rco"], "checks passed"),
     ("suite:refit", [sys.executable, "-m", "kindi.refit", "--selftest"], "checks passed"),
     ("suite:docbatch", [sys.executable, "-m", "tools.expert_merge.docbatch", "--selftest"], "checks passed"),
+    ("suite:rotq", [sys.executable, "-m", "tools.rotq.probe", "--selftest"], "checks passed"),
 ]
 
 

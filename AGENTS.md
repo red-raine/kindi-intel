@@ -42,6 +42,8 @@ Other standing rules:
 | Merging 128 → 64 pairs costs **+1.077 nats** at the control's routing fraction; **routing ≤ +0.17**, **arithmetic ≥ +1.08** | `docs/EXPERT-MERGE.md` |
 | 4 **super experts** (L2E92 2,152×, L1E114 927×, L3E82 525×, L1E68 210× their own layer's median output; next largest 42.7×). Routing mass ranks them **27, 27, 38, 92 of 128** — the 112 and 96 plans keep all four, the **64 plan drops L1E68** and 32 drops L1E68 + L2E92 | `tools/expert_merge/superex.py`, `docs/EXPERT-PRUNE.md` |
 | Pruning beats merging at equal bytes on this model class, externally measured | `appendix.md` §C |
+| A rotation before ternary rounding is **not** the literature's win here: −2.6% mean weight error, **+1.5–2.1% worse** on expert matrices, and sequency ordering is *exactly* inert at a group-local quantiser — measured on 6 real matrices, no NLL walk | `tools/rotq/probe.py`, `appendix.md` §H |
+| A symbolic/LUT/graph backbone is not supported for *answer quality*; the measured route to better answers is verifier-gated selection over the model's own samples | `appendix.md` §G |
 
 ## The plan, in short
 
@@ -56,6 +58,10 @@ Other standing rules:
 - **P6** pin the small always-hot tensors, read whole expert slabs instead of faulting pages, threads = physical cores.
 - **P4** closed-form (ridge) router re-fit; then **P3** the mitigated merge, judged **against prune-at-96** — and
   expected to lose.
+- **P9** verifier-gated selection (`astvalid` + `--select k`): the only "better answers" route with end-task numbers, and it
+  is P2's checker reused. After P2.
+- **P10** rotation before rounding — **measured and parked**: the probe is one command, the verdict is above, and only an
+  early-attention paired NLL walk can reopen it.
 - **P7** exact n-gram speculative decoding, flag off by default, acceptance measured on our traffic.
 
 `P8` lists what not to build and why (hugepages, `MADV_WILLNEED`, KV eviction as a speed play, retrieval as a
@@ -67,14 +73,16 @@ small-model reliability fix, a LUT-kernel rewrite for speed).
 |---|---|
 | engine, CPU kernels | `kindi/` — `cpu.py`, `kcpu.c`, `quant.py`, `packio.py`, `moe.py`, `spec.py` |
 | conversion, ternary packing, refit | `kindi/convert.py`, `kindi/refit.py`, `kindi/gsq.py`, `kindi/rco.py` |
+| detection, catalog packs (GLM-5.3-Flash, MiniMax M3) | `kindi/recipes.py`, `kindi/archs.py` |
 | MoE analysis and editing | `tools/expert_merge/` — `routes.py` (route log), `prune.py`, `superex.py`, `merge.py`, `mergepack.py`, `real.py` |
 | gates | `tools/nll.py` (NLL, bootstrap), `tools/kl.py`, `tools/expert_merge/prunegate.py` |
 | kernel microbenchmarks | `tools/bitnet_gemm/` — `stream_probe.py`, `prefetch_budget.py`, `cluster_budget.py`, `tmac.py` |
+| rotation vs the ternary quantiser | `tools/rotq/probe.py` — 8 orthogonal arms, our 128-group RTN, `--selftest`, `--json` |
 | functional screen (unused so far) | `tools/astvalid/` |
 | plan and research | `masterplan.md`, `appendix.md` |
 | the repo gate | `python -m tools.selftest` (runs every `suite:*`, including `suite:superex`) |
 
-Docs worth knowing: `docs/EXPERT-MERGE.md`, `docs/EXPERT-PRUNE.md`, `docs/CPU-PERF-2026.md`,
+Docs worth knowing: `docs/IMPORT-CATALOG.md`, `docs/EXPERT-MERGE.md`, `docs/EXPERT-PRUNE.md`, `docs/CPU-PERF-2026.md`,
 `docs/TERNARY-LUT-AND-PAGING-2026.md`, `docs/RECIPES.md`, `docs/TESTING.md`. `masterplan.md` and `appendix.md` are the
 newest and carry the current direction.
 

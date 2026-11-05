@@ -210,6 +210,70 @@ path. Ship it behind a flag whose default is measured, not assumed.
 
 *Kill:* if acceptance is < 30% on our own traffic, keep the flag off by default and record the number.
 
+### P9 — Verifier-gated selection: the only symbolic layer with end-task numbers — **~3 days**
+
+*Hypothesis:* the request behind this branch's §G research was a symbolic/LUT/action-graph backbone that gets *better
+answers than the model*. The literature does not support a backbone, but it does support one narrow, CPU-cheap thing:
+**sample k, run a cheap deterministic verifier, keep a verified answer**. That is what the measured gains are —
+self-consistency (PaLM-540B GSM8K 56.5 → 74.4%), program-of-thought with an executor, CodeT-style test filtering —
+and every one of them is a *selection* over a fixed model's samples, not a new representation of knowledge.
+
+*Method:* `tools/astvalid` already parses and checks; P2's 40 fixed prompts are the harness. Add a `--select k` mode
+that draws k samples at temperature, scores each with the verifier (compiles, passes the AST/type check, matches the
+unit test), and returns the best verified one; ties broken by likelihood. No graph, no retrieval index, no extra model.
+
+*Gate:* pass@1 on the 40 prompts, paired by prompt against a single greedy sample; report the verifier's own
+false-accept rate and the k× cost per accepted answer. A gain that needs k=16 to appear is a latency decision, not a
+capability claim, and the text must say which.
+
+*Cost:* k× prefill, which on a bandwidth-bound CPU is k× wall clock — this is why the flag is off by default and the
+gate reports cost per accepted answer rather than per sample.
+
+*Kill:* if the verifier accepts wrong answers at a rate that erases the selection gain (measure it on the prompts where
+the model is wrong), or if a single greedy sample already passes, the item is closed as "no headroom on this model".
+
+### P10 — Group-aligned rotation before rounding — **measured, not worth building yet**
+
+*Hypothesis:* an orthogonal transform before ternary rounding reduces what the pack loses, as QuaRot/SpinQuant/DuQuant
+and the group-rotation line (GSR: 20.29 → 11.59 WikiText-2 PPL at W2) report. The catch: every published win is inside a
+different quantiser (GPTQ error feedback, per-channel scales, learned rotations), and the block size in those papers is
+not our block size.
+
+*Measured* (`tools/rotq/probe.py`, six real matrices from `qwen3moe-control-q4.gguf`, both scale schemes, 26 selftest
+checks):
+
+| arm | mean vs `none` | range over matrices | adds/token |
+|---|---|---|---|
+| `group-128` (rotate inside the scale group) | **−2.6%** error | −16.8% .. +2.1% | 0.09–0.72% of the GEMV |
+| `hadamard` (global) | −3.4% | −16.4% .. +1.5% | 0.13–0.72% |
+| `orthogonal` (dense QR) | −2.5% | −16.5% .. +2.1% | 25–133% |
+| `zigzag-128` (DuQuant's channel interleave) | −2.3% | −14.8% .. +1.5% | 0.10–0.52% |
+| `signed-perm` | **+1.6% worse** | −0.0% .. +9.5% | 0 |
+| `group-128-sequency` | identical to `group-128` | — | 0.09–0.72% |
+
+The mean is carried by one matrix: `blk.0.attn_q` is at 0.6117 relative error without a rotation and 0.5089 with one
+(−16.8%), because layer 0 is where an outlier exceeds its group's scale and gets clipped to ±1. Every expert matrix
+(`ffn_gate`/`up`/`down`) comes out **1.5–2.1% worse**, and `blk.47.attn_q` is level. The one thing that improves
+everywhere is the worst single group: 0.9018 → 0.6260, 0.8573 → 0.6492, 0.8215 → 0.6315.
+
+Two structural results the probe pinned, which matter more than the table:
+
+- **Ordering inside a group is exactly inert.** Sequency-sorted rows are a permutation *within* each scale group, so the
+  group keeps its multiset and its scale: the two arms agree to the last digit. GSR's sequency gain therefore cannot
+  come from the ordering at a group-local quantiser.
+- **Whole-group permutation is inert too, for the same reason** (it relabels groups, it does not move a channel between
+  them). The probe caught this as a dead arm before it became a dead end; the arm that *can* move an outlier is the
+  zigzag, which interleaves channels across groups — and it is slightly worse than plain rotation here.
+
+*Verdict:* **do not build this into `convert` yet.** A 2% weight-error change on experts is inside the noise of
+anything we could measure, and the arithmetic is only free if the rotation is folded into the weights — which means
+rotating *before* ternarising, the order BitNet v2 measured as worse at 1.58 bits (20.83 vs 11.33 PPL).
+
+*Next, if it is ever picked up:* the cheap version is a **per-matrix flag** for layers whose outlier is provably
+clipped — measured by this probe, cheaply, at conversion time — followed by a paired NLL walk over early attention only.
+The gate is that walk's interval, not this table: a weight error is a proxy, and this file does not get to promote a
+proxy to a result.
+
 ### P8 — What we will not do (and the evidence)
 
 - **Not** hugepages for weight buffers: ~0.1–0.6% measured on x86, "no noticeable difference" in llama.cpp's own issue.
@@ -221,6 +285,17 @@ path. Ship it behind a flag whose default is measured, not assumed.
   answers. It is a prompt-budget cost, not a capability.
 - **Not** a LUT kernel rewrite for speed: on AVX2 the honest measured gain is ~2× over a *naive* kernel and ~1.19–1.33×
   over a good one; the 6× figures are against FP16 baselines on the same bytes.
+- **Not** a symbolic/LUT "backbone" under the transformer, and **not** a compressed symbolic action graph as the
+  answer engine. The proposal is old and respectable — ternary LUT kernels, Tsetlin machines, weightless nets, tries
+  and n-gram caches — and every one of them is *cheaper*, none of them is *more accurate* at language-model scale. The
+  measured end-task gains in the neuro-symbolic literature come from a **verifier selecting among the model's own
+  samples** (P9), not from a symbolic representation that reasons; and the retrieval half is already rejected above by
+  oracle experiments. What we keep from the proposal is the part with numbers: P5's packing, P6's memory work, P7's
+  exact n-gram draft, and P9's verifier.
+- **Not** a knowledge-graph or ontology layer for answer quality: with the graph *given*, small models still failed the
+  questions they could not answer alone, and the same evidence shows retrieval destroying answers they had right.
+  "Better answers, not just cheaper" is a claim that needs a paired pass@1 walk, and nothing in §G reports one for a
+  graph without a verifier.
 
 ---
 
@@ -233,6 +308,11 @@ path. Ship it behind a flag whose default is measured, not assumed.
 5. **P6** — the biggest measured CPU win in the literature, once we know our read sizes.
 6. **P4 / P3** — settle the merge question rather than leaving "we could re-fit the router" open forever.
 7. **P7** — real but workload-dependent, and the largest engineering effort for the smallest guaranteed gain.
+8. **P9** — after P2, because its verifier *is* P2's checker; it is the only "better answers" route with numbers.
+
+**P10 is measured and parked.** It is not in the order because the measurement says the effect is a proxy-sized 2%,
+not the literature's 8-point perplexity: it moves between P5 and P6 only if an early-attention NLL walk shows a real
+interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 
 ## 5. Rules that keep this honest
 
@@ -256,6 +336,8 @@ path. Ship it behind a flag whose default is measured, not assumed.
 | P5 1.667 bpw packing | open | measure the roofline with `stream_probe` first |
 | P6 pin hot tensors / merged reads | open | measure current read size and fault count |
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
+| P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |
+| P10 group rotation before rounding | **measured, parked** | −2.6% weight error mean, +2.1% on experts, sequency exactly inert; no NLL walk run |
 | super-expert audit (done) | **measured** | 4 outliers at 210–2,152× their layer; mass ranks 27–92; the 64 plan drops L1E68 |
 | merge cost split (done) | **measured** | router ≤0.17, arithmetic ≥1.08 |
 | prune 112 (done) | **measured** | +0.0045, certified lossless at 1,785 tokens |
