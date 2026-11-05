@@ -61,10 +61,15 @@ python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --gro
 python -m tools.expert_merge.mergepack --pack SRC.gguf --routes routes.npz --groups 64 --expert-type Q4_0 \
     --out MERGED.gguf --gate --baseline CONTROL.gguf --corpus A,B --docs 2 --tokens 48
 python -m tools.expert_merge.mergepack --retopk MERGED.gguf --used 4 --out MERGED-k4.gguf   # same weights, k=4
+python -m tools.expert_merge.mergepack --pack MERGED-k4.gguf --router-from SRC.gguf --routes routes.npz \
+    --out MERGED-k4-router.gguf --json router.json         # merged stacks, the source's 128 router rows
 The same weights at another routing breadth: `--retopk` (or `--used N` when a pack is being built) rewrites the
 `expert_used_count` header field and copies everything else, so a paired walk of the copy against its source prices
-routing breadth with the merge held fixed. `--compare BASE --against A.gguf,B.gguf` gates packs that already exist,
-loading and scoring the baseline once for every arm:
+routing breadth with the merge held fixed. The other lever is the router itself: a merge pools each group's router
+rows, which changes routing as well as arithmetic. `--router-from SRC.gguf` (or `--keep-router` while merging) writes
+the *source's* rows over the merged stacks and records the group map, so a reader routes over 128 slots and pools the
+decision onto the 64 stacks a token actually reads. `--compare BASE --against A.gguf,B.gguf` gates packs that already
+exist, loading and scoring the baseline once for every arm and then every arm against every other:
 
 ```
 python -m tools.expert_merge.mergepack --compare CONTROL.gguf --against MERGED.gguf,MERGED-k4.gguf \
@@ -99,6 +104,16 @@ grouping is real - the same pairs co-fire 10.8x more often than independence (me
 10.75, mean 12.75 over the 144 pairs) - and averaging them is still ruinous, which is what
 [docs/EXPERT-MERGE.md](../../docs/EXPERT-MERGE.md) measures from the weight side: a co-activated pair is not a
 relabelled function, so there is nothing for a merge to preserve. The 0.85 gate is load-bearing, not conservative.
+
+**The cost is the average, not the router.** `--keep-router` (or `--router-from SRC` onto a pack already merged) writes
+the 64 merged stacks under the source's own 128 router rows, mapped through `kindi.expert_map`, so the source's top-8
+still decides which experts fire. Gated at a fixed budget of 4 stacks over 1,275 tokens, that router is *worse* than
+the pooled 64-row one it replaced: 4.6984 against 4.5707 NLL, **+0.1277** for keeping the source's routing, interval
+-0.0139..+0.1695 - a consistent sign on all five documents and still inside the noise. Against the control the pooled
+arm is +1.0768 (+0.9394..+1.2105). So replacing the router costs **at most about 0.17 nats and plausibly nothing**, and
+**at least 1.08 of the merge is arithmetic**: one averaged matrix doing what two did. A 128-row router after the merge
+scores two ids for one stack and a token can spend half its choices on the same matrix; the pooled row averages those
+into the one decision the stack can serve, which is why the consistent router is the better one.
 
 ## Pruning: which experts a layer can keep
 

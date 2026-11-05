@@ -179,12 +179,19 @@ def _add(writer, name, ne, ty, flat):
     writer.add_tensor(name, arr, raw_shape=tuple(int(d) for d in reversed(ne)), raw_dtype=t)
 
 
-def write_pack(src, dst, gids, mass, expert_type=None, used=None, log=print, progress=None):
+def write_pack(src, dst, gids, mass, expert_type=None, used=None, keep_router=False, log=print, progress=None):
     """Write `dst` as `src` with each group of experts replaced by one mass-weighted average.
 
     Non-expert tensors are copied as bytes, not re-quantised: a copy that dequantised and re-quantised the attention
     would put the source's own quantisation error into the comparison. Everything that changes is in the expert
     stacks, the router, and `expert_count`.
+
+    `keep_router` splits the merge into its two levers. The default pools each group's router rows into one, which
+    makes a pack that is a normal MoE of `n_groups` experts - and changes routing as well as arithmetic. With it, the
+    router is the source's own (128 rows, same bytes, same quantisation), the stacks stay merged, and the pack records
+    the group map so a reader can route over 128 rows and pool the result onto 64 stacks. The difference between the
+    two packs is then the router and nothing else, which is what `docs/EXPERT-MERGE.md` needed to attribute the merge
+    cost instead of quoting one number for two changes.
     """
     from gguf import GGUFWriter
 
@@ -202,6 +209,13 @@ def write_pack(src, dst, gids, mass, expert_type=None, used=None, log=print, pro
         raise SystemExit("mergepack: this gguf cannot write type %d; pick one it can (e.g. Q8_0, Q5_0, Q4_0, F16)" % et)
     kv = dict(g.kv)
     kv["%s.expert_count" % pack.arch] = n_groups
+    if keep_router:
+        # the router keeps the source's rows, so the file states two counts: `expert_count` is what the stacks hold,
+        # and these say how many routing slots there are and which stack each one feeds. It is not a pack llama.cpp
+        # can serve - it is a measurement arm - and `moe.py` refuses it unless it reads all three keys.
+        kv["kindi.router_rows"] = int(n_expert)
+        kv["kindi.router_used"] = int(pack.n_expert_used)
+        kv["kindi.expert_map"] = [int(x) for x in gids]
     if used is not None:
         # how many experts a token reads is a routing decision, so a pack can carry fewer groups than the source's k
         # "same fraction" arm; it is written here rather than patched afterwards when the merge is being built anyway
@@ -232,6 +246,12 @@ def write_pack(src, dst, gids, mass, expert_type=None, used=None, log=print, pro
                 mats = [pack.expert_weight(name, int(e)) for e in mem]
                 merged[k] = merge_matrices(mats, m[mem])
             _add(writer, name, (n_in, n_out, n_groups), et if et is not None else ty, merged.ravel())
+        elif short == ROUTER and layer is not None and keep_router:
+            # byte for byte: the rows are the source's decisions, and re-quantising them would be a second change
+            span = pack._span(ty, int(np.prod(ne)))
+            start = pack.g.data_start + off
+            raw = np.ascontiguousarray(np.asarray(pack._raw[start:start + span]))
+            writer.add_tensor(name, raw, raw_shape=tuple(int(d) for d in reversed(ne)), raw_dtype=from_type(ty))
         elif short == ROUTER and layer is not None:
             n_in, n_exp = ne
             rows = [pack.tensor(name)[int(e)] for e in range(n_exp)]       # [d_model] each
@@ -251,7 +271,97 @@ def write_pack(src, dst, gids, mass, expert_type=None, used=None, log=print, pro
     writer.write_tensors_to_file()
     writer.close()
     return dict(path=dst, groups=n_groups, bytes=int(os.path.getsize(dst)),
+                router_rows=int(pack.n_expert) if keep_router else n_groups,
                 source_bytes=int(os.path.getsize(src)), copied_bytes=int(copied))
+
+
+def splice_router(merged, router_from, dst, gids, mass=None, log=print):
+    """The merged pack with the source's router spliced in: every tensor copied as bytes, only the router replaced.
+
+    This is the other half of the merge, and it is deliberately not a second merge. Re-merging would dequantise and
+    re-quantise 9.77 GB of expert stacks that the first merge already wrote, and a stack that differs from its
+    counterpart by one quantisation step makes the two arms differ in more than the thing being measured. Copying the
+    bytes makes the stacks bit-identical, so the only difference between this pack and the matched-fraction arm is
+    which router picks the stacks a token reads.
+
+    `gids` is the map the merge used. It is checked against the pack it is applied to rather than trusted: a pool of
+    each group's router rows is what the merged pack holds, so if the map explains that pack the pooled row and the
+    group's mean agree to the pack's own quantisation error, and if it does not, this refuses instead of writing a
+    pack whose map is for a different merge.
+    """
+    from gguf import GGUFWriter
+
+    m, s = Moepack(merged), Moepack(router_from)
+    gids = np.asarray(gids, dtype=np.int64)
+    if gids.size != s.n_expert:
+        raise SystemExit("mergepack: %d map entries for a %d-expert source" % (gids.size, s.n_expert))
+    if m.n_expert != int(gids.max()) + 1:
+        raise SystemExit("mergepack: %s has %d experts but the map names %d groups"
+                         % (os.path.basename(merged), m.n_expert, int(gids.max()) + 1))
+    if m.n_layer != s.n_layer:
+        raise SystemExit("mergepack: %s and %s do not have the same layer count" % (merged, router_from))
+
+    name0 = "blk.0." + ROUTER
+    have = m.tensor(name0)                                  # [groups, d_model]
+    rows = s.tensor(name0)                                  # [experts, d_model]
+    w = np.ones(s.n_expert, np.float32) if mass is None else np.asarray(mass[0], np.float32)
+
+    def worst_map(g):
+        """the worst group's cosine between the pooled row the pack holds and the pool this map predicts"""
+        out = []
+        for k in range(m.n_expert):
+            mem = np.nonzero(g == k)[0]
+            if not mem.size:
+                return -1.0
+            ww = w[mem]
+            want = (rows[mem] * ww[:, None]).sum(0) / max(float(ww.sum()), 1e-9)
+            a, b = have[k], want
+            out.append(float(a @ b / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-30)))
+        return float(min(out))
+
+    # A pooled row is compared with the pool the map predicts, so the number is limited by the pack's own
+    # quantisation: a Q4_0 router lands near 0.99 and a wrong map near 0.55. The check is therefore a comparison
+    # with a shuffled map rather than an absolute threshold, which is the only version that cannot be passed by a
+    # pack whose router says nothing.
+    worst = worst_map(gids)
+    shuffled = worst_map(np.random.RandomState(0).permutation(gids))
+    if worst < 0.95 or worst - shuffled < 0.2:
+        raise SystemExit("mergepack: the map does not explain %s's router (worst group cosine %.3f, a shuffled map "
+                         "scores %.3f on layer 0): this routes file is not the one the pack was merged with"
+                         % (os.path.basename(merged), worst, shuffled))
+    log("  the map explains %s's router: worst group cosine %.4f on layer 0 (a shuffled map scores %.4f)"
+        % (os.path.basename(merged), worst, shuffled))
+
+    kv = dict(m.g.kv)
+    kv["kindi.router_rows"] = int(s.n_expert)
+    kv["kindi.router_used"] = int(s.n_expert_used)
+    kv["kindi.expert_map"] = [int(x) for x in gids]
+    writer = GGUFWriter(dst, m.arch, use_temp_file=True)
+    for k in sorted(kv):
+        if k == "general.architecture":
+            continue
+        vtype, sub = _value_type(kv[k])
+        writer.add_key_value(k, kv[k], vtype, sub)
+    for name, (ne, ty, off) in sorted(m.info.items(), key=lambda kv2: kv2[1][2]):
+        short = ".".join(name.split(".")[2:]) if name.startswith("blk.") else name
+        if short == ROUTER:
+            sne, sty, soff = s.info[name]
+            span = s._span(sty, int(np.prod(sne)))
+            start = s.g.data_start + soff
+            raw = np.ascontiguousarray(np.asarray(s._raw[start:start + span]))
+            writer.add_tensor(name, raw, raw_shape=tuple(int(d) for d in reversed(sne)), raw_dtype=from_type(sty))
+        else:
+            span = m._span(ty, int(np.prod(ne)))
+            start = m.g.data_start + off
+            raw = np.ascontiguousarray(np.asarray(m._raw[start:start + span]))
+            writer.add_tensor(name, raw, raw_shape=tuple(int(d) for d in reversed(ne)), raw_dtype=from_type(ty))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return dict(path=dst, bytes=int(os.path.getsize(dst)), merged_bytes=int(os.path.getsize(merged)),
+                groups=m.n_expert, router_rows=int(s.n_expert), router_used=int(s.n_expert_used),
+                map_cosine=worst, shuffle_cosine=shuffled)
 
 
 def from_type(ty):
@@ -266,36 +376,48 @@ def compare_arms(base_pack, arms, docs, max_delta=0.02, block=8, log=print):
     """One baseline walk, one walk a pack, one verdict each.
 
     The baseline is loaded and scored once, which is what makes several arms affordable: the Q4_0 control is 17 GB and
-    each merged arm 8.9 GB, while the 94 scored tokens are the cheap part. Every walk sees the same tokenisation and
-    the same positions, so an arm's difference from the baseline is comparable with another arm's.
+    each merged arm 8.9 GB, while the scored tokens are the cheap part. Every walk sees the same tokenisation and the
+    same positions, so an arm's difference from the baseline is comparable with another arm's - and each arm is also
+    scored against every other arm, because "the merge costs 1.4 nats" is two changes added together and the arms
+    exist to separate them.
+
+    The corpus goes through one batched forward a pack (`forward_docs`): the dequantiser is the cost of a document, so
+    a document at a time would make a corpus of seven unaffordable for arms this large.
     """
     from .moe import Qwen3Moe
-    from .prune import gate, nll_moe
+    from .prune import gate, nll_moe_batch
 
     b = Qwen3Moe(base_pack, log=lambda *a: None)
-    per, b_docs = [], []
-    for name, ids in docs:
-        r = nll_moe(b, ids)
-        per.append(r["per_token"])
-        b_docs.append((name, r["nll"], r["tokens"]))
-        log("    baseline %-24s %8d tokens  nll %.4f" % (name, r["tokens"], r["nll"]))
+    rb = nll_moe_batch(b, docs)
+    baseline = rb["per_token"]
+    b_docs = [(n, v, max(1, len(ids) - 1)) for (n, ids), v in zip(docs, rb["per_doc"])]
+    for name, nll, ntok in b_docs:
+        log("    baseline %-24s %8d tokens  nll %.4f" % (name, ntok, nll))
     del b
-    baseline = np.concatenate(per)
 
-    out = []
+    out, per_token = [], {}
     for path in arms:
         arm = Qwen3Moe(path, log=lambda *a: None)
-        aps, a_docs = [], []
-        for name, ids in docs:
-            r = nll_moe(arm, ids)
-            aps.append(r["per_token"])
-            a_docs.append((name, r["nll"], r["tokens"]))
-            log("    %-12s %-24s %8d tokens  nll %.4f" % (os.path.basename(path)[:12], name, r["tokens"], r["nll"]))
+        ra = nll_moe_batch(arm, docs)
         del arm
-        after = np.concatenate(aps)
+        after = ra["per_token"]
+        per_token[path] = after
+        a_docs = [(n, v, max(1, len(ids) - 1)) for (n, ids), v in zip(docs, ra["per_doc"])]
+        for name, nll, ntok in a_docs:
+            log("    %-20s %-24s %8d tokens  nll %.4f" % (os.path.basename(path)[:20], name, ntok, nll))
         v = gate(dict(per_token=baseline), [dict(per_token=after)], max_delta=max_delta, block=block)[0]
         out.append(dict(pack=path, baseline_nll=float(baseline.mean()), merged_nll=float(after.mean()),
-                        tokens=int(baseline.size), baseline_docs=b_docs, merged_docs=a_docs, gate=v))
+                        tokens=int(baseline.size), baseline_docs=b_docs, merged_docs=a_docs, gate=v, vs={}))
+
+    # each arm against each other arm: the same paired tokens, so this is the difference between two models and not
+    # between two comparisons against the control
+    for i, a in enumerate(out):
+        for b2 in out[i + 1:]:
+            v = gate(dict(per_token=per_token[a["pack"]]), [dict(per_token=per_token[b2["pack"]])],
+                     max_delta=max_delta, block=block)[0]
+            a["vs"][b2["pack"]] = v
+            b2["vs"][a["pack"]] = dict(v, delta=-v["delta"], ci_lo=-v["ci_hi"], ci_hi=-v["ci_lo"],
+                                       passed=-v["delta"] <= max_delta, marginal=False)
     return out
 
 
@@ -455,9 +577,21 @@ def selftest():
     import shutil
     import tempfile
 
+    done = []
+
     def check(name, ok, detail=""):
         if not ok:
             raise AssertionError("%s%s" % (name, (": " + detail) if detail else ""))
+        done.append(name)
+
+    def refuses(name, fn, exc=SystemExit):
+        """a check that is a refusal: the call must raise, and raising is the claim"""
+        try:
+            fn()
+        except exc:
+            done.append(name)
+        else:
+            raise AssertionError(name)
 
     # --- the grouping
     coc = np.zeros((4, 4))
@@ -477,12 +611,7 @@ def selftest():
     sizes = np.bincount(sprawling)
     check("mergepack: a size cap keeps the groups even at a group count that does not divide", sizes.max() <= 2,
           str(sizes))
-    try:
-        groups(coc, 5, log=None)
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("more groups than experts must be refused")
+    refuses("mergepack: more groups than experts is refused", lambda: groups(coc, 5, log=None))
 
     # --- the fusion arithmetic
     a, b = np.zeros((2, 3), np.float32), np.ones((2, 3), np.float32)
@@ -534,6 +663,62 @@ def selftest():
         check("mergepack: the merged forward is finite too", np.isfinite(after).all())
         check("mergepack: and it is not the same model any more", not np.allclose(before, after, atol=1e-4))
 
+        # a kept-router pack: the source's rows, the merged stacks, and a map between them
+        kept = os.path.join(td, "merged-router.gguf")
+        kr = write_pack(src, kept, gids, mass, used=1, keep_router=True, log=lambda *a: None)
+        mk = Moepack(kept)
+        src_r = Moepack(src).tensor("blk.0.ffn_gate_inp.weight")
+        got_r = mk.tensor("blk.0.ffn_gate_inp.weight")
+        check("mergepack: --keep-router keeps the source's router rows, not a pooled version",
+              got_r.shape == src_r.shape and np.array_equal(got_r, src_r), "%s vs %s" % (got_r.shape, src_r.shape))
+        check("mergepack: the router it scores has more slots than the stacks it owns",
+              mk.router_rows == 4 and mk.n_expert == 2 and kr["router_rows"] == 4,
+              "rows %d stacks %d" % (mk.router_rows, mk.n_expert))
+        check("mergepack: the map says which stack each slot feeds",
+              mk.router_map is not None and mk.router_map.tolist() == [0, 0, 1, 1], str(mk.router_map))
+        check("mergepack: and the stacks are still the merged ones",
+              np.allclose(mk.expert_weight("blk.0.ffn_gate_exps.weight", 0),
+                          m.expert_weight("blk.0.ffn_gate_exps.weight", 0), atol=1e-6))
+        mk_ids = [3, 5, 7, 11]
+        kept_logits = Qwen3Moe(kept, log=lambda *a: None).forward(mk_ids)["logits"]
+        check("mergepack: a kept-router pack forwards, and is neither the source nor the pooled pack",
+              np.isfinite(kept_logits).all() and not np.allclose(kept_logits, before, atol=1e-4)
+              and not np.allclose(kept_logits, after, atol=1e-4))
+        refuses("mergepack: a per-slot prune mask on a kept-router pack is refused",
+                lambda: Qwen3Moe(kept, log=lambda *a: None).set_prune([None] * 1), ValueError)
+
+        # the pooling the reader runs: two slots in one group add their weight onto one stack, and a token that
+        # chose k slots ending up on fewer stacks reads only the stacks it has
+        from .moe import pool_to_stacks
+
+        lg = np.array([[3.0, 2.0, 1.0, 0.0]], dtype=np.float32)         # slot 0 > 1 > 2 > 3
+        top, w = pool_to_stacks(lg, np.array([0, 0, 1, 1]), router_used=4, stacks_used=1, n_stacks=2)
+        check("mergepack: pooling a token's slots sums their weight on one stack",
+              top.tolist() == [[0]] and abs(float(w.sum()) - 1.0) < 1e-6, "%s %s" % (top.tolist(), w.tolist()))
+        two = np.array([[0.05, 0.05, 9.0, 9.0]], dtype=np.float32)
+        top2, w2 = pool_to_stacks(two, np.array([0, 0, 1, 1]), router_used=4, stacks_used=2, n_stacks=2)
+        check("mergepack: and keeps the stacks with the most weight, in the order the reader can apply",
+              sorted(top2[0].tolist()) == [0, 1] and abs(float(w2.sum()) - 1.0) < 1e-6)
+        top3, w3 = pool_to_stacks(two, np.array([0, 0, 1, 1]), router_used=4, stacks_used=1, n_stacks=2)
+        check("mergepack: a stack that two of four slots chose can win a top-1 over one they did not",
+              top3[0].tolist() == [1], str(top3.tolist()))
+
+        # the same arm, written the cheap way: the merged pack's bytes with the source's router spliced in
+        sp = os.path.join(td, "spliced.gguf")
+        sr = splice_router(dst, src, sp, gids, mass=mass, log=lambda *a: None)
+        ms = Moepack(sp)
+        check("mergepack: the splice keeps every merged stack bit for bit",
+              all(np.array_equal(ms.expert_weight("blk.0.%s" % s, 0), m.expert_weight("blk.0.%s" % s, 0))
+                  for s in EXPERT_STACKS))
+        check("mergepack: and takes the router from the source", np.array_equal(
+              ms.tensor("blk.0." + ROUTER), src_pack.tensor("blk.0." + ROUTER)))
+        check("mergepack: a spliced pack states both counts and its map",
+              ms.n_expert == 2 and ms.router_rows == 4 and ms.router_map.tolist() == [0, 0, 1, 1]
+              and sr["map_cosine"] > 0.99, str(sr))
+        refuses("mergepack: a map that does not explain the pack's router is refused, not written",
+                lambda: splice_router(dst, src, os.path.join(td, "bad.gguf"), np.array([0, 0, 0, 1]), mass=mass,
+                                      log=lambda *a: None))
+
         # routing breadth is a header field: the same weights at another k, with nothing else moving
         k1 = os.path.join(td, "merged-k1.gguf")
         rr = retopk(dst, k1, 1)
@@ -563,6 +748,7 @@ def selftest():
               len(reps) == 1 and reps[0]["gate"]["delta"] == 0.0 and reps[0]["tokens"] > 0, str(reps[0]["gate"]))
     finally:
         shutil.rmtree(td, ignore_errors=True)
+    print("%d claims held" % len(done))
     return 0
 
 
@@ -606,7 +792,14 @@ def main(argv):
             v = r["gate"]
             print("  %s: nll %.4f -> %.4f (%+.4f, 95%% CI %+.4f..%+.4f) over %d tokens, tolerance %+.3f: %s"
                   % (os.path.basename(r["pack"]), r["baseline_nll"], r["merged_nll"], v["delta"], v["ci_lo"],
-                     v["ci_hi"], v["tokens"], v["max_delta"], "ACCEPTED" if v["passed"] else "REJECTED"))
+                     v["ci_hi"], r["tokens"], v["max_delta"], "ACCEPTED" if v["passed"] else "REJECTED"))
+        print("")
+        print("  arm against arm (paired tokens, positive = the first arm is worse):")
+        for r in reps:
+            for other, v in sorted(r["vs"].items()):
+                print("    %-24s vs %-24s %+8.4f  %+.4f..%+.4f  over %d tokens%s"
+                      % (os.path.basename(r["pack"])[:24], os.path.basename(other)[:24], v["delta"], v["ci_lo"],
+                         v["ci_hi"], v["tokens"], "  (resolved)" if v["ci_lo"] > 0 or v["ci_hi"] < 0 else ""))
         js = _arg(argv, "--json")
         if js:
             with open(js, "w", encoding="utf-8") as f:
@@ -618,9 +811,35 @@ def main(argv):
     src = _arg(argv, "--pack")
     routes_path = _arg(argv, "--routes")
     out = _arg(argv, "--out")
+    router_from = _arg(argv, "--router-from")
+    if router_from and src and routes_path and out:
+        # the other half of the merge: this pack's stacks, the source pack's router, and the map between them
+        from .routes import load
+
+        got = load(routes_path)
+        meta = got.get("meta", {})
+        n_expert = int(meta.get("experts", got["route_ids"].max() + 1))
+        mass, _count = mass_per_expert(got, n_expert)
+        n_groups = int(_arg(argv, "--groups", Moepack(src).n_expert))
+        coc = coactivation(got["route_ids"], got["route_wts"], np.arange(got["route_wts"].shape[1]), n_expert)
+        gids = groups(coc + coc.T, n_groups)
+        rep = splice_router(src, router_from, out, gids, mass=mass)
+        print("  wrote %s: %.2f GB, %d stacks, the source's %d router rows, %d used"
+              % (out, rep["bytes"] / 1e9, rep["groups"], rep["router_rows"], rep["router_used"]))
+        for a in ("--used", "--expert-type"):
+            if a in argv:
+                print("  note: %s does not apply to --router-from (nothing is re-merged and no breadth is written)" % a)
+        if _arg(argv, "--json"):
+            with open(_arg(argv, "--json"), "w", encoding="utf-8") as f:
+                json.dump(dict(merged=src, router_from=router_from, out=out, groups=n_groups,
+                               gids=[int(x) for x in gids], splice=rep), f, indent=1, sort_keys=True)
+        return 0
     if not (src and routes_path and out):
         print("usage: python -m tools.expert_merge.mergepack --pack SRC.gguf --routes ROUTES.npz --groups 64 "
-              "--out MERGED.gguf [--used N] [--gate --corpus A,B --docs 2 --tokens 48 --json out.json]\n"
+              "--out MERGED.gguf [--used N] [--keep-router] [--gate --corpus A,B --docs 2 --tokens 48 "
+              "--json out.json]\n"
+              "       python -m tools.expert_merge.mergepack --pack MERGED.gguf --router-from SRC.gguf --routes ROUTES.npz "
+              "--out MERGED-ROUTER.gguf [--groups 64] [--json out.json]\n"
               "       python -m tools.expert_merge.mergepack --retopk PACK.gguf --used 4 --out PACK-k4.gguf\n"
               "       python -m tools.expert_merge.mergepack --compare BASE.gguf --against A.gguf[,B.gguf] "
               "--corpus A,B --docs 2 --tokens 48 --json out.json [--selftest]")
@@ -646,8 +865,12 @@ def main(argv):
         from gguf import GGMLQuantizationType as T
 
         et = int(T[et_name])
-    rep = write_pack(src, out, gids, mass, expert_type=et, used=_arg(argv, "--used"),
+    keep_router = "--keep-router" in argv
+    rep = write_pack(src, out, gids, mass, expert_type=et, used=_arg(argv, "--used"), keep_router=keep_router,
                      progress=lambda il: il % 8 == 7 and print("    merged through layer %d" % il))
+    if keep_router:
+        print("  router: the source's %d rows kept byte for byte over %d merged stacks (kindi.expert_map)" %
+              (rep["router_rows"], n_groups))
     if et_name:
         print("  expert stacks and router written as %s (the source's K-quants cannot be re-quantised by this build)"
               % et_name)

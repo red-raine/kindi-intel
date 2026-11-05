@@ -67,6 +67,30 @@ class Moepack(object):
     def n_expert_used(self):
         return int(self.meta("expert_used_count"))
 
+    # --- a kept-router pack -------------------------------------------------------------------------------------
+    # `mergepack --keep-router` writes the source's 128 router rows over 64 merged stacks, so the file has two
+    # expert counts: `expert_count` is what the stacks hold, and `kindi.router_rows` is how many routing slots the
+    # router scores. A normal pack has neither key and routes over `expert_count` slots, exactly as before.
+    @property
+    def router_rows(self):
+        """Routing slots the router scores: the source's when the router was kept, else `expert_count`."""
+        return int(self.g.kv.get("kindi.router_rows") or self.n_expert)
+
+    @property
+    def router_used(self):
+        """Slots a token selects at the router: `expert_used_count`, unless a kept-router pack says otherwise."""
+        return int(self.g.kv.get("kindi.router_used") or self.n_expert_used)
+
+    @property
+    def router_map(self):
+        """slot -> stack, or None for a normal pack. A pack with a map routes over `router_rows` logits.
+
+        This is the key that makes a kept-router pack not-a-normal-MoE: without it the router's 128 rows would be
+        read against 64 stacks by index, which would be a model with 64 experts and a doubled router, not this one.
+        """
+        m = self.g.kv.get("kindi.expert_map")
+        return None if m is None else np.asarray(m, dtype=np.int64)
+
     @property
     def n_ff_exp(self):
         return int(self.meta("expert_feed_forward_length"))

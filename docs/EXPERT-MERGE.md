@@ -188,10 +188,10 @@ token. The 0.85 gate is not over-cautious: it is the difference between this reg
 only thing that stood between the pipeline and it.
 
 What the number still mixes together: the group's pooled router row changes which experts are chosen, and the averaged
-matrix changes what the chosen one computes. This measurement cannot attribute the 1.36 between the two; separating
-them needs a pack whose router keeps 128 rows while its expert stacks hold 64, which this reader could map and which
-nothing here does. The arm below prices one half of that mixture - how many of the merged experts a token reads - and
-leaves the pooled row in both arms.
+matrix changes what the chosen one computes. This measurement cannot attribute the 1.36 between the two. The arm below
+prices one half of that mixture - how many of the merged experts a token reads - and leaves the pooled row in both
+arms; the section after it builds the pack this one cannot, a router with the source's 128 rows over 64 merged stacks,
+and finishes the split.
 
 ## At the control's own routing fraction
 
@@ -218,8 +218,60 @@ this sample cannot separate 0.043 from zero. What the arm does establish is the 
 open - **the merge costs +1.4018 at the control's own routing fraction**, not +1.3588 at twice it - and that the
 breadth difference is at most a sixth of the cost, not the explanation of it.
 
+## Which half of the bill is which
+
+A merged pack can keep its source's router. `mergepack --keep-router` writes one in the merge pass, and
+`mergepack --router-from SRC` splices one onto a pack already merged - its 64 stacks are copied byte for byte, while
+`ffn_gate_inp` keeps the source's 128 rows and three keys record what changed (`kindi.router_rows` = 128,
+`kindi.router_used` = 8, `kindi.expert_map` = one stack id a slot). The source's top-8 over 128 experts therefore
+still decides *which* experts fire; only the arithmetic behind each id changed. The map is a bijection onto the 64
+stacks, and the pack's payload report re-decodes every tensor, so the two files differ in the router, the map and
+`expert_used_count` and nothing else.
+
+A token whose 8 slots land in the same group twice would read one stack where it read two, so this router's 8 slots
+touch about 6.6 stacks. At a fixed budget of 4 stacks (`--used 4`), the two arms cost the same arithmetic and differ
+only in *which* four a token spends them on: the pooled router's top-4 of 64, or the four heaviest stacks under the
+source's 128-way ordering. That is the comparison below. Corpus is this run's wider one, 1,275 tokens over five
+documents, so its absolute numbers are not the 94-token table's; every delta is a paired walk inside the run.
+
+| arm | router rows | expert stacks | stacks read | NLL, 1,275 tokens | delta vs control | 95% interval |
+|---|---:|---:|---:|---:|---:|---|
+| control | 128 (source) | 128 | 8 | 3.4939 | - | - |
+| merged, matched fraction | 64 (pooled) | 64 | 4 | 4.5707 | +1.0768 | +0.9394..+1.2105 |
+| merged, source router | 128 (source) | 64 | 4 of the mapped stacks | 4.6984 | **+1.2045** | +1.0611..+1.3562 |
+
+| | change | 95% interval | shares of the merge cost |
+|---|---:|---|---|
+| pooled router -> source router, arithmetic fixed | +0.1277 | -0.0139..+0.1695 | routing **at most +0.17**, point +0.13 |
+| merge, pooled router (the shipped pack) | +1.0768 | +0.9394..+1.2105 | arithmetic, **at least +1.08** |
+
+**The router is not where the money goes, and keeping it may cost a little.** Replacing 128 rows with 64 pooled ones
+moves NLL by +0.1277 in the *wrong* direction for the usual story: the source's own router is the worse of the two,
+consistently, on all five documents (+0.157, +0.166, +0.058, +0.050, +0.207). It is still not resolved - the interval
+crosses zero, and 0.128 is inside what 1,275 tokens can call noise - so the honest reading is that the routing half of
+the merge costs **at most about 0.17 nats and plausibly nothing**, and the arithmetic half carries **all of the rest**:
+averaging two experts' three matrices into one leaves at least 1.08 of the ~1.2 total. The 10.8x co-firing and 0.78
+profile cosine were a real reason to expect the pairs to be interchangeable; the measurement says the router already
+found near-duplicates, and the *matrix* average is what breaks them.
+
+The sign is explicable and is not a bug in the map. After the merge there is one expert where the router sees two, so a
+128-row router scores two ids for one stack and a token can spend half its 8 choices on the same matrix - 17.7% of its
+routing weight lands in a group another slot already picked - while the pooled row averages those two scores into the
+one decision the stack can actually serve. The pooled router is the *consistent* one: its slots are the stacks. What
+this does not settle is how much of the 0.128 is that duplication penalty and how much is the pooled row's own
+information; separating those needs a 128-row router re-fitted against the merged stacks rather than copied, which
+would be a fine-tune, not a rewrite.
+
 ## What this does not establish
 
+- **The attribution is a budget, not two exact fractions.** The router half is +0.1277 with an interval crossing zero;
+  the arithmetic half is whatever remains of +1.0768..+1.2045. Read together: routing <= +0.17, arithmetic >= +1.08.
+  Stating them as "0.13 routing / 1.08 arithmetic" would over-claim a split this sample cannot resolve.
+- **The source-router arm spends its 4 stacks by truncation.** Its ordering is the source's 128-way one; the mapping
+  collapses duplicate groups and then the heaviest 4 stacks are kept, the tail renormalised away. A merged model with a
+  4-stack budget must truncate whichever router it has, so the arm is a fair choice of *which* four - but it is not the
+  same object as a router trained for 64 experts, and the arm that lets all 8 slots fire (about 6.6 stacks) would trade
+  routing breadth for arithmetic and confound the two.
 - **The paired walk resolves the merge, not the breadth behind it.** The shipped arm reads 8 of 64 experts against the
   control's 8 of 128; the matched-fraction arm reads 4 of 64 (the same 6.25%) and costs **+1.4018**. That is +0.0430
   more than the shipped arm, with an interval of -0.1414..+0.2073 that covers zero: the capacity argument has the right
@@ -290,6 +342,16 @@ python -m tools.expert_merge.mergepack --compare CONTROL.gguf --against MERGED.g
     --corpus docs/BENCHMARKS.md,kindi/tp.py --docs 2 --tokens 48 --json merge64-arms.json
 python -m tools.expert_merge.mergepack --compare MERGED.gguf --against MERGED-k4.gguf \
     --corpus docs/BENCHMARKS.md,kindi/tp.py --docs 2 --tokens 48 --json merge64-k4-vs-k8.json
+
+# the router half: the same 64 merged stacks under the source's own 128 router rows (~1 min, nothing is re-merged)
+python -m tools.expert_merge.mergepack --pack MERGED-k4.gguf --router-from MODEL.gguf --routes routes.npz \
+    --groups 64 --out MERGED-k4-srcrouter.gguf
+
+# routing against arithmetic at a fixed budget of 4 stacks, over the wider corpus (~1.5 h)
+python -m tools.expert_merge.mergepack --compare CONTROL.gguf \
+    --against MERGED-k4.gguf,MERGED-k4-srcrouter.gguf \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md \
+    --docs 5 --tokens 255 --json merge64-route-attribution.json
 ```
 
 `python -m tools.selftest` runs these suites (`suite:expert_merge`, `suite:expert_perm`, `suite:mergepack`) as part of

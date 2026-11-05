@@ -92,6 +92,25 @@ def masked_route(logits, k):
     return idx, w / w.sum(axis=1, keepdims=True)
 
 
+def pool_to_stacks(logits, slot_map, router_used, stacks_used, n_stacks=None):
+    """Route over the source's slots, then pool that decision onto the stacks the pack actually holds.
+
+    A kept-router pack scores 128 slots but owns 64 merged experts, so a token's top-8 slots can land on fewer than
+    eight stacks - two members of a group share one stack, and their weights add. Keeping the `stacks_used` heaviest
+    distinct stacks is what makes this arm read the same number of matrices a token as the matched-fraction arm it is
+    compared with, so the difference between them is the router and not the arithmetic.
+    """
+    idx, wts = masked_route(logits, int(router_used))
+    stacks = slot_map[idx]
+    n = int(logits.shape[0])
+    width = int(n_stacks) if n_stacks is not None else int(stacks.max()) + 1
+    total = np.zeros((n, width), dtype=np.float32)
+    np.add.at(total, (np.arange(n)[:, None], stacks), wts.astype(np.float32))
+    top = np.argsort(-total, axis=1, kind="stable")[:, :int(stacks_used)]
+    w = np.take_along_axis(total, top, 1)
+    return top, (w / np.maximum(w.sum(axis=1, keepdims=True), 1e-30))
+
+
 def spans_of(seqs):
     """The (start, stop) of each sequence in a batch they are concatenated into, in the order given."""
     spans, off = [], 0
@@ -143,6 +162,9 @@ class Qwen3Moe(object):
         if keep_per_layer is None:
             self.prune = None
             return self
+        if self.pack.router_map is not None:
+            raise ValueError("a kept-router pack scores %d slots over %d stacks; a per-slot mask has no meaning here"
+                             % (self.pack.router_rows, self.pack.n_expert))
         keep = [None if k is None else sorted(int(e) for e in k) for k in keep_per_layer]
         if len(keep) != self.n_layers:
             raise ValueError("a plan for %d layers cannot be applied to %d" % (len(keep), self.n_layers))
@@ -185,6 +207,11 @@ class Qwen3Moe(object):
         p = self.pack
         logits = h @ self.attn_weights(il)["router"].T
         logits = mask_logits(logits, None if self.prune is None else self.prune[il])
+        m = p.router_map
+        if m is not None:
+            # a kept-router pack: the source's routing, the merged stacks underneath it
+            idx, wts = pool_to_stacks(logits, m, p.router_used, p.n_expert_used, n_stacks=p.n_expert)
+            return logits, idx, wts
         idx, wts = masked_route(logits, p.n_expert_used)
         return logits, idx, wts
 
