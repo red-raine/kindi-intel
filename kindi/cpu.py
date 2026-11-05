@@ -97,7 +97,9 @@ def _pack_files(pack):
     if miss:
         raise SystemExit("kindi-cpu: %s is not a Kindi CPU pack - it has no %s.\n"
                          "  A pack is written by `kindi convert MODEL.gguf PACK_DIR`. A Gemma 4 or Nemotron pack holds\n"
-                         "  model_path and is served by the GPU backend, not by KINDI_DEVICE=cpu."
+                         "  model_path and is served by the GPU backend, not by KINDI_DEVICE=cpu. A catalog pack\n"
+                         "  (GLM-5.3-Flash, MiniMax M3) names a kernel this engine does not have and holds no weights\n"
+                         "  at all; its kindi_pack.json `blockers` says which."
                          % (pack, _few(miss)))
 
 

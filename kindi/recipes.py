@@ -30,6 +30,8 @@ import re
 import shutil
 import tempfile
 
+from . import archs
+
 # --- detection --------------------------------------------------------------------------------------------------------
 
 # GGUF tensor type ids this engine can read, by name. The ids are ggml's; only the ones a conversion decision depends
@@ -38,7 +40,9 @@ TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 8: "Q8_0", 10: "Q2_K", 11: "Q
          14: "Q6_K", 20: "IQ4_NL", 23: "IQ4_XS", 30: "BF16", 41: "Q1_0", 143: "PTQ1_0"}
 
 # families this engine has a conversion path for, and what that path is. A family that is absent is reported as
-# "no conversion path" rather than being forced through the qwen35 reader.
+# "no conversion path" rather than being forced through the qwen35 reader. The two catalog families are added below
+# from `kindi.archs`, which owns their geometry and their blockers: detection and the catalog must not describe the
+# same file differently.
 FAMILIES = {
     "qwen35": dict(what="Qwen3.5 hybrid (gated DeltaNet + full attention)", path="cpu pack", ternary=True),
     "qwen3": dict(what="Qwen3 dense", path="cpu pack", ternary=True),
@@ -73,6 +77,11 @@ _GEOM = {
                    experts="expert_count", used="expert_used_count", ctx="context_length",
                    rope_base="rope.freq_base", head_dim="attention.key_length"),
 }
+
+# GLM-5.3-Flash and MiniMax M3: recognised from the header, priced by `kindi.archs`, not convertible to a CPU pack
+# (MLA/KDA and MSA attention respectively). Their geometry keys come from the same table the catalog writes from.
+FAMILIES.update({k: dict(what=v["what"], path=v["path"], ternary=False) for k, v in archs.SPEC.items()})
+_GEOM.update({k: dict(v["geometry"]) for k, v in archs.SPEC.items()})
 
 
 def _num(v):
@@ -115,6 +124,10 @@ def detect_meta(kv, tensors=()):
     out["tensor_types"] = dict(sorted(hist.items()))
     out["ternary_source"] = bool(hist) and set(hist) <= {"PTQ1_0", "Q1_0", "F32", "BF16"}
     out["convertible"] = bool(fam) and fam["path"] != "none yet"
+    spec = archs.SPEC.get(arch)
+    if spec:                                    # a catalog family: the attention it needs, and what the engine lacks
+        out["attention"] = spec["attention"]
+        out["blockers"] = list(spec["blockers"])
     return out
 
 
@@ -209,27 +222,45 @@ def plan(detected, role=None, target_bytes=None):
         raise SystemExit("kindi recipes: unknown role %r (have: %s)" % (role, ", ".join(sorted(RECIPES))))
     r = RECIPES[role]
     warn = []
+    catalog = detected.get("path") == "catalog pack"
     if not detected.get("convertible"):
         warn.append("%s has no conversion path in this engine (%s)" % (detected.get("arch") or "this file",
                                                                       detected.get("path")))
-    if detected.get("ternary_source") is False:
-        warn.append("the file is not ternary (types %s): the pack path copies ternary codes, so this needs the "
-                    "float path (kindi qat-pack) first" % (detected.get("tensor_types") or "unknown"))
-    ctx = detected.get("ctx") or 0
-    if r["rope_window"] and ctx and r["rope_window"] > ctx:
-        warn.append("recipe asks for a %d-position window; the file declares %d, so the table would extrapolate"
-                    % (r["rope_window"], ctx))
-    if r["paircodes"] and not detected.get("moe"):
-        warn.append("paircodes stage expert matrices; this model has no experts, so the flag does nothing")
-    if r["scheme"] == "gsq" and detected.get("ternary_source"):
-        warn.append("gsq re-fits codes and scales from float weights; a ternary source has no float weights to fit, "
-                    "so the pack keeps the file's own codes (use kindi qat-pack for a float checkpoint)")
-    steps = [dict(do="convert", scheme=r["scheme"], rope_window=r["rope_window"], paircodes=r["paircodes"],
-                  keep_float=list(r["keep_float"]))]
+    if catalog:
+        # a catalog pack holds no weights, so what a recipe would do to them does not apply; what does apply is why
+        # there is no pack, which is the blocker the catalog writes into the manifest
+        blockers = detected.get("blockers") or []
+        warn.append("%s is catalogued, not converted: %s" % (detected.get("arch"),
+                                                             blockers[0] if blockers else "no kernel in this engine"))
+        if detected.get("ternary_source") is False:
+            warn.append("the file is not ternary (types %s): a catalog pack copies no weights, so nothing is re-coded "
+                        "today - import_plan prices what a ternary pass would cover"
+                        % (detected.get("tensor_types") or "unknown"))
+    else:
+        if detected.get("ternary_source") is False:
+            warn.append("the file is not ternary (types %s): the pack path copies ternary codes, so this needs the "
+                        "float path (kindi qat-pack) first" % (detected.get("tensor_types") or "unknown"))
+        ctx = detected.get("ctx") or 0
+        if r["rope_window"] and ctx and r["rope_window"] > ctx:
+            warn.append("recipe asks for a %d-position window; the file declares %d, so the table would extrapolate"
+                        % (r["rope_window"], ctx))
+        if r["paircodes"] and not detected.get("moe"):
+            warn.append("paircodes stage expert matrices; this model has no experts, so the flag does nothing")
+        if r["scheme"] == "gsq" and detected.get("ternary_source"):
+            warn.append("gsq re-fits codes and scales from float weights; a ternary source has no float weights to "
+                        "fit, so the pack keeps the file's own codes (use kindi qat-pack for a float checkpoint)")
+    steps = ([dict(do="catalog", what="write kindi_pack.json and tensors.json from the header and the tensor table; "
+                                     "no weights are copied")]
+             if catalog else
+             [dict(do="convert", scheme=r["scheme"], rope_window=r["rope_window"], paircodes=r["paircodes"],
+                   keep_float=list(r["keep_float"]))])
     if target_bytes:
         steps.append(dict(do="rco", budget=int(target_bytes),
                           what="exact-budget choice of which tensors stay f32 (kindi.rco)"))
-    return dict(role=role, recipe=r, detected=detected, steps=steps, warnings=warn, gate=r["gate"])
+    # a catalog pack copies no weights, so the recipe's likelihood gate has nothing to measure; the manifest's own
+    # `blockers` is what a catalog has to satisfy instead
+    return dict(role=role, recipe=r, detected=detected, steps=steps, warnings=warn,
+                gate=(None if catalog else r["gate"]))
 
 
 def listing(log=print):
@@ -340,6 +371,21 @@ def selftest():
     check("detect: an unknown family is reported as such", d3["family"] == "ornith" and d3["convertible"] is False)
     check("plan: an unconvertible family is a warning",
           any("no conversion path" in w for w in plan(d3, "chat")["warnings"]))
+
+    # a catalog family: recognised, with the attention it needs, and planned as a catalog rather than a conversion
+    d4 = detect_meta({"general.architecture": "glm5-next", "glm5-next.block_count": 45,
+                      "glm5-next.embedding_length": 4096, "glm5-next.expert_count": 288,
+                      "glm5-next.expert_used_count": 8, "glm5-next.attention.head_count": 64,
+                      "glm5-next.attention.q_lora_rank": 1536, "glm5-next.context_length": 1048576},
+                     [("blk.0.ffn_gate_exps.weight", [4096, 2048, 288], 10, 0)])
+    check("detect: a catalog family is named with its attention",
+          d4["path"] == "catalog pack" and "MLA" in d4["attention"], str(d4.get("attention")))
+    check("detect: its extra geometry comes from the table the catalog writes from", d4["q_lora"] == 1536)
+    p4 = plan(d4, "chat")
+    check("plan: a catalog family plans a catalog, not a conversion",
+          len(p4["steps"]) == 1 and p4["steps"][0]["do"] == "catalog", str(p4["steps"]))
+    check("plan: and says why there is no pack",
+          any("catalogued, not converted" in w for w in p4["warnings"]), str(p4["warnings"]))
 
     # a budget adds the rco step, and the gate is the recipe's own
     p3 = plan(d, "chat", target_bytes=500 << 20)

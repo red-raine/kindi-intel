@@ -54,15 +54,19 @@ def cmd_convert(cfg, a):
         for w in p["warnings"]:
             log("  warning: %s" % w)
         step = p["steps"][0]
-        paircodes = paircodes or bool(step["paircodes"])
+        # a catalog step (`do: catalog`) carries none of these: it copies no weights, so there is nothing to re-code
+        paircodes = paircodes or bool(step.get("paircodes"))
         # a recipe that wants a longer window than the file declares builds the table that reaches it; the plan has
         # already said so as a warning, so the stretch is the caller's decision rather than a silent extrapolation
-        if step["rope_window"] and det.get("ctx") and step["rope_window"] > det["ctx"] and factor is None:
-            factor, window = float(step["rope_window"]) / float(det["ctx"]), int(det["ctx"])
-            log("  rope: factor %g from the file's %d positions, to reach %d" % (factor, det["ctx"], step["rope_window"]))
+        win = step.get("rope_window")
+        if win and det.get("ctx") and win > det["ctx"] and factor is None:
+            factor, window = float(win) / float(det["ctx"]), int(det["ctx"])
+            log("  rope: factor %g from the file's %d positions, to reach %d" % (factor, det["ctx"], win))
     manifest = convert(a.gguf, out, log=log, paircodes=paircodes, rope_factor=factor, rope_window=window)
     if manifest.get("backend") == "kindi_gemma4":
         log("Gemma 4 model ready for Kindi native CUDA inference")
+    elif manifest.get("backend") == "catalog":
+        log("catalog only: no weights copied - kindi_pack.json names what a kernel would have to implement")
     else:
         log("next: kindi verify")
     return 0
@@ -115,8 +119,9 @@ def cmd_recipes(cfg, a):
     log("recipe %s: %s" % (p["role"], p["recipe"]["what"]))
     for s in p["steps"]:
         log("  step: %s" % ", ".join("%s=%s" % (k, v) for k, v in s.items() if k != "do"))
-    log("  gate: %s corpus, NLL delta <= %.3f, top-1 >= %.2f"
-        % (p["gate"]["corpus"], p["gate"]["max_delta_nll"], p["gate"]["min_top1"]))
+    if p["gate"]:                               # a catalog pack holds no weights, so it has no likelihood to gate
+        log("  gate: %s corpus, NLL delta <= %.3f, top-1 >= %.2f"
+            % (p["gate"]["corpus"], p["gate"]["max_delta_nll"], p["gate"]["min_top1"]))
     for w in p["warnings"]:
         log("  warning: %s" % w)
     return 0

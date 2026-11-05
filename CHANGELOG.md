@@ -4,6 +4,13 @@
 
 ### New
 
+- **GLM-5.3-Flash and MiniMax M3 conversion support.** `kindi convert` recognises `glm5-next` and `minimax-m3` and
+  writes a **catalog pack** for them: `kindi_pack.json` plus `tensors.json` with every tensor's shape, type, bytes and
+  role in its block, the geometry the header declares, the attention its tensors prove, a byte price per group, what a
+  ternary pass would cover, and the blockers that say why there is no CPU route (MLA/KDA and MSA attention). No weights
+  are copied, because a manifest claiming a CPU pack for a file the engine cannot decode a block of is worse than no
+  pack. `kindi recipes --for` reads the same table, so detection and the catalog cannot disagree about a file.
+  [docs/IMPORT-CATALOG.md](docs/IMPORT-CATALOG.md).
 - **`kindi refit`.** Keeps every ternary code and re-derives every 128-weight block scale against a target pack: the
   closed form `s = <w, c> / <c, c>` a block, clipped at 0 (a block scale is a magnitude), and a block with no codes
   keeping the scale it came in with. No training and no code moves, so the pack's size does not change. It writes a new

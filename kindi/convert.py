@@ -19,6 +19,10 @@ index.json, bcodes_index.json, kindi_pack.json.
 paging slots, so a paged expert is loaded by memcpy rather than rebuilt from the trits at every miss. It is about 6%
 of the pack for the experts it covers, and only packs with experts get one.
 
+Two recovered architectures - GLM-5.3-Flash (`glm5-next`) and MiniMax M3 (`minimax-m3`) - have no CPU kernel here, and
+this function does not pretend they do: they are routed to `kindi.archs.catalog`, which writes a manifest and a tensor
+inventory with no weights in it. Everything below is the pack path a file with ternary weights takes.
+
 `--rope-factor F --rope-window N` builds a pack whose rotary table uses factor F (2 stretches an 8k window to 16k; 1
 is the plain table, and drops a block the file declares). What the GGUF asks for is recorded verbatim by
 default; `rope_override` is the only place the manifest's `rope_scaling` block is decided, and `kindi.rope` reads it,
@@ -30,7 +34,7 @@ import time
 
 import numpy as np
 
-from . import __version__, packio
+from . import __version__, archs, packio
 from .cpu import is_expert, pair_bytes
 from .gguf import GGUF
 
@@ -241,8 +245,18 @@ def convert(gguf_path, out_dir, log=print, paircodes=False, rope_factor=None, ro
             (info["tensor_count"], info["tensor_types"]))
         return manifest
     arch = g.kv.get("general.architecture")
+    if arch in archs.SPEC:
+        # A checkpoint this engine can recognise and price but not run (MLA/KDA, or MSA attention). The catalog is the
+        # artifact an import needs whether or not the kernel exists, and writing a weight pack here would be the one
+        # thing worse than writing nothing: a manifest that says "pack" for a file the engine cannot decode a block of.
+        for flag, val in (("--paircodes", paircodes), ("--rope-factor", rope_factor),
+                          ("--rope-window", rope_window)):
+            if val:
+                log("kindi convert: %s is a catalog pack (no weights copied), so %s does nothing here" % (arch, flag))
+        return archs.catalog(gguf_path, out_dir, log=log, g=g)
     if arch not in ("qwen35", "qwen3"):
-        raise SystemExit("kindi convert: expected a qwen35, qwen3 or Gemma 4 GGUF (found %r)" % (arch,))
+        raise SystemExit("kindi convert: expected a qwen35, qwen3, glm5-next, minimax-m3 or Gemma 4 GGUF (found %r)"
+                         % (arch,))
     types = {t[2] for t in g.tensors}
     if not types <= {PTQ1_0, Q1_0, F32, BF16}:
         raise SystemExit("kindi convert: needs a ternary (PTQ1_0) or 1-bit (Q1_0) GGUF - found tensor types %s"
