@@ -148,7 +148,80 @@ def plan_layer(mass, sizes, budget, unit=1024, max_cells=40 << 20, protect=None)
                 protected=forced, protected_bytes=forced_bytes)
 
 
-def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=None, protect=None):
+def saliency_per_expert(routes, output, layers=None):
+    """[layers, experts] saliency: routing mass times the expert's own measured output.
+
+    Mass alone ranks an expert by how often the router chooses it; an expert the router chooses rarely but whose
+    output is enormous is worth more than its mass says, because dropping it removes a large vector from the layer's
+    output, not a small one. `output` is `superex.profile`'s max-|output| per expert (0 for an expert no token
+    chose, which is also mass 0, so the product stays honest). Masterplan P1: the literature (PRIME/REAM) puts the
+    saliency half at -3.7 to -8.7 points when removed; here it is the same product, measured on the same log.
+    """
+    mass, _count = mass_per_expert(routes, int(np.asarray(output).shape[1]))
+    out = np.asarray(output, dtype=np.float64)
+    if out.shape != mass.shape:
+        raise SystemExit("prune: the output profile is %s and the log's mass is %s"
+                         % (tuple(out.shape), tuple(mass.shape)))
+    return mass * out
+
+
+def entropy_per_layer(routes):
+    """[layers] entropy of the aggregate routing-mass distribution, in nats.
+
+    One number a layer: how spread its mass is over its experts. A peaked layer leans on a few experts and must keep
+    them; a flat layer spreads its mass thinly and can shed experts cheaply. That asymmetry is what a non-uniform
+    budget spends: total experts fixed, low-entropy layers keep more.
+    """
+    mass, _count = mass_per_expert(routes)
+    p = mass / mass.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        terms = np.where(p > 0, p * np.log(p), 0.0)
+    return -terms.sum(axis=1)
+
+
+def budgets_from_entropy(entropy, total_keep, n_expert, min_keep=8):
+    """Per-layer keep counts summing to `total_keep`, weighted by exp(-(H - Hmin)).
+
+    A peaked layer (low entropy) leans on few experts and keeps more; a flat layer spreads its mass and keeps
+    fewer. The weight is a softmax over negative entropy at temperature 1 nat - entropy's own unit - so the
+    flattest layer carries e^-1 of the most peaked layer's weight, a max/min ratio of e^(Hmax-Hmin), and never
+    the near-zero a linear deficit gives it: on this log the raw deficit weights put 9 experts in layer 0 (which
+    routes top-8 into 9 slots), spending the whole experiment on whether a degenerate corner survives rather
+    than on whether non-uniform budgets help. Allocation is proportional with largest-remainder rounding, then
+    clamped to [min_keep, n_expert] with the clamped amount redistributed, so the sum stays exact. `min_keep`
+    defaults to the router's top-k (8): a layer that keeps fewer experts than it routes to is not a prune, it is
+    a different model.
+    """
+    H = np.asarray(entropy, dtype=np.float64)
+    L = H.size
+    if total_keep < L * int(min_keep) or total_keep > L * int(n_expert):
+        raise SystemExit("prune: total keep %d does not fit %d layers between %d and %d"
+                         % (int(total_keep), L, int(min_keep), int(n_expert)))
+    w = np.exp(-(H - H.min()))
+    raw = int(total_keep) * w / w.sum()
+    keep = np.floor(raw).astype(np.int64)
+    order = np.argsort(-(raw - keep))
+    keep[order[: int(total_keep) - int(keep.sum())]] += 1
+    keep = np.clip(keep, int(min_keep), int(n_expert))
+    # clipping can break the sum; walk the largest/smallest layers back to exactness
+    while int(keep.sum()) != int(total_keep):
+        if int(keep.sum()) < int(total_keep):
+            cand = [l for l in np.argsort(-(H.max() - H)) if keep[l] < int(n_expert)]
+            for l in cand:
+                if int(keep.sum()) >= int(total_keep):
+                    break
+                keep[l] += 1
+        else:
+            cand = [l for l in np.argsort(H - H.max()) if keep[l] > int(min_keep)]
+            for l in cand:
+                if int(keep.sum()) <= int(total_keep):
+                    break
+                keep[l] -= 1
+    return [int(k) for k in keep]
+
+
+def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=None, protect=None,
+          score=None, budgets=None):
     """Every layer, solved on its own budget: `frac` of the pack's expert bytes, or exactly `keep` experts.
 
     The budget is per layer and exact - each layer may spend its allowance and no more - so a layer that needs
@@ -157,13 +230,20 @@ def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=N
     answer is 48 independent knapsacks rather than one big one.
 
     `protect` is `{layer: {expert, ...}}` - the guard from `superex`, forced into every layer's keep set.
+
+    `score` replaces mass as the value of keeping an expert (P1's saliency = mass x output); `budgets` replaces
+    the uniform budget with a per-layer count list (P1's entropy allocation). Both keep the same exact solve;
+    only the price of dropping an expert, or the size of each layer's allowance, changes.
     """
-    mass, _count = mass_per_expert(routes, per_expert.shape[1])
+    true_mass, _count = mass_per_expert(routes, per_expert.shape[1])
+    mass = score if score is not None else true_mass
     L = mass.shape[0]
     if L != per_expert.shape[0]:
         raise SystemExit("prune: the log has %d layers and the pack prices %d" % (L, per_expert.shape[0]))
-    if keep is None and frac is None:
+    if keep is None and frac is None and budgets is None:
         raise SystemExit("prune: give --keep N or --frac F")
+    if budgets is not None and len(budgets) != L:
+        raise SystemExit("prune: %d per-layer budgets for %d layers" % (len(budgets), L))
     protect = protect or {}
     bad = sorted(set(protect) - set(range(L)))
     if bad:
@@ -171,7 +251,9 @@ def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=N
     out = []
     for l in range(L):
         sizes = np.asarray(per_expert[l], dtype=np.int64)
-        if keep is None:
+        if budgets is not None:
+            budget = int(budgets[l])
+        elif keep is None:
             budget = int(frac * int(sizes.sum()))
         else:
             budget = int(keep)
@@ -180,7 +262,12 @@ def solve(routes, per_expert, frac=None, keep=None, unit=1024, min_keep=1, log=N
             raise SystemExit("prune: layer %d: a budget of %d bytes keeps %d experts, below the floor of %d "
                              "(%d bytes an expert)" % (l, budget, len(p["keep"]), int(min_keep), int(sizes[0])))
         p["layer"] = l
-        p["total_mass"] = float(mass[l].sum())
+        # reported against true routing mass even when the solve priced drops in saliency: a plan's dropped-mass
+        # fraction is a fact about the plan, not about the currency the solve happened to use
+        p["total_mass"] = float(true_mass[l].sum())
+        kept = set(p["keep"])
+        p["dropped_mass"] = float(sum(float(true_mass[l][e]) for e in range(true_mass.shape[1])
+                                         if e not in kept))
         out.append(p)
     if log:
         log("  solved %d layers: %s" % (L, ", ".join(sorted({"%s%s" % (p["method"], "" if p["gap"] == 0 else
@@ -334,17 +421,50 @@ def gate(baseline, plans, max_delta=NLL_TOL, block=GATE_BLOCK, iters=2000, seed=
 # --- the CLI --------------------------------------------------------------------------------------------------
 
 def _plans_from_spec(routes, per_expert, argv, protect=None):
-    """every `--keep` / `--frac` value becomes its own plan, so one process can gate a curve of them"""
+    """every `--keep` / `--frac` value becomes its own plan, so one process can gate a curve of them
+
+    P1's four arms, per keep value: {uniform-mass (the shipped plan), uniform-saliency, entropy-mass,
+    entropy-saliency}, at equal total experts. `--saliency FILE` turns the saliency arms on (FILE is a `superex`
+    profile with `output` + `layers`); `--entropy-budgets` turns the entropy arms on. With neither flag the
+    result is the single shipped arm, so existing commands are unchanged.
+    """
     keeps = float_list(argv, "--keep", int)
     fracs = float_list(argv, "--frac", float)
     if not keeps and not fracs:
         raise SystemExit("prune: give --keep N[,N...] or --frac F[,F...] (or --selftest)")
     unit = int(_arg(argv, "--unit", 1024))
+    L = int(per_expert.shape[0])
+    n_expert = int(per_expert.shape[1])
+    sal_path = _arg(argv, "--saliency")
+    score = None
+    if sal_path:
+        with open(sal_path, encoding="utf-8") as f:
+            prof = json.load(f)
+        if prof.get("output") is None or prof.get("layers") is None:
+            raise SystemExit("prune: --saliency %s is not a superex profile (needs output + layers)" % sal_path)
+        layers = [int(l) for l in prof["layers"]]
+        out = np.zeros((L, n_expert), dtype=np.float64)
+        out[layers] = np.asarray(prof["output"], dtype=np.float64)
+        score = saliency_per_expert(routes, out)
+        print("  saliency: mass x max|output| from %s (%d layers)" % (sal_path, len(layers)))
+    entropy = entropy_per_layer(routes) if "--entropy-budgets" in argv else None
+    if entropy is not None:
+        print("  entropy budgets: layer entropy %.3f..%.3f nats (min layer %d, max layer %d)"
+              % (float(entropy.min()), float(entropy.max()), int(entropy.argmin()), int(entropy.argmax())))
     plans = []
     for k in keeps:
         # one byte an expert: the budget is a count, and the solve is the same solve
-        plans.append(("keep=%d" % k, solve(routes, np.ones_like(per_expert), keep=k, unit=1, protect=protect),
-                      "count"))
+        arms = [("keep=%d" % k, None, None)]
+        if score is not None:
+            arms.append(("keep=%d/saliency" % k, score, None))
+        if entropy is not None:
+            budgets = budgets_from_entropy(entropy, k * L, n_expert)
+            arms.append(("keep=%d/entropy" % k, None, budgets))
+            if score is not None:
+                arms.append(("keep=%d/saliency+entropy" % k, score, budgets))
+        for name, sc, budgets in arms:
+            plans.append((name, solve(routes, np.ones_like(per_expert), keep=k, unit=1, protect=protect,
+                                      score=sc, budgets=budgets), "count"))
     for f in fracs:
         plans.append(("frac=%g" % f, solve(routes, per_expert, frac=f, unit=unit, protect=protect), "bytes"))
     return plans
@@ -431,6 +551,7 @@ def main(argv):
     if not path:
         print("usage: python -m tools.expert_merge.prune --routes ROUTES.npz --keep N[,N...] "
               "| --frac F[,F...] [--pack MODEL.gguf] [--protect L:E,...] [--protect-json superex.json] "
+              "[--saliency superex.json] [--entropy-budgets] "
               "[--json out.json] [--gate --docs 2 --tokens 96 --max-delta 0.02] [--selftest]")
         return 2
     from .routes import load
@@ -582,6 +703,26 @@ def selftest():
           np.allclose(m[0], [0.9, 0.75, 1.35], atol=1e-3), str(m[0]))   # the log stores weights in fp16
     check("prune: counts are selections, not mass", list(c[0]) == [2, 2, 2], str(c[0]))
     check("prune: a layer's mass sums to its token count", abs(m[0].sum() - 3.0) < 1e-9, str(m[0].sum()))
+
+    # --- P1: saliency is mass x output, and it changes the ranking exactly where output disagrees with mass
+    out = np.zeros((1, 3), dtype=np.float64)
+    out[0] = [1.0, 10.0, 1.0]                                  # expert 1 is picked rarely but writes 10x
+    s = saliency_per_expert(dict(route_ids=ids, route_wts=wts), out)
+    check("prune: saliency is mass times the measured output", np.allclose(s[0], m[0] * out[0]), str(s[0]))
+    by_mass = top_m_by_mass(m[0], 1)[0]
+    by_sal = top_m_by_mass(s[0], 1)[0]
+    check("prune: saliency keeps the high-output expert mass alone would drop",
+          by_mass == 2 and by_sal == 1, "mass top %d, saliency top %d" % (by_mass, by_sal))
+
+    # --- P1: entropy allocation spends the same total on peaked layers, and clamps where it must
+    H = np.array([1.0, 2.0, 3.0, 4.0])                         # layer 0 peaked, layer 3 flat
+    b = budgets_from_entropy(H, total_keep=320, n_expert=128, min_keep=8)
+    check("prune: entropy budgets sum to the uniform total", sum(b) == 320, str(b))
+    check("prune: a peaked layer keeps more than a flat one at equal total", b[0] > b[3], str(b))
+    check("prune: entropy budgets respect the floor and the cap",
+          min(b) >= 8 and max(b) <= 128, str(b))
+    b2 = budgets_from_entropy(np.zeros(4), total_keep=200, n_expert=128, min_keep=8)
+    check("prune: equal entropy gives the uniform budget back", b2 == [50, 50, 50, 50], str(b2))
 
     # --- the count path: equal prices, so the exact answer is the mass-sorted one
     mass = rng.permutation(np.linspace(1.0, 128.0, 128))

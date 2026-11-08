@@ -172,6 +172,76 @@ text: a sixth of the expert bytes for nothing measurable, and the only plan in t
 one worth another corpus - 7.31 GB, a quarter of the experts gone, point estimate under the tolerance - and 64 is out
 by a fifth of a nat.
 
+## P1: saliency and non-uniform budgets do not beat mass here
+
+P1 asked the two literature questions that the shipped uniform, mass-only plan had not tested: whether expert value
+should be `routing mass × max|output|` rather than routing mass alone, and whether layers should receive unequal
+budgets according to routing entropy rather than the same count. The implementation is in `prune.py`:
+`--saliency superex.json` supplies the measured output profile and `--entropy-budgets` derives the per-layer budget
+from the aggregate routing-mass entropy. Every arm carries the P0 super-expert guard.
+
+The entropy allocator originally used a linear entropy deficit. On the 384-token route log that concentrated the
+budget so heavily that layer 0 received only 9 of 128 experts while other layers approached 128 / 128; that tested
+a degenerate corner more than the general non-uniform-budget question. It was therefore replaced before the gated
+runs with a bounded softmax weighting, `exp(-(H - Hmin))`: layers span **53–110 experts at the nominal 96 budget**
+and **44–104 at the nominal 80 budget**, rather than 9–128. This still gives early, peaked layers more experts and
+flat layers fewer, but keeps every layer within a meaningful operating range.
+
+The two orders of the experiment were run in separate processes because each gate takes roughly half an hour. Both
+used the same seven held-out documents, seven documents × 255 tokens, the same super-expert guard, and the same
+paired baseline procedure, but produced **1,778 scored tokens**, not 1,785; this section therefore quotes only its
+own baseline and does not compare deltas with the earlier 1,785-token run. The baseline was **3.6704** in both
+P1 processes.
+
+### 96 experts per layer
+
+| arm | kept slots | expert bytes | routing mass given up | NLL change | 95% interval | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| uniform mass | 4,597 | 7,851,823,104 | 0.5874% | **+0.0173** | −0.0012 .. +0.0361 | marginal |
+| uniform saliency | 4,597 | 7,851,823,104 | 0.7534% | **+0.0160** | −0.0090 .. +0.0418 | marginal |
+| entropy mass | 4,465 | 7,626,362,880 | 1.9765% | **+0.0622** | +0.0238 .. +0.1054 | rejected |
+| entropy saliency | 4,465 | 7,626,362,880 | 2.3180% | **+0.0478** | +0.0105 .. +0.0877 | rejected |
+
+Saliency's point estimate is 0.0013 nats lower than mass at exactly the same slot count and byte count, but the
+baseline-relative intervals overlap and the run JSON stores no per-token arm difference, so this is **not an
+established saliency advantage**. If the plan is going to be judged from point estimates alone, saliency is
+nominally a hair ahead at 96; by the repository's interval rule, mass remains the arm to ship because it is cheaper
+to explain and its interval is narrower.
+
+Entropy loses despite spending fewer bytes (2.88% fewer than the uniform arms at this nominal budget). The exact
+slot totals also need to be read as actual plans rather than as idealized equal-byte controls: the uniform arms
+kept 4,597 slots and the entropy arms kept 4,465. Under entropy allocation, several layer budgets landed where the
+DP found zero-value experts tied with dropping them, so it did not spend a slot that buys no score. Entropy is
+therefore rejected both on its loss and because it drops 3.37 times as much routing mass at this budget.
+
+### 80 experts per layer
+
+| arm | kept slots | expert bytes | routing mass given up | NLL change | 95% interval | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| uniform mass | 3,840 | 6,558,842,880 | 2.1325% | **+0.0524** | +0.0178 .. +0.0870 | rejected |
+| uniform saliency | 3,840 | 6,558,842,880 | 2.5195% | **+0.0413** | +0.0102 .. +0.0721 | rejected |
+| entropy mass | 3,805 | 6,499,061,760 | 3.7349% | **+0.1054** | +0.0555 .. +0.1596 | rejected |
+| entropy saliency | 3,805 | 6,499,061,760 | 4.2223% | **+0.1059** | +0.0573 .. +0.1569 | rejected |
+
+At 80, all four arms fail the 0.02-nat tolerance. Saliency is again nominally preferable by 0.0111 nats at the same
+slot and byte count, but no direct saliency-versus-mass per-token interval was stored, and both intervals extend
+well above tolerance; it is not an established win. Entropy is worse still, at almost exactly twice the uniform
+arms' measured damage while using 0.91% fewer bytes.
+
+### Verdict
+
+**Keep uniform mass for pruning this model.** The kill condition in masterplan P1 is met in its established form:
+neither saliency nor entropy produces a statistically established advantage at equal nominal size. The entropy
+allocation is positively rejected at both budgets. Saliency remains a plausible tie-breaker, not a shipping rule:
+its point estimate is lower, its dropped-mass fraction is consistently higher, and its intervals are consistently
+wider. A future claim that saliency itself is better needs the paired saliency-minus-mass per-token interval; the
+present JSON intentionally has baseline-relative intervals only.
+
+P2's functional screen was **not** run for these arms. `tools/funcscreen` drives converted kindi packs, while
+`prune` produces kept-expert plans applied as a GGUF routing mask; no P1 pruned kindi pack exists on this host, so
+this is an NLL-only verdict. The machine-local plan and gate JSON files are `prune-p1-gate96.json` and
+`prune-p1-gate80.json` under `B:/models/scratch`; their commands are in Reproduce below.
+
 ## What a mass budget cannot see
 
 Routing mass is the right currency for a byte budget and the wrong one for a hazard, because it treats an expert as a
@@ -361,4 +431,14 @@ python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 
     --docs 7 --tokens 255 --json gate-guard-96-64.json
 # then the verdicts, from the shards (refuses shards whose baseline disagrees)
 python -m tools.expert_merge.prunegate gate-112-96.json
+
+# P1: saliency and entropy budgets, each gated separately on the same held-out 1,778-token corpus
+python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 96 \
+    --saliency superex.json --entropy-budgets --protect-json superex.json --gate \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md,tools/nll.py,docs/EXPERT-MERGE.md \
+    --docs 7 --tokens 255 --json prune-p1-gate96.json
+python -m tools.expert_merge.prune --pack MODEL.gguf --routes routes.npz --keep 80 \
+    --saliency superex.json --entropy-budgets --protect-json superex.json --gate \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md,tools/nll.py,docs/EXPERT-MERGE.md \
+    --docs 7 --tokens 255 --json prune-p1-gate80.json
 ```

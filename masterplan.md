@@ -126,6 +126,15 @@ lossless and at what bytes — not which arm has the lowest mean.
 
 *Kill:* if saliency does not beat mass at equal bytes on the paired walk, keep mass (it is cheaper and already explained).
 
+*Result (2026-11-08):* **keep uniform mass.** On **1,778 held-out tokens** (baseline 3.6704; this corpus is not the
+earlier 1,785-token corpus), saliency was nominally lower than mass by 0.0013 nats at 96 (**+0.0160 [−0.0090,
++0.0418]** vs mass **+0.0173 [−0.0012, +0.0361]**) and by 0.0111 nats at 80 (**+0.0413 [+0.0102, +0.0721]** vs mass
+**+0.0524 [+0.0178, +0.0870]**), but no direct saliency-minus-mass per-token interval was stored, so neither is an
+established advantage; saliency also drops more routing mass and has wider intervals. Entropy was rejected at both
+budgets: **+0.0622 [+0.0238, +0.1054]** at 96 and **+0.1054 [+0.0555, +0.1596]** at 80, and the combined arm was
+similarly rejected. At 80 all four arms fail 0.02. P2's screen was not run because no pruned kindi packs were
+converted; see [`docs/EXPERT-PRUNE.md`](docs/EXPERT-PRUNE.md).
+
 ### P2 — A functional acceptance screen beside the NLL gate — **~3 h**
 
 *Hypothesis:* the gate can certify a model that cannot write a valid program. NLL over 1,785 tokens of this repo's
@@ -361,7 +370,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | item | status | next action |
 |---|---|---|
 | P0 protect super experts | **measured** | `--protect`/`--protect-json` in `prune`; guard 0.07% of bytes; 96 identical to unguarded (**+0.0173 [−0.0012, +0.0361]**, marginal); 64 guarded **+0.0914** vs unguarded **+0.0963** on the same tokens — the outlier is 5% of that loss, not its cause |
-| P1 saliency + non-uniform budgets | open | needs P0 and P2 |
+| P1 saliency + non-uniform budgets | **measured; keep uniform mass** | saliency only nominally ahead with overlapping baseline intervals; entropy rejected at 96 and 80 on 1,778 held-out tokens. P2 not run: no pruned kindi packs converted |
 | P2 functional screen | **built, kill property measured** | `tools/funcscreen`: 40 fixed items (20 code + 20 arithmetic), greedy, outputs stored; bonsai-2b 32/40 vs token-shuffled 6/40, paired delta −0.65 [−0.80, −0.50]. **Control-vs-merge64 kill test not run** — arms are GGUF-only on this host; convert both packs and `--compare` |
 | P3 mitigated merge | open, likely kill | compare against prune-at-96, not just the control |
 | P4 ridge router re-fit | open | fit on the 384-token log, gate at 1,275 tokens |
