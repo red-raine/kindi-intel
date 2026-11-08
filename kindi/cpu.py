@@ -788,6 +788,36 @@ class Engine(object):
             for j in range(3):                      # every paged expert starts on the same slot, filled by its fetch
                 arr[3 * e + j] = Mat(_p(slots[0][j][0], PU8), _p(slots[0][j][1]), arr[3 * e + j].R, arr[3 * e + j].C)
 
+    def _pread_pc(self, length, offset):
+        """One contiguous staged-expert read from pcodes.bin, or None when no positional read is available.
+
+        POSIX uses os.pread on a retained descriptor. Windows has no os.pread, so it uses a retained CreateFileW
+        handle with an OVERLAPPED offset; the handle is kept for the engine's lifetime like the memmaps are.
+        """
+        handle = getattr(self, "_pc_handle", None)
+        if handle is not None:
+            class _OVERLAPPED(ctypes.Structure):
+                _fields_ = [("Internal", ctypes.c_ulonglong), ("InternalHigh", ctypes.c_ulonglong),
+                            ("Offset", ctypes.c_ulong), ("OffsetHigh", ctypes.c_ulong),
+                            ("hEvent", ctypes.c_void_p)]
+
+            buf = ctypes.create_string_buffer(length)
+            ov = _OVERLAPPED(0, 0, int(offset) & 0xFFFFFFFF, int(offset) >> 32, None)
+            n_read = ctypes.c_ulong(0)
+            ok = self._kernel32.ReadFile(handle, buf, int(length), ctypes.byref(n_read), ctypes.byref(ov))
+            if not ok or int(n_read.value) != int(length):
+                raise OSError("kindi-cpu: short pcodes.bin read at byte %d (wanted %d, got %d)"
+                              % (int(offset), int(length), int(n_read.value)))
+            return buf.raw
+        fd = getattr(self, "_pread_fd", None)
+        if fd is not None and hasattr(os, "pread"):
+            data = os.pread(fd, int(length), int(offset))
+            if len(data) != int(length):
+                raise OSError("kindi-cpu: short pcodes.bin read at byte %d (wanted %d, got %d)"
+                              % (int(offset), int(length), len(data)))
+            return data
+        return None
+
     def _page_expert(self, big, layer, expert):
         p = self.pager
         ins = p["in_slot"].get(layer)
@@ -797,9 +827,21 @@ class Engine(object):
         ins[k] = expert
         p["next"][layer] = (k + 1) % len(ins)
         arr = p["arr"][layer]
-        for j, rec in enumerate(p["src"][(layer, expert)]):
+        recs = p["src"][(layer, expert)]
+        staged = None
+        if self.pc is not None and all("pc_off" in rec for rec in recs):
+            offs = [int(rec["pc_off"]) for rec in recs]
+            lens = [_pair_len(rec) for rec in recs]
+            if offs[0] + lens[0] == offs[1] and offs[1] + lens[1] == offs[2]:
+                data = self._pread_pc(sum(lens), offs[0])
+                if data is not None:
+                    staged = (data, offs[0])
+        for j, rec in enumerate(recs):
             dw, ds = p["slots"][layer][k][j]
-            if self.pc is not None and "pc_off" in rec:
+            if staged is not None:
+                data, base = staged
+                W, S = _pair_views(data, dict(rec, pc_off=int(rec["pc_off"]) - base))
+            elif self.pc is not None and "pc_off" in rec:
                 W, S = _pair_views(self.pc, rec)      # the pair-code pack: two memcpys, no conversion
             else:
                 W, S = pair_mat(big["bc"], big["dp"], rec)
@@ -821,6 +863,19 @@ class Engine(object):
         if os.path.isfile(pc):
             self.pc = np.memmap(pc, dtype=np.uint8, mode="r")
             self._paging_src["pc"] = self.pc
+            self._pc_handle = None
+            self._pread_fd = None
+            if os.name == "nt":
+                self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                self._kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong,
+                                                        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                                                        ctypes.c_void_p]
+                self._kernel32.CreateFileW.restype = ctypes.c_void_p
+                handle = self._kernel32.CreateFileW(pc, 0x80000000, 0x00000003, None, 3, 0x10000000, None)
+                if handle and int(ctypes.cast(handle, ctypes.c_void_p).value or 0) != 0xFFFFFFFFFFFFFFFF:
+                    self._pc_handle = handle
+            elif hasattr(os, "pread"):
+                self._pread_fd = os.open(pc, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             size = int(self.pc.shape[0])
             for (il, e), recs in self.pager["src"].items():        # a short file would stage half an expert
                 for rec in recs:
@@ -978,6 +1033,29 @@ def selftest():
 
         staged = [n for n in bi if "pc_off" in bi[n]]       # only the paged expert matrices are staged
         check("the pack stages some tensors in pcodes.bin", bool(staged))
+
+        def span(rec, kind):
+            if kind == "bcodes":
+                return int(rec["rows"]) * (int(rec["ne0"]) // 4)
+            if kind == "dpm":
+                return int(rec["rows"]) * (int(rec["ne0"]) // 128)
+            return _pair_len(rec)
+
+        def adjacent(kind):
+            off_key = {"bcodes": "bc_off", "dpm": "dblk", "pcodes": "pc_off"}[kind]
+            for il in range(d["layers"]):
+                for e in range(d["experts"]):
+                    g = bi["blk.%d.moe_gate.e%d.weight" % (il, e)]
+                    u = bi["blk.%d.moe_up.e%d.weight" % (il, e)]
+                    dn = bi["blk.%d.moe_down.e%d.weight" % (il, e)]
+                    if int(g[off_key]) + span(g, kind) != int(u[off_key]):
+                        return False
+                    if int(u[off_key]) + span(u, kind) != int(dn[off_key]):
+                        return False
+            return True
+
+        check("expert gate/up/down matrices are adjacent in bcodes, dpm and pcodes",
+              adjacent("bcodes") and adjacent("dpm") and adjacent("pcodes"))
         broken = json.loads(json.dumps(bi))
         broken[staged[0]]["pc_off"] += 2                     # the staged form is read as 32-bit words
         refuses("a pcodes offset that is not word-aligned is refused",

@@ -25,6 +25,7 @@ more scales than levels are approximated at all.
 """
 import json
 import os
+import re
 
 import numpy as np
 
@@ -117,6 +118,31 @@ def decode(table, index):
 def block_of(rec):
     """The block offset of a tensor's scales: `dblk` in a v2 record, `dpm_off` at 2 bytes a block in a v1 one."""
     return int(rec["dblk"]) if "dblk" in rec else int(rec["dpm_off"]) // 2
+
+
+_EXPERT_RE = re.compile(r"blk\.(?P<layer>\d+)\.moe_(?P<kind>gate|up|down)\.e(?P<expert>\d+)\.weight$")
+_EXPERT_RANK = {"gate": 0, "up": 1, "down": 2}
+
+
+def tensor_write_order(names, contiguous_experts=True):
+    """Pack write order with each MoE expert's gate/up/down matrices back to back.
+
+    Names that are not expert matrices keep a deterministic lexicographic order and are written before the expert
+    groups. The expert sequence is layer, expert, then gate -> up -> down; this only changes offsets, not the bytes
+    a tensor decodes to. It lets a paged reader treat one expert as one contiguous byte run in bcodes.bin,
+    dpm.bin and (when written) pcodes.bin.
+    """
+    names = list(names)
+    if not contiguous_experts:
+        return sorted(names)
+
+    def key(name):
+        m = _EXPERT_RE.search(name)
+        if m:
+            return (1, int(m.group("layer")), int(m.group("expert")), _EXPERT_RANK[m.group("kind")], name)
+        return (0, name)
+
+    return sorted(names, key=key)
 
 
 def tensor_scales(dp, rec):
@@ -212,6 +238,21 @@ def selftest():
         refused = True
     check("a negative scale is refused, not fitted", refused)
 
+    # expert-first packing: every gate/up/down triple is adjacent, in gate -> up -> down order
+    rough = ["token_embd.weight", "blk.0.moe_down.e1.weight", "blk.0.moe_gate.e1.weight",
+             "blk.0.moe_up.e0.weight", "blk.0.moe_down.e0.weight", "blk.0.moe_gate.e0.weight",
+             "blk.0.moe_up.e1.weight", "blk.1.moe_down.e0.weight", "blk.1.moe_up.e0.weight",
+             "blk.1.moe_gate.e0.weight"]
+    ordered = tensor_write_order(rough)
+    exp_order = ["token_embd.weight", "blk.0.moe_gate.e0.weight", "blk.0.moe_up.e0.weight",
+                 "blk.0.moe_down.e0.weight", "blk.0.moe_gate.e1.weight", "blk.0.moe_up.e1.weight",
+                 "blk.0.moe_down.e1.weight", "blk.1.moe_gate.e0.weight", "blk.1.moe_up.e0.weight",
+                 "blk.1.moe_down.e0.weight"]
+    check("expert matrices are written gate -> up -> down, one expert at a time", ordered == exp_order,
+          ", ".join(ordered[:4]))
+    check("legacy lexicographic order remains available for byte-identical old packs",
+          tensor_write_order(rough, contiguous_experts=False) == sorted(rough))
+
     # the two on-disk formats agree: a v1 pack (fp16 per block) and a v2 pack (8-bit index) load to the same scales
     tmp = tempfile.mkdtemp(prefix="packio-")
     blocks = 4096
@@ -276,7 +317,7 @@ def selftest():
     check("a v2 pack that is shorter than its index says is refused, naming the file", refused)
 
     print("\n%d checks passed" % len(PASS))
-    return 0 if len(PASS) == 9 else 1
+    return 0 if len(PASS) == 11 else 1
 
 
 if __name__ == "__main__":

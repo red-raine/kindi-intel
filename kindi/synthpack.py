@@ -108,7 +108,7 @@ def build(out_dir, seed=7, log=print, **kw):
             open(os.path.join(out_dir, "dpm.bin"), "wb") as fd, \
             open(os.path.join(out_dir, "dscale.bin"), "wb") as ft, open(os.path.join(out_dir, "f32.bin"), "wb") as ff, \
             (open(os.path.join(out_dir, "pcodes.bin"), "wb") if want_pc else contextlib.nullcontext()) as fp:
-        for name in sorted(tern):
+        for name in packio.tensor_write_order(tern):
             a, rows = quant._pad8(np.ascontiguousarray(tern[name], dtype=np.float32))
             codes, sc, deq = quant.quantise(a, 128)
             quantised[name] = deq[:tern[name].shape[0], :tern[name].shape[1]]
@@ -155,7 +155,8 @@ def build(out_dir, seed=7, log=print, **kw):
         f.write("#version: 0.2\n")
     man = {"kindi_version": __version__, "pack_format": 2, "model": "kindi-tiny-fixture", "source_file": "synth",
            "source_sha256": None, "tensors": len(tern) + len(flt), "vocab": vocab, "context_length": 256,
-           "head": "output.weight", "hadamard_block": d["hadamard_block"], "fold": fold, "synthetic": True,
+           "head": "output.weight",           "hadamard_block": d["hadamard_block"], "fold": fold, "synthetic": True,
+           "expert_layout": "gate_up_down_contiguous",
            "rope_scaling": kw.get("rope_scaling"),
            "dimensions": dict({k: d[k] for k in ("layers", "width", "ffn", "heads", "kv_heads", "groups",
                                                  "head_dim", "rope_dim", "state_size", "gdn_inner", "rope_base",

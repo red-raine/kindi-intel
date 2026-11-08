@@ -189,3 +189,12 @@ These are the cross-checks that make the appendix useful rather than decorative.
 - **Symbolic/LUT backbone: no counterpart to reproduce.** Nothing in §G reports an end-task accuracy win on an assistant
   task from a symbolic representation *without* a verifier, and the retrieval experiments we do have point the other
   way. That is why the plan takes the verifier (`P9`) and refuses the backbone (`P8`) rather than the reverse.
+- **Gemini P6b plan: partially confirmed, mostly misattributed.** The layout part is confirmed: an expert-first
+  gate → up → down ordering is written by `packio.tensor_write_order` and the reader can do one positional read
+  when the matrices are adjacent. The rest does not survive contact with this branch: `io_uring`/`O_DIRECT` are
+  Linux-only, `MADV_WILLNEED` was already measured null/negative, and the real Qwen layer-0 fixture remains
+  callback/memcpy-bound (93.52 tok/s paged vs 419.96 resident, tokens identical). The pasted AWP script is not AWP
+  (wrong hook target, no activation covariance, unstructured Wanda threshold, no `Proj_C` constraint), and the
+  proposed neuron permutation does not commute with this engine's Hadamard fold/sign vector. Schackay3's recipe
+  does transfer two lessons — domain-matched calibration and protecting the router/trunk/starved experts — but the
+  artifact is Q2_K/`qwen3next`, not a native kindi ternary source. Keep as reference, not as a conversion path.

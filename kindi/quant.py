@@ -104,6 +104,10 @@ def dequantise(codes, scales, R, C):
     return q * sf.repeat(C // sf.shape[1], axis=1)
 
 
+def is_expert_name(name):
+    return any(s in name for s in (".moe_gate.e", ".moe_up.e", ".moe_down.e"))
+
+
 def is_ternary(name, a):
     """the 2-D weight matrices; norms, biases, conv kernels and the GDN parameters stay float"""
     if a.ndim != 2:
@@ -122,7 +126,7 @@ def _pad8(a):
 
 
 def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, extra=None, scheme="lsq",
-         budget=None, within=0.0):
+         budget=None, within=0.0, paircodes=False):
     """write bcodes.bin / dpm.bin / f32.bin / index.json / bcodes_index.json / kindi_pack.json for a float state dict
 
     `budget` (bytes) spends a size allowance through `kindi.rco`: each tensor's ternary error is measured first, then
@@ -136,7 +140,8 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
     as autotune.json, because with more than one scheme the bytes are not readable without it.
     """
     os.makedirs(out_dir, exist_ok=True)
-    order = sorted(sd)
+    from . import packio
+    order = packio.tensor_write_order(sd)
     tern = [k for k in order if is_ternary(k, sd[k])]
     if not tern:
         raise SystemExit("kindi quant: no 2-D weight matrices in this checkpoint, so there is nothing to ternarise")
@@ -175,6 +180,8 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
     fb = open(os.path.join(out_dir, "bcodes.bin"), "wb")
     fd = open(os.path.join(out_dir, "dpm.bin"), "wb")
     ff = open(os.path.join(out_dir, "f32.bin"), "wb")
+    fp = open(os.path.join(out_dir, "pcodes.bin"), "wb") if paircodes else None
+    pc_off = n_pc = 0
     bc_off = dpm_off = f32_off = 0
     R = C = 0
     for k in order:
@@ -189,6 +196,14 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
             index["tensors"][k] = {"dims": [R0, C0], "type": PTQ1_0, "folded": False, "rows": rows, "ne0": C0,
                                    "bc_off": bc_off, "dpm_off": dpm_off}
             bindex["tensors"][k] = {"bc_off": bc_off, "dpm_off": dpm_off, "rows": rows, "ne0": C0}
+            if fp is not None and is_expert_name(k) and rows % 8 == 0 and C0 % 128 == 0:
+                from .cpu import pair_bytes
+                Wb, Sb = pair_bytes(codes, sc, rows, C0)
+                fp.write(Wb)
+                fp.write(Sb)
+                bindex["tensors"][k]["pc_off"] = pc_off
+                pc_off += len(Wb) + len(Sb)
+                n_pc += 1
             bc_off += n
             dpm_off += sc.shape[0] * rows * 2
             R, C = rows, C0
@@ -200,8 +215,9 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
             f32_off += 4 * f.size
         log("  %-28s %-18s %s" % (k, "ternary" if (k in tern and chosen.get(k, "ternary") == "ternary") else "f32",
                                   tuple(a.shape)))
-    for h in (fb, fd, ff):
-        h.close()
+    for h in (fb, fd, ff, fp):
+        if h is not None:
+            h.close()
     with open(os.path.join(out_dir, "index.json"), "w") as f:
         json.dump(index, f)
     with open(os.path.join(out_dir, "bcodes_index.json"), "w") as f:
@@ -210,11 +226,14 @@ def pack(sd, out_dir, log=print, group=GROUP, name=None, source=None, sha=None, 
            "source_file": os.path.basename(source) if source else None, "source_sha256": sha,
            "tensors": len(order), "ternary_tensors": n_tern, "bcodes_bytes": bc_off, "dpm_bytes": dpm_off,
            "f32_bytes": f32_off,           "quant": {"scheme": scheme, "group": group, "scale": "fp16", "values": [-1, 0, 1]},
-           "hadamard": {"enabled": False}, "dimensions": infer_dims(sd)}
+           "hadamard": {"enabled": False}, "expert_layout": "gate_up_down_contiguous",
+           "dimensions": infer_dims(sd)}
     if picks is not None:
         # the aggregate is in the manifest, the map is in autotune.json: a reader of the manifest learns that this
         # pack is not one scheme, without carrying a thousand-entry table in a header
         man["quant"]["per_tensor"] = dict((s, sum(1 for v in picks.values() if v == s)) for s in sorted(set(picks.values())))
+    if n_pc:
+        man["paircodes"] = {"tensors": n_pc, "bytes": pc_off}
     if extra:
         man.update(extra)
     with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:

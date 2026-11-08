@@ -741,3 +741,101 @@ changing it for prefill-heavy or larger models where SMT may still pay.
 
 **P6 verdict: measured, engine unchanged.** Resident decode already has zero disk reads and zero faults per token;
 the paged reader's read sizes are now measured and its coalescing fix is deferred until a converted MoE pack exists.
+
+## P6 follow-up — contiguous expert layout and one-read staging (2026-11-08)
+
+The deferred layout change is now implemented **and validated against real weights**, but the result is narrower
+than the Gemini plan promised.
+
+**What landed.** `kindi/packio.tensor_write_order` now writes MoE experts as gate -> up -> down triples. It is used
+by `kindi/quant.pack` (the float/QAT path) and `kindi/synthpack`, in `bcodes.bin`, `dpm.bin` and `pcodes.bin`.
+The reader now checks that the three staged matrices are adjacent and, when they are, performs **one positional
+read of the whole staged expert** before copying the three matrices into the resident slots. The reader is still
+on the Python fetch callback; there is no separate I/O thread, and no `io_uring`/`O_DIRECT` (Linux-only) or
+`MADV_WILLNEED` (already measured worse in `appendix.md` §P8). `kindi/quant.pack` also gained `pcodes.bin`
+support, so the real-weight fixture below can exercise the memcpy path rather than the conversion path.
+
+**Selftests.** `packio` now checks the ordering; `cpu` `selftest` checks adjacency of `bcodes.bin`, `dpm.bin` and
+`pcodes.bin`; `quant.selftest` still checks the pack layout round trip. Repository gate: **106 ok, 1 skipped,
+0 failed** (`python -m tools.selftest`). `kindi.moe` bench still passes and still gives the resident tokens for every
+cache size and both packs.
+
+**Real-weight fixture.** There is no tiny MoE GGUF on this host. The real source used is
+`B:/models/scratch/qwen3moe-control-q4.gguf`, which is **Qwen3-Coder-30B-A3B-Instruct** (48 layers, width 2048,
+128 experts, 8 active, expert width 768). `tools/qwen_layer0_pack.py` builds a one-layer kindi pack from layer 0,
+all 128 real expert triples, layer-0 attention, and the first 1,024 rows of the embedding/output tables:
+
+```bash
+python -u tools/qwen_layer0_pack.py B:/models/scratch/qwen3moe-control-q4.gguf B:/models/scratch/qwen-layer0-pack --vocab 1024
+```
+
+- pack: **396 tensors, 384 pair-coded matrices**, 317 MB on scratch (not in git)
+- staged pcodes size per expert: **1,327,104 bytes** (442,368 per matrix)
+- first expert offsets are contiguous in `bcodes.bin` (5,832,704 / 6,225,920 / 6,619,136) and in `pcodes.bin`
+  (0 / 442,368 / 884,736)
+- the fixture's Q4-dequantised weights were re-ternarised with `absmean`; this is **not lossless relative to the
+  GGUF source**, and it is **not a 48-layer model**. Token identity is claimed only between resident and paged
+  uses of the same one-layer fixture.
+
+Measured on the same 10-token prompt, 40 generated tokens, cache 8:
+
+| arm | tok/s | page faults/token | misses/token | steady WS | tokens |
+|---|---:|---:|---:|---:|---|
+| resident | 419.96 | 0.0 | — | 213 MB | [887, 886, ...] |
+| paged, pcodes, one-read | 93.52 | 1774.7 | 2.5 | 223 MB | identical |
+
+Paged bytes per token are about **3.32 MB** (2.5 misses × 1.327 MB). Tokens are **bit-identical** between the
+resident and paged arms. The improvement over the non-contiguous synthetic baseline is not the headline: a
+re-run of the old synthetic fixture now reports 62.66 tok/s and 246 faults/token against the earlier 55.53 tok/s /
+302 faults/token, but those two runs are not interleaved and should not be quoted as a paired result. On the real
+fixture, the one-read path did **not** hide the read behind compute: the binding cost is the callback plus slot
+memcpy at batch 1, not the number of syscalls. A separate I/O thread would move that cost, not remove it, and the
+branch's earlier batch-stream measurement already found streaming 2.3–7× worse because reads contend with compute.
+**No silent claim of disk-overlap: this is bounded by the callback/memcpy path and the B: HDD cache.**
+
+**Reverse-engineering the Schackay3 Qwen3-Next ternary recipe.** The HF model card reports PT2-LLM GPTQ-style
+error-compensating ternary reconstruction for experts plus shared expert, asymmetric group-128, but the artifact
+is still **Q2_K (2.94 bpw)**, not a native 1.58-bit kindi pack. Router, DeltaNet/full attention, embeddings,
+norms and lm_head stayed BF16. Quality is **PPL 5.75 → 8.69 (+51%)** on WikiText2 2048 ctx; size **45.08 → 27.25 GB**;
+speed **16.74 → 23.74 tok/s (+42%)**, and the card explicitly says domain-mismatched WikiText2-only calibration is
+a limitation. Three lessons transfer; the rest does not:
+
+1. **Calibration and protection are the recipe.** Wikitext-only calibration hurt; starved experts were left BF16.
+   That matches this branch's super-expert and router findings: protect the structural trunk, do not spend the same
+   budget everywhere.
+2. **Asymmetric scale+min is the quantization trick.** Q2_K carries scale/min per sub-block and therefore fits the
+   asymmetric ternary values better than a symmetric group-128 format. A native asymmetric group-128 ternary
+   kernel would recover the remaining ~0.9 bpw, but that is a kernel project, not a pack conversion.
+3. **This engine cannot import that artifact as its own ternary source.** It is `qwen3next` (DeltaNet attention), and
+   the branch's converters do not re-encode K-quants. It is a research reference, not a pack in the current
+   tokenizer/model path.
+
+**What was rejected from the Gemini plan, and why.**
+
+- **"1.58-bit lossless ternary pack from a Q4/Q2 source"** is a category error. Dequantising Q4/Q2 yields floats;
+  re-ternarising them is a second lossy step. The only honest claim for the layer-0 fixture is token-identical
+  between layouts of the same packed bytes.
+- **AWP/PGD as pasted** is not AWP. The script hooks layer *outputs*, not per-linear inputs; it repeatedly runs the
+  whole model; it thresholds a flattened Wanda saliency into an unstructured mask; and `AdamW` plus a hard
+  projection is not the activation-covariance PGD of the paper (Algorithm 1 uses `C = (1/n)XX^T`, constraint
+  projection, and a closed-form gradient). A correct experiment is a **ridge/PGD layer reconstruction** with a
+  pre-registered sparsity constraint, gated by paired NLL and P2, not this script.
+- **Hungarian permutation** is misnamed in the plan: `argsort` by activation frequency is not the Hungarian
+  algorithm, and sorting hot neurons first does not by itself save bandwidth because the whole active expert is
+  streamed. Worse, in this engine the expert hidden vector passes through the Hadamard fold and sign vector before
+  `down`; a naive gate/up row permutation and down column permutation does **not** commute with that transform.
+  A valid permutation experiment needs to model the fold explicitly and prove output identity with logits, not
+  just `W2W1 = (W2P^T)(PW1)`.
+- **Spectral entropy as a bit-allocation rule** is unvalidated here. SVD of 18,432 expert matrices (48 layers ×
+  128 experts × 3) plus calibration is expensive, and the card's own gate is P2/NLL — not an entropy threshold. It
+  is a candidate synthesis metric for `tools/rotq` or `tools/expert_merge`, not a gate.
+- **"One IO thread fixes B=8"** is not established. The measured B=8 regression came from reads contending with
+  compute. This follow-up deliberately did **not** add `io_uring` (not available on the Windows host) or
+  `MADV_WILLNEED` (already measured null/negative). A Windows overlapped-I/O thread is possible, but the next
+  measurement must compare it against the callback/memcpy baseline on the real fixture before any engine claim.
+
+**P6 follow-up verdict: layout and one-read staging are shipped; another I/O thread is not.** The contiguous pack
+removes offset jumps and the selftests prove it. The token-identity-preserving gain on the real fixture is
+**format hygiene, not a serving win**: paged decode remains callback/memcpy-bound at batch 1. The next honest
+experiment is to time the callback, slot memcpy, and read separately; only if a read thread beats those together
+does it earn a place in the plan.

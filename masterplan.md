@@ -250,8 +250,22 @@ cache 2): 208,896 bytes an expert raw, 221,184 staged, 6 slices per miss, **expe
 `bcodes.bin`; pcodes staging costs 302 faults/token against 15,711 for conversion staging, tokens identical across
 resident/paged/convert arms. One pread per expert needs a convert-side contiguous layout — deferred until a real
 MoE pack exists to validate it (Qwen arms are GGUF-only on this host). Threads 8 vs 16 on the i9-9980HK:
-10.44 vs 10.36 tok/s, bit-identical tokens, single run each — no measurable difference, default unchanged. See
-`docs/TERNARY-LUT-AND-PAGING-2026.md` ("P6 — the memory side, measured").
+10.44 vs 10.36 tok/s, bit-identical tokens, single run each — no measurable difference, default unchanged.
+
+*Follow-up (2026-11-08, P6b):* **contiguous layout implemented.** `packio.tensor_write_order` writes experts as
+ gate → up → down in `bcodes.bin`, `dpm.bin` and `pcodes.bin`; a positional whole-expert read is used when the
+ three staged matrices are adjacent (Windows `ReadFile` overlapped handle / POSIX `pread`). Repository gate:
+ **106 ok, 1 skipped, 0 failed**. A real-weight one-layer fixture was built from layer 0 of the local
+ Qwen3-Coder 30B GGUF with `tools/qwen_layer0_pack.py` (396 tensors, 384 pair-coded matrices, 317 MB, scratch-only).
+ Cache 8, 40 tokens: resident **419.96 tok/s, 0 faults/token**; paged **93.52 tok/s, 1,774.7 faults/token,
+ 2.5 misses/token, ~3.32 MB/token**, tokens bit-identical. The fixture was re-ternarised from dequantised Q4 weights
+ with `absmean`, so it is **not lossless vs the source GGUF** and is **not a 48-layer model**; the identity claim is
+ only resident-vs-paged on the same pack. The binding cost is the Python fetch callback + slot memcpy at batch 1,
+ not syscall count; `io_uring`/`O_DIRECT` and `MADV_WILLNEED` were not added (wrong OS / already measured worse).
+ The Schackay3 Qwen3-Next artifact is a Q2_K (2.94 bpw) PT2-LLM asymmetric-group-128 conversion with PPL 5.75 → 8.69;
+ its lessons (domain-matched calibration, protect router/trunk) transfer, but the artifact is `qwen3next` + K-quant
+ and cannot be imported as a kindi ternary source today. See `docs/TERNARY-LUT-AND-PAGING-2026.md`
+ ("P6 follow-up").
 
 ### P7 — Exact speculative decoding from an n-gram cache — **~2 days**
 
@@ -394,7 +408,8 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P3 mitigated merge | open, likely kill | compare against prune-at-96, not just the control |
 | P4 ridge router re-fit | open | fit on the 384-token log, gate at 1,275 tokens |
 | P5 1.667 bpw packing | **measured; deferred** | GEMV is issue-bound at ~12–13 GB/s vs a 26.0 GB/s DRAM ceiling; `stream_probe` measures disk, not DRAM. Repacking adds instructions and is not a decode speedup on this evidence |
-| P6 pin hot tensors / merged reads | **measured; engine unchanged** | resident decode is 0 disk reads and 0–1 faults per 40 tokens; paged read sizes now on record (221 KB/expert staged, 6 slices/miss, non-contiguous); one-pread-per-expert deferred until a converted MoE pack exists; threads 8 vs 16 tie at 10.44/10.36 |
+| P6 pin hot tensors / merged reads | **measured** | resident decode is 0 disk reads and 0–1 faults per 40 tokens; threads 8 vs 16 tie at 10.44/10.36; pinning has nothing to fix |
+| P6b contiguous experts + one-read paged staging | **implemented; callback-bound** | gate→up→down adjacency in bcodes/dpm/pcodes, whole-expert positional read when contiguous; real layer-0 Qwen3-Coder fixture: resident 419.96 tok/s, paged 93.52 tok/s @ 2.5 misses/token, tokens bit-identical; no io_uring/MADV_WILLNEED; next test must split callback vs memcpy vs read |
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
 | P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |
 | P10 group rotation before rounding | **measured, parked** | −2.6% weight error mean, +2.1% on experts, sequency exactly inert; no NLL walk run |
