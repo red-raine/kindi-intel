@@ -206,6 +206,13 @@ equality, not approximate equality.
 *Kill:* if the engine is not bandwidth-bound at the thread counts we ship (measure with `stream_probe`), defer — a
 smaller file that is compute-bound buys nothing.
 
+*Result (2026-11-08):* **deferred.** Fresh Bonsai-2B decode profiles gave 20.0–21.1 tokens/s, with GEMV at 80–82% of
+the token and about 12–13 GB/s over the 499,400,704-byte streamed pair-code/scale footprint. That remains below the
+documented 26.0 GB/s DRAM streaming ceiling, and the established working-set sweep is flat from 8 MB to 384 MB, so
+the shipped kernel is issue-bound rather than bandwidth-bound. `stream_probe` measures disk reads (C: 1.63 GB/s in the
+fresh run), not the resident DRAM stream. A 1.667 bpw repack would reduce bytes but add decode instructions; on this
+evidence it is a storage change, not a decode speedup. See `docs/CPU-PERF-2026.md`.
+
 ### P6 — The memory side, where CPU wins actually are — **~1 day**
 
 *Hypothesis:* three measured wins from the research transfer to us: (a) pinning the small always-hot tensors
@@ -374,7 +381,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P2 functional screen | **built, kill property measured** | `tools/funcscreen`: 40 fixed items (20 code + 20 arithmetic), greedy, outputs stored; bonsai-2b 32/40 vs token-shuffled 6/40, paired delta −0.65 [−0.80, −0.50]. **Control-vs-merge64 kill test not run** — arms are GGUF-only on this host; convert both packs and `--compare` |
 | P3 mitigated merge | open, likely kill | compare against prune-at-96, not just the control |
 | P4 ridge router re-fit | open | fit on the 384-token log, gate at 1,275 tokens |
-| P5 1.667 bpw packing | open | measure the roofline with `stream_probe` first |
+| P5 1.667 bpw packing | **measured; deferred** | GEMV is issue-bound at ~12–13 GB/s vs a 26.0 GB/s DRAM ceiling; `stream_probe` measures disk, not DRAM. Repacking adds instructions and is not a decode speedup on this evidence |
 | P6 pin hot tensors / merged reads | open | measure current read size and fault count |
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
 | P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |

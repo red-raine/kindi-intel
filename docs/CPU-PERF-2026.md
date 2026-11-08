@@ -208,6 +208,25 @@ word, so fewer rows per lookup — no net gain. Widening the index beyond 8 entr
 lookup, and it requires the vector-LUT form, which requires N > 1 to pay. So **further N=1 kernel polish has a low
 ceiling**; the multi-token path is where the remaining 2× lives.
 
+## 1.667 bpw packing: deferred, because the decode kernel is not bandwidth-bound
+
+Masterplan P5 proposes storing ternary weights at 1.667 bpw instead of 2.0 bpw. That would be a 16.7% reduction in
+packed weight bytes, but fewer bytes only turn into speed when the kernel is waiting on those bytes. The current
+engine is not: hardware-counter runs show essentially the same GEMV throughput for an 8 MB working set and a
+384 MB working set (18.2 and 19.0 GB/s), against a measured 26.0 GB/s streaming-read ceiling, and the shipped two-
+token kernel gets 1.35x while reading half as many bytes per token. A fresh decode profile on the local Bonsai-2B
+pack on 2026-11-08 gave 20.0–21.1 tokens/s over three 20-token runs, with the GEMV stage at 80–82% of the token and
+about 0.762–0.822 s of GEMV time for the run. The pack’s streamed pair-code and scale files total 499,400,704 bytes,
+so that is roughly 12–13 GB/s of GEMV stream at decode, still below the documented streaming ceiling. `stream_probe`
+was also re-run, but it measures disk reads (C: reported 1.63 GB/s), not the DRAM stream the resident engine uses;
+it therefore does not authorize P5.
+
+A TL2-style 1.667 bpw layout would also add decode work. This kernel already wins by reducing instructions per weight
+word, and the mirror-consolidation A/B showed that about five added uops per word can cost 40–45%. Repacking to fewer
+bytes is therefore the wrong direction for N=1 decode on this CPU. P5 is deferred until a future kernel/profile shows
+the GEMV actually saturating DRAM bandwidth; file-size work can still help storage and disk staging, but it must not
+be sold as a decode speedup on this evidence.
+
 ## What the mirror A/B says about the table
 
 Mirror consolidation was the cheap way to ask whether the 32 KB pair table costs anything. It halves the table and
