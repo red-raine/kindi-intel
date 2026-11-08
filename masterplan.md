@@ -351,7 +351,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 - A gate is a **paired walk** over the same tokens, with a 95% interval from a block bootstrap. A sign is not a result.
 - Never compare deltas across corpora. Every table states its token count; 94-token and 1,275-token deltas are not
   comparable, and the same merge reads +1.40 on one and +1.08 on the other.
-- Never accept on perplexity alone once P2 exists.
+- Never accept on perplexity alone once P2 exists. (P2 built 2026-11-07 as `tools/funcscreen`, kill property measured on bonsai-2b generations; the control-vs-merge64 separation run is still owed, so P2 can reject a *corrupted* arm today and a *merged* arm once its packs are converted.)
 - Every claim in `docs/` names the arm that produced it and the interval. If an interval covers zero, the text says so.
 - Machine-local artifacts (packs, route logs, JSON) live under `B:/models/scratch` and are **not** in git; the JSON
   needed to reproduce a table is quoted in the doc, and the command is in its Reproduce block.
@@ -362,7 +362,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 |---|---|---|
 | P0 protect super experts | **measured** | `--protect`/`--protect-json` in `prune`; guard 0.07% of bytes; 96 identical to unguarded (**+0.0173 [−0.0012, +0.0361]**, marginal); 64 guarded **+0.0914** vs unguarded **+0.0963** on the same tokens — the outlier is 5% of that loss, not its cause |
 | P1 saliency + non-uniform budgets | open | needs P0 and P2 |
-| P2 functional screen | open | wrap `astvalid` around 40 fixed prompts |
+| P2 functional screen | **built, kill property measured** | `tools/funcscreen`: 40 fixed items (20 code + 20 arithmetic), greedy, outputs stored; bonsai-2b 32/40 vs token-shuffled 6/40, paired delta −0.65 [−0.80, −0.50]. **Control-vs-merge64 kill test not run** — arms are GGUF-only on this host; convert both packs and `--compare` |
 | P3 mitigated merge | open, likely kill | compare against prune-at-96, not just the control |
 | P4 ridge router re-fit | open | fit on the 384-token log, gate at 1,275 tokens |
 | P5 1.667 bpw packing | open | measure the roofline with `stream_probe` first |

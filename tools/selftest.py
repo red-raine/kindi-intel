@@ -118,6 +118,7 @@ SUITES = [
     ("suite:refit", [sys.executable, "-m", "kindi.refit", "--selftest"], "checks passed"),
     ("suite:docbatch", [sys.executable, "-m", "tools.expert_merge.docbatch", "--selftest"], "checks passed"),
     ("suite:rotq", [sys.executable, "-m", "tools.rotq.probe", "--selftest"], "checks passed"),
+    ("suite:funcscreen", [sys.executable, "-m", "tools.funcscreen", "--selftest"], "checks passed"),
 ]
 
 
