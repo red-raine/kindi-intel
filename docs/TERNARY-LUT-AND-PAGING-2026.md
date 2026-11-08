@@ -681,3 +681,63 @@ Paging is a batched design and this engine decodes at batch 1.
   fetches 4.4 experts per token at that size. What remains open is a pipeline whose reader does not contend with the
   compute it feeds - a separate I/O engine, or a drive whose uncontended read stays near its 3.7 ms while 16 threads
   of GEMV run. Neither exists here, so the design question stays open rather than answered in streaming's favour.
+
+## P6 — the memory side, measured (2026-11-08)
+
+*Method first, as the plan orders it.* The two claims that matter are what the shipped engine already does, so both
+were measured on the shipped reader, with process counters from `GetProcessMemoryInfo` (total page faults, soft and
+hard together — Windows exposes no per-process hard-fault counter through that API) and `GetProcessIoCounters`
+(explicit read operations — **memory-mapped file reads do not appear in it**, so a zero there is not proof of zero
+disk traffic; the fault count is the honest instrument for the mapped path).
+
+**Resident engine, Bonsai-2B pack.** Batch 1, fixed 64-token prompt, 40 generated tokens, three runs, pack on C:
+(the NVMe at 1.63 GB/s unbuffered from `stream_probe`; B:'s 0.23 GB/s HDD figure above still governs scratch packs).
+
+| | value |
+|---|---|
+| load time | 30.4 s (conversion-CPU dominated; placement moves it by ~2 s on the HDD) |
+| kept arrays after load | 637 MB, of which converted pair codes + fp32 scales 528.8 MB |
+| peak / steady working set | 1.17 GB during load / 667 MB in decode |
+| decode speed (prefill included in each call) | 10.28–10.50 tok/s |
+| disk read operations / bytes in decode | **+0 / +0** in all three runs |
+| page faults in decode | **+0–1 per 40-token run** |
+| bytes streamed per token from RAM | 528.8 MB (every weight, every token — the GEMV stream in `docs/CPU-PERF-2026.md`) |
+| bytes read per token from disk | **0** |
+
+Read granularity at load is one memmap slice per tensor: codes `R*(C/4)` bytes and fp16 scales `R*(C/128)*2`
+bytes, read exactly once, then converted to anonymous arrays the kernel streams from DRAM. There is no per-token
+disk read to coalesce, and total faults at zero bound major faults at zero. The literature's `VirtualLock` win
+(+26%) assumes file-backed weights under eviction pressure; this engine's kept sets are anonymous RAM on a 64 GB
+box, so pinning has nothing to fix. **No pinning, no read-ahead: nothing is left to improve on the resident path.**
+
+**Paged MoE reader** (synthetic fixture: 1024 width, 512 expert width, 12 experts, 2 active, 6 layers, cache 2;
+no converted real MoE pack exists on this host — the Qwen arms are GGUF-only):
+
+| | value |
+|---|---|
+| bytes per expert, raw (codes + fp16 scales) | 208,896 |
+| bytes per expert, staged (pcodes form) | 221,184 |
+| slices/views per miss | 6 (3 matrices × codes+scales), convert path or pcodes path |
+| expert matrices contiguous in `bcodes.bin`? | **no** — offsets 917504, 1708032, 131072 for one expert's gate/up/down |
+| pcodes staging: speed / faults per token / misses per token | 55.5 tok/s / **302** / 13.3 (resident 261.6 tok/s, 0 faults; synthetic sizes, not comparable in absolute terms) |
+| conversion staging: speed / faults per token | 4.5 tok/s / **15,711** — the reason `pcodes.bin` exists |
+| tokens | **identical** across resident, pcodes-paged and conversion-paged (token-identity gate holds) |
+
+One pread per expert would need the pack to store an expert contiguously; today it does not, and coalescing cuts
+syscalls and faults, not bytes (the same 221 KB is read either way). That is a convert-side layout change to be made
+when a real MoE pack exists to validate it against — not before. **Deferred, with the current read sizes now on
+record.**
+
+**Threads = physical cores.** Same Bonsai-2B run, separate processes, i9-9980HK (8C/16T), tokens bit-identical:
+
+| threads | tokens/s |
+|---:|---:|
+| 8 (physical) | 10.44 |
+| 16 (logical, the current default) | 10.36 |
+
+Single run each, so the 0.8% gap is inside the noise this note has been bitten by before — the honest statement is
+**no measurable difference**, not a win for 8. The default stays at the logical count: a tie does not justify
+changing it for prefill-heavy or larger models where SMT may still pay.
+
+**P6 verdict: measured, engine unchanged.** Resident decode already has zero disk reads and zero faults per token;
+the paged reader's read sizes are now measured and its coalescing fix is deferred until a converted MoE pack exists.

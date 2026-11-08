@@ -241,6 +241,18 @@ has since measured at a **3.3 ms** median, which would move them to 4.9% and 47%
 verdict does not turn on it (the read is 64 ms either way), but re-run the budget before committing anything to paging.
 Placement is the first experiment; the rest of this item is after it.
 
+*Result (2026-11-08):* **measured; engine unchanged.** Resident Bonsai-2B decode (64-token prompt, 40 tokens, 3 runs,
+pack on C: NVMe): **0 disk read operations and 0–1 page faults per 40-token run**, 528.8 MB streamed from RAM per
+token, peak working set 1.17 GB at load and 667 MB steady. Total faults at zero bound major faults at zero, so there
+is nothing for `VirtualLock` or read-ahead to improve — the literature's +26% assumes file-backed weights under
+eviction pressure, and this engine's kept sets are anonymous RAM. Paged MoE (synthetic fixture, 12 experts/2 active,
+cache 2): 208,896 bytes an expert raw, 221,184 staged, 6 slices per miss, **expert matrices not contiguous** in
+`bcodes.bin`; pcodes staging costs 302 faults/token against 15,711 for conversion staging, tokens identical across
+resident/paged/convert arms. One pread per expert needs a convert-side contiguous layout — deferred until a real
+MoE pack exists to validate it (Qwen arms are GGUF-only on this host). Threads 8 vs 16 on the i9-9980HK:
+10.44 vs 10.36 tok/s, bit-identical tokens, single run each — no measurable difference, default unchanged. See
+`docs/TERNARY-LUT-AND-PAGING-2026.md` ("P6 — the memory side, measured").
+
 ### P7 — Exact speculative decoding from an n-gram cache — **~2 days**
 
 *Hypothesis:* the only technique in the research with a large, *quality-free* speedup: draft from an n-gram cache over
@@ -382,7 +394,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P3 mitigated merge | open, likely kill | compare against prune-at-96, not just the control |
 | P4 ridge router re-fit | open | fit on the 384-token log, gate at 1,275 tokens |
 | P5 1.667 bpw packing | **measured; deferred** | GEMV is issue-bound at ~12–13 GB/s vs a 26.0 GB/s DRAM ceiling; `stream_probe` measures disk, not DRAM. Repacking adds instructions and is not a decode speedup on this evidence |
-| P6 pin hot tensors / merged reads | open | measure current read size and fault count |
+| P6 pin hot tensors / merged reads | **measured; engine unchanged** | resident decode is 0 disk reads and 0–1 faults per 40 tokens; paged read sizes now on record (221 KB/expert staged, 6 slices/miss, non-contiguous); one-pread-per-expert deferred until a converted MoE pack exists; threads 8 vs 16 tie at 10.44/10.36 |
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
 | P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |
 | P10 group rotation before rounding | **measured, parked** | −2.6% weight error mean, +2.1% on experts, sequency exactly inert; no NLL walk run |
