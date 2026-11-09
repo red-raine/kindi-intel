@@ -29,14 +29,18 @@ def main():
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--device", default="cpu", help="cpu or xpu (torch native XPU, no IPEX needed)")
     a = ap.parse_args()
 
     torch.manual_seed(0)
-    m = MiniMinion(vocab=32000, d=512, layers=8, heads=8, hidden=1408)
+    dev = a.device
+    if dev == "xpu" and not torch.xpu.is_available():
+        print("XPU not available; falling back to cpu"); dev = "cpu"
+    m = MiniMinion(vocab=32000, d=512, layers=8, heads=8, hidden=1408).to(dev)
     n = m.num_parameters()
     opt = adamw_from_model(m)
-    x = torch.randint(0, 32000, (a.batch, a.seq))
-    y = torch.randint(0, 32000, (a.batch, a.seq))
+    x = torch.randint(0, 32000, (a.batch, a.seq), device=dev)
+    y = torch.randint(0, 32000, (a.batch, a.seq), device=dev)
 
     losses = []
     t0 = time.time()
@@ -49,7 +53,7 @@ def main():
         losses.append(float(loss))
     dt = time.time() - t0
     tps = a.steps * a.batch * a.seq / dt
-    print(f"params: {n/1e6:.1f}M  device: cpu  tok/s: {tps:.1f}")
+    print(f"params: {n/1e6:.1f}M  device: {dev}  tok/s: {tps:.1f}")
     print(f"loss first/last: {losses[0]:.3f} -> {losses[-1]:.3f}")
     for name, tokens in BUDGETS:
         print(f"  {name}: {tokens:.1e} tokens -> {tokens/tps/3.15e7:.2f} years at this rate")

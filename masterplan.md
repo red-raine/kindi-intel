@@ -397,9 +397,16 @@ proxy to a result.
   RMSNorm-before-BitLinear, per-group weight-decay AdamW) with a smoke test: 58.5M params, 483 tok/s on
   CPU, loss 10.49 → 8.84 over 20 steps. Token-budget extrapolation at that rate: 1.35B tokens ≈ 32 days,
   9.9B ≈ 0.65 years, 4T ≈ 263 years — a framework for small GPU experiments (50M class), not a plan for
-  a competitive ternary 0.5B on CPU. A GPU-enabled node (the Arc B-series box `sol`, verified reachable
+  a competitive ternary 0.5B on CPU.  A GPU-enabled node (the Arc B-series box `sol`, verified reachable
   key-only 2026-11-08) changes the constants but not the scaling conclusion below 3B. HumanEval remains
   eval-only in that harness.
+  **Cluster inventory (verified 2026-11-08, key-only SSH):** `sol` — 8 cores, 125 GB RAM, **Arc Pro B50**
+  (Battlemage workstation class, 20 GB) + Arrow Lake-U iGPU, NPU accel node, OpenVINO 2026.4.1 enumerating
+  `['CPU', 'GPU.0', 'GPU.1', 'NPU']`, Level Zero + `xe` driver present — so native torch XPU (no IPEX)
+  can target the dGPU. `nyx` — 16 cores, 58 GB, Arrow Lake-P iGPU, torch 2.14 CPU-only. Torch-XPU install
+  on sol was in progress at the close of this session (pytorch.org CDN throttled to ~40 KB/s from this
+  network; no mirror carries the XPU wheel) — the 58M smoke test on the B50 is the next command and it
+  replaces every projection in this file with a measured tok/s.
 - **Not** retrieval or graph front-ends as a reliability upgrade for a small model: with **oracle** retrieval, models
   ≤7B failed 85–100% of questions they could not answer alone, and retrieval destroyed 42–100% of previously correct
   answers. It is a prompt-budget cost, not a capability.
