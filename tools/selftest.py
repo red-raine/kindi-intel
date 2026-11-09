@@ -119,6 +119,7 @@ SUITES = [
     ("suite:docbatch", [sys.executable, "-m", "tools.expert_merge.docbatch", "--selftest"], "checks passed"),
     ("suite:rotq", [sys.executable, "-m", "tools.rotq.probe", "--selftest"], "checks passed"),
     ("suite:funcscreen", [sys.executable, "-m", "tools.funcscreen", "--selftest"], "checks passed"),
+    ("suite:routerfit", [sys.executable, "-m", "tools.expert_merge.routerfit", "--selftest"], "checks passed"),
 ]
 
 

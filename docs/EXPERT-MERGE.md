@@ -262,6 +262,46 @@ this does not settle is how much of the 0.128 is that duplication penalty and ho
 information; separating those needs a 128-row router re-fitted against the merged stacks rather than copied, which
 would be a fine-tune, not a rewrite.
 
+## Can a re-fitted router beat the pooled one? (P4, routing fidelity, 384 tokens)
+
+Pooling a group's rows is forced by the merge, not estimated by it: one stack, one row. `P4` asked whether a 64-row
+router *fitted* to the teacher's routing does better than that pool. That was priced before any pack was written,
+because the answer decides whether a 1,275-token walk is worth its 1.5 h: `tools/expert_merge/routerfit.py` fits, per
+layer, the anchored ridge map
+
+    argmin_W  || (x W^T) − (log p_64 − L_pool) ||² + λ ||W||² ,   prediction = L_pool + x W^T
+
+where `p_64` is the teacher's 128-way distribution summed inside each group and `L_pool` is what the shipped pooled
+router scores (a routing-mass-weighted mean of member logits). The anchor is the point: at λ→∞ the arm *is* the pooled
+router, so the measurement can only say how far a re-fit improves on it, never how much a bad regulariser hurts.
+Fitted on three of the four logged documents and scored on the fourth, all four folds, λ chosen per fold on that
+fold's held-out tokens (`λ = 0.1 × trace(XᵀX)/d` won every fold):
+
+| arm | KL(teacher grouped routing ‖ arm), nats |
+|---|---:|
+| pooled (the shipped merged router) | 0.0723 |
+| **anchored ridge re-fit, 64 rows a layer** | **0.0311** |
+| paired difference, ridge − pooled | **−0.0412** |
+| 95% interval, moving-block bootstrap | −0.0428..−0.0396 |
+
+Per fold the direction is identical and the sizes are close: 0.0784→0.0289, 0.0695→0.0283, 0.0733→0.0352,
+0.0679→0.0320. The pairing is 18,432 token-layer observations (384 tokens × 48 layers), and the interval excludes zero,
+so this is a resolved result on the routing distribution: **a closed-form re-fit of 64 rows per layer on 384 tokens
+recovers a little over half of the pooled router's divergence from the teacher**, at 64×2,048 parameters a layer
+fitted from 288 held-in tokens.
+
+The same fit *without* the anchor is **worse than pooling**: +0.0520 [+0.0488, +0.0552], same folds, same tokens. That
+is worth stating because it is the difference between a measurement and a misreading: an unanchored ridge is free to
+depart from the shipped router in directions the log cannot constrain, and on this sample it does. A re-fit is only
+interesting as a correction *to* the pool, not as a replacement for it.
+
+What this is not: an NLL result. The 1,275-token paired walk has **not** been run. That gate needs the fitted rows
+written into the merged pack (`routerfit --emit` writes them: `rows (48, 64, 2048)`, `xm`, `rm`, `gids` at λ = 0.1,
+fitted on all 384 logged tokens at the λ the folds picked), and then a three-arm walk — control, pooled-router merged,
+fitted-router merged — on five documents. Until that runs, the finding is that routing has **headroom**, not that it
+buys nats of NLL: the routing half of the merge is at most +0.17, and 55% of a KL that small is not obviously 0.1 nats
+of likelihood.
+
 ## What this does not establish
 
 - **The attribution is a budget, not two exact fractions.** The router half is +0.1277 with an interval crossing zero;
