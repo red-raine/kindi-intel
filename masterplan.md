@@ -387,6 +387,12 @@ proxy to a result.
   What *does* transfer from CAT-Q / ScaleQ-1.58 (ICML 2026 oral, arXiv 2606.26650 / 2608.01078) is the
   calibration-domain finding — quantising against web text collapses reasoning tasks, quantising against the
   model's own CoT traces does not — which is why P2's functional screen, not PPL, is the gate.
+- **Not** a native BitNet b1.58 from-scratch "Mini-Minion": measured locally, this CPU does ~195 tok/s on a
+  0.5B fp32 forward+backward (no attention/optimizer), so the 4T-token recipe behind Microsoft's 2B native
+  ternary model is ~650 years here and even a 9.9B-token hobbyist budget is ~1.6 years; the published
+  evidence (BitNet b1.58, JMLR 2025; "Reloaded", arXiv 2407.09527) also shows parity with fp16 only from
+  3B at equal tokens, and HumanEval is an eval set (training on it is contamination). Native ternary is a
+  data/compute campaign, not a converter feature; its output already exists as a downloadable GGUF.
 - **Not** retrieval or graph front-ends as a reliability upgrade for a small model: with **oracle** retrieval, models
   ≤7B failed 85–100% of questions they could not answer alone, and retrieval destroyed 42–100% of previously correct
   answers. It is a prompt-budget cost, not a capability.
