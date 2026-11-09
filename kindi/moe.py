@@ -53,7 +53,17 @@ def silu(x):
 
 
 def ref_ffn(x, t, il, dims, hb):
-    """t: quantised tensors of the fixture. Returns (out, selected experts, weights)."""
+    """The reference block - the engine's arithmetic on the same bytes.
+
+    `t` must carry the weights AS THE ENGINE READS THEM. The engine never sees the fixture's float tensors: it
+    reads ternary codes plus scales from bcodes/dpm and dequantises. A float reference would conflate the
+    kernel with the fixture's ternarisation error (observed: 6.03e-04 worst on `kindi moe-check`, present on
+    scalar and AVX2 tiers bit-for-bit, matching exactly the one expert matrix whose Gaussian weights sit
+    near half-scale points and re-encode with error through the pack's 8-bit scale table). `run()` passes the
+    weights re-read from the pack, so the check measures rounding/summation order alone (the fp32 associativity
+    floor, ~1e-7, now 5.82e-07), not scale error. Passing a raw float dict is the mojibake path: swizzled scale
+    space makes ternary-quantised f16 scales wrong if taken as float.
+    """
     p = "blk.%d." % il
     D = dims["width"]
     xp = rmsfold(x, t[p + "post_attention_norm.weight"], t["signs_%d" % D], hb)
@@ -80,8 +90,27 @@ def run(a, log=print):
     pack, tens, floats = synthpack.build(tmp, log=lambda *x: None, width=dims["width"], ffn=dims["ffn"],
                                          layers=dims["layers"], experts=dims["experts"],
                                          experts_active=dims["experts_active"])
+    # NOTE: `tens` here is the *quantised* effective weight dict `synthpack.build` returns (codes x scales),
+    # exactly what the engine dequantises. `floats` only carries the tensors that stay f32 (norms, signs).
     t = dict(floats)
     t.update(tens)
+    # The check must compare the C kernel against the weights the ENGINE reads, not against the floats the fixture
+    # was sampled from: the pack re-derives scales through the 8-bit level table, and a handful of weight groups
+    # land between table levels (rel error up to ~6e-4). `tens` holds the pre-table floats, so the reference using
+    # them mixed up quantisation error with arithmetic. Re-read the effective weights from bcodes/dpm instead.
+    from . import packio as _packio, quant as _quant
+    import json as _json
+    _bi = _json.load(open(os.path.join(pack, "bcodes_index.json")))["tensors"]
+    _dp = _packio.load_scales(pack)
+    _bc = np.memmap(os.path.join(pack, "bcodes.bin"), dtype=np.uint8, mode="r")
+    for _n in list(tens):
+        if _n in _bi:
+            _rec = _bi[_n]
+            _R, _C = int(_rec["rows"]), int(_rec["ne0"])
+            _codes = np.asarray(_bc[_rec["bc_off"]:_rec["bc_off"] + _R * (_C // 4)]).reshape(_C // 4, _R)
+            _scales = np.asarray(_packio.tensor_scales(_dp, _rec)).reshape(_C // 128, _R)
+            _W = _quant.dequantise(_codes, _scales, _R, _C).astype(np.float32)
+            t[_n] = _W[:tens[_n].shape[0], :tens[_n].shape[1]]
     for w in (dims["width"], dims["ffn"] // 2, dims["ffn"]):
         f = os.path.join(pack, "signs_%d.f32" % w)
         if os.path.exists(f) and "signs_%d" % w not in t:
