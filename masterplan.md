@@ -260,12 +260,35 @@ MoE pack exists to validate it (Qwen arms are GGUF-only on this host). Threads 8
  Cache 8, 40 tokens: resident **419.96 tok/s, 0 faults/token**; paged **93.52 tok/s, 1,774.7 faults/token,
  2.5 misses/token, ~3.32 MB/token**, tokens bit-identical. The fixture was re-ternarised from dequantised Q4 weights
  with `absmean`, so it is **not lossless vs the source GGUF** and is **not a 48-layer model**; the identity claim is
- only resident-vs-paged on the same pack. The binding cost is the Python fetch callback + slot memcpy at batch 1,
- not syscall count; `io_uring`/`O_DIRECT` and `MADV_WILLNEED` were not added (wrong OS / already measured worse).
- The Schackay3 Qwen3-Next artifact is a Q2_K (2.94 bpw) PT2-LLM asymmetric-group-128 conversion with PPL 5.75 → 8.69;
- its lessons (domain-matched calibration, protect router/trunk) transfer, but the artifact is `qwen3next` + K-quant
- and cannot be imported as a kindi ternary source today. See `docs/TERNARY-LUT-AND-PAGING-2026.md`
- ("P6 follow-up").
+ only resident-vs-paged on the same pack. `tools/paged_cost.py` splits the per-miss cost further: read 1.537 ms,
+ slot memcpy 0.123 ms, callback 0.0007 ms — **reads dominate**, not the callback (which also had a threading bug:
+ it fired from every OpenMP thread, 1,280 calls per 10 tokens; fixed to `#pragma omp single`, tokens identical,
+ paged 114.56 tok/s). `io_uring`/`O_DIRECT` and `MADV_WILLNEED` were not added (wrong OS / already measured
+ worse); a Windows overlapped-I/O thread would only hide a cost the reads themselves are, so it stays unbuilt.
+ `kindi moe-check` fails at HEAD with the same numbers as before the change (worst rel 6.03e-04, tolerance 1e-4) —
+ pre-existing, unrelated to paging; the threshold is not being relaxed silently. The Schackay3 Qwen3-Next artifact
+ is a Q2_K (2.94 bpw) PT2-LLM asymmetric-group-128 conversion with PPL 5.75 → 8.69; its lessons (domain-matched
+ calibration, protect router/trunk) transfer, but the artifact is `qwen3next` + K-quant and cannot be imported as
+ a kindi ternary source today. See `docs/TERNARY-LUT-AND-PAGING-2026.md` ("P6 follow-up").
+
+*The ternary-export research verdict (2026-11-08, PTERA):* the pasted proposal's four pillars are built on
+misreadings, and one was measured and killed here. **(1) AWP:** the actual paper (arXiv 2506.10205, MERL) is
+projected gradient descent with the activation covariance C as a *preconditioner* — it exists precisely to avoid
+Hessian inverses; the `(X^T X + λI)^{-1}` the proposal insists on is GPTQ/OBS, a different method, and AWP
+targets sparsity/INT4, not ternary. **(2) Ridge reconstruction measured:** `tools/awp_ridge/probe.py` hooks the
+true per-linear inputs straight out of the C engine's scratch (not layer outputs), forms C = X^T X + λI with
+relative damping, does the OBS-style projection (pruned coordinates to zero, survivors move by H^{-1}), then
+ternarises. On three real Qwen3-Coder gate matrices (256 true inputs each): naive absmean output error
+0.306–0.313; Wanda-flat-then-ternarise identical (the ternariser already zeroes those weights); **ridge-project
+then ternarise 0.557–0.583 — worse on every expert**. Compensation moves survivors off the ternary grid, and
+re-ternarising costs more than the projection buys. **(3) QAD/BitDistill:** the real paper (arXiv 2510.13998,
+Microsoft) is a three-stage *training* campaign (SubLN insertion, continual pre-training, logits+attention
+KD) validated on Qwen/Gemma ≤4B for *task* parity after distillation — it is not a lossless converter, and
+it needs GPU training this branch does not have; deferred with that kill criterion. **(4) SLQ:** IST-DASLab's
+own numbers put the task-lossless floor at **3.3 bits** and distribution-lossless at 5–6 bits — no published
+method claims lossless 1.58-bit PTQ, and DeltaPQ is a similarity-search index codec, not a weight packing.
+What transfers to this branch instead is what it already ships: calibration-aware scale search (lsq/gsq), and
+mixed-precision budgeting (`kindi.rco`).
 
 ### P7 — Exact speculative decoding from an n-gram cache — **~2 days**
 
@@ -409,7 +432,9 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P4 ridge router re-fit | open | fit on the 384-token log, gate at 1,275 tokens |
 | P5 1.667 bpw packing | **measured; deferred** | GEMV is issue-bound at ~12–13 GB/s vs a 26.0 GB/s DRAM ceiling; `stream_probe` measures disk, not DRAM. Repacking adds instructions and is not a decode speedup on this evidence |
 | P6 pin hot tensors / merged reads | **measured** | resident decode is 0 disk reads and 0–1 faults per 40 tokens; threads 8 vs 16 tie at 10.44/10.36; pinning has nothing to fix |
-| P6b contiguous experts + one-read paged staging | **implemented; callback-bound** | gate→up→down adjacency in bcodes/dpm/pcodes, whole-expert positional read when contiguous; real layer-0 Qwen3-Coder fixture: resident 419.96 tok/s, paged 93.52 tok/s @ 2.5 misses/token, tokens bit-identical; no io_uring/MADV_WILLNEED; next test must split callback vs memcpy vs read |
+| P6b contiguous experts + one-read paged staging | **implemented; callback-bound** | gate→up→down adjacency in bcodes/dpm/pcodes, whole-expert positional read when contiguous; real layer-0 Qwen3-Coder fixture: resident 419.96 tok/s, paged 93.52 tok/s @ 2.5 misses/token, tokens bit-identical; no io_uring/MADV_WILLNEED |
+| P6c cost split (callback/read/memcpy) | **measured: reads dominate** | `tools/paged_cost.py` on the real fixture, 40 tokens: 2.5 misses/token × 1.66 ms read+memcpy per miss; read 1.537 ms, memcpy 0.123 ms, callback 0.0007 ms; callback path also had a threading bug (fetch fired per-thread, 1,280 calls for 10 tokens) — fixed to `#pragma omp single`; tokens bit-identical, paged 114.56 tok/s after. **However:** `kindi moe-check` now FAILS (worst rel 6.03e-04 vs cached tolerance 1e-4) — unchanged numbers before/after the change; treat as a pre-existing tolerance hold, do not relax the threshold without a registered reason. **No overlapped-I/O thread is built**: the split says the read *is* the cost, so hiding it needs a kernel-side iteration register/prefetch, which is not justified while paging is off by default |
+| Ternary-export research (AWP/QAD/SLQ/DeltaPQ) | **measured; PTQ ridge rejected, QAD infeasible here** | `tools/awp_ridge/probe.py` on true gate inputs of the real fixture (256 tokens, 3 experts): naive absmean output error 0.306–0.313; Wanda-flat then ternarise identical 0.306–0.313 (the ternariser already zeroes those); **ridge-project then ternarise 0.557–0.583 — worse on every expert**. True AWP (arXiv 2506.10205) has no covariance inverse at all: PGD with C as preconditioner, and it targets sparsity/INT4, not ternary. QAD/BitDistill (2510.13998) is a GPU training campaign on ≤4B models with task-metric parity, not lossless conversion; not feasible for a 30B MoE on this CPU-only host. SLQ's own floor is 3.3 bits task-lossless. See appendix §F |
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
 | P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |
 | P10 group rotation before rounding | **measured, parked** | −2.6% weight error mean, +2.1% on experts, sequency exactly inert; no NLL walk run |
