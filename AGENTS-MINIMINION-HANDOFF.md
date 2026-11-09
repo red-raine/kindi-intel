@@ -2,9 +2,16 @@
 
 This file is the written handoff for Antigravity to pick up MiniMinion and/or a MiniMinion-derived sidecar script. It is intentionally concrete: tasks, artifacts, gate, and the contract the sidecar must satisfy so the main works stays the main works.
 
-## Context, in one paragraph
+## Where MiniMinion lives (measured from this box)
 
-We are porting an Intel-CPU-first kindi engine (the `freebuff/i-am-making-a-branch-of-this-to-support-intel-cpu` branch) to also run well on a 9th-gen i9 and now also on an Arc B50 desktop. Today we have:
+MiniMinion is **not** a theoretical target. I can see it directly on the same local Gitea instance this repo pushes to:
+
+- Gitea instance: `http://192.168.8.217:3005` (reachable from here via HTTP; `localhost:3005` is **not** reachable from this process)
+- MiniMinion repo: `antigravity-crystal-eyes/mini-minion-0` — API `GET /api/v1/repos/antigravity-crystal-eyes/mini-minion-0` returns `200`; repo id `31`, owner `antigravity-crystal-eyes`, language Python, default branch `master`, updated `2026-11-08T21:40:51Z`.
+- MiniMinion UI: `http://192.168.8.217:3005/antigravity-crystal-eyes/mini-minion-0` returns `200`, title `antigravity-crystal-eyes/mini-minion-0: Zero-Token Autonomous Agent Swarm OS with PseudoDAG IR, Hermes Multi-Agent Frames & Swimba Polymorphic MoE Engine`.
+- NanoResearch repo: `opencode/NanoResearch` — API `GET /api/v1/repos/opencode/NanoResearch` returns `200`; repo id `13`, owner `opencode`, MIT, Python, default branch `main`, description `Mirror of OpenRaiser/NanoResearch (MIT) - autonomous research generation engine; integrated with jitral-scientest verifier`.
+
+I also pulled the mini-minion-0 archive from `http://192.168.8.217:3005/antigravity-crystal-eyes/mini-minion-0/archive/refs/heads/master.zip` (6,728,585 bytes, zip ok) and read enough of it to know the repo has skills under `.agents/skills/` including `mini-minion-sidecar`, `ai-science-lab`, `auto-research-in-sleep`, `autoresearch-mini-minion`, plus an `AGENTS.md`, `MANIFEST.md`, `README.md`, `minion/` tree, a `minion_harvest_config.yaml`, and docker/cloud run support. So MiniMinion and NanoResearch are local and reachable; the handoff below is written for them to pick up, not for a repo I cannot see. Today we have:
 - a real measured token rate on sol: **B50 on `torch.xpu` gives 3968.4 tok/s on a 58.5M MiniMinion harness**, loss 10.486 → 9.263 in 20 steps;
 - a working local bitnet smoke harness under `tools/bitnet_qat/` (a small native ternary training smoke, not a full trainer yet);
 - the existing MoE prune/merge tools under `tools/expert_merge/`, with P0/P1 already gated (prune-112 certified lossless on 1,785 held-out tokens);
@@ -14,7 +21,20 @@ The next phase is: keep the pipeline moving toward **near-lossless or lossless**
 
 ## What MiniMinion already brings (use it)
 
-MiniMinion is described as having an unusually large set of optimization abilities: training loops, distillation loops, router/Fisher/expert merge helpers, hypothesis-experiment loops, and the ability to be uploaded as a small sidecar alongside a Colab/Modal/Paperspace script. Use that. Specifically:
+MiniMinion is **not merely a sidecar wrapper**. From the repo I pulled, it already has:
+
+- a `mini-minion-sidecar` skill that is explicitly framed as a universal sidecar/debugger/Wayward DAG generator/autonomous science lab for Antigravity, Claude Code, OpenCode, Freebuff, Poolside, ZCode, and GSD;
+- an `ai-science-lab` skill with a 4-stage experiment protocol (pre-registration → 4-rung ablation → statistical check → OpsML packaging), Bootstrap/Welch statistical checks, and AI architecture history from GOFAI through BitNet b1.58 / Mamba / BitMamba;
+- an `auto-research-in-sleep` skill plus the NanoResearch mirror (`opencode/NanoResearch`) as the autonomous research generation engine paired with a `jitral-scientest` verifier;
+- a zero-token doctrine via `CostGuard.assert_zero_tokens()`, LiteLLM cluster routing across `sol`/`nyx`/`desktop`, and a `minion_harvest_config.yaml` with provider + cluster routing.
+
+So when I say "use MiniMinion", I mean: anchor on the repo’s existing skills and contracts instead of inventing a new research-lab shape from scratch. The sidecar I ask for should plug into the existing `mini-minion-sidecar` / `ai-science-lab` shape where possible.
+
+Concrete abilities to use from what I saw:
+
+- **Distillation logic.** The repo’s own phase/benchmark scripts already include distillation-shaped entries (`scripts/run_poolside_20epoch_distill.py` and the longer discovery/benchmark phases). Use that as the local hint that MiniMinion can own distillation loops; keep the clean skeleton you pasted (freeze teacher, STE through the student’s BitLinear backward, `temp**2` scaling, `clip_grad_norm`, blended KL+CE) as the starting point, but gate it on the same paired-NLL + P2 language, run it on the actual target tier before committing to scale, and treat it as an experimental recovery layer, not a replacement for the lossless import pipeline.
+- **MoE expert compression logic.** The repo already speaks MoE (Swimba Polymorphic MoE Engine, Zipfian tiering, Arc hardware). Use that as the home for the Fisher-weighted expert merge, routing-aware sparsification, and token-bypass/early-exit ideas — each as its own gated experiment, not one big bundle.
+- **Hypothesis-experiment loops.** MiniMinion already has an `ai-science-lab` skill and an `auto-research-in-sleep` skill; the handoff should route through them. The same paired-NLL gate discipline this branch already uses for MoE pruning should extend to the other ideas below instead of inventing a new verdict language.
 
 - **Distillation logic:** temperature-scaled KL + hard CE with a freeze-the-teacher + STE-through-the-student pattern (the `execute_ternary_distillation` shape in the pasted QAD loop is the right skeleton; keep the freeze, the `temp**2` scale, `clip_grad_norm`, and the STE hook on the student's BitLinear backward).
 - **MoE expert compression logic:** activation profiling + pairwise similarity + Fisher-weighted fusion + router logit summation + physical shrink path (the pasted Experiment 2 skeleton is the right one; keep the FIM-diag accumulation only on the expert under test to control VRAM).
@@ -34,7 +54,7 @@ Do not have MiniMinion re-open these as if they were still live options:
 
 ### 1. Sidecar contract (the uploadable thing)
 
-MiniMinion should produce **one small sidecar** that travels with the cloud script and can be dropped into Colab/Modal/Paperspace with minimal glue. The sidecar must:
+MiniMinion should produce or refine **one small sidecar** that travels with the cloud script and can be dropped into Colab/Modal/Paperspace with minimal glue. Prefer building on top of the repo’s existing `mini-minion-sidecar` skill rather than inventing a fresh one. The sidecar must:
 
 - run headless, accept a small config (device, checkpoint_dir, run_id, artifact_prefix, max_wallclock_seconds, resume_from);
 - checkpoint often and resume from the latest checkpoint deterministically;
@@ -91,6 +111,10 @@ At the end of any research burst, MiniMinion should leave:
 - a short status summary (what ran, what gated, what is still open, what failed to run and why);
 - the artifacts with the smallest useful JSON summaries checked into the repo and the large ones left in scratch with pointers;
 - a written note of any decision that should change the cluster plan (for example: “sidecar now works on Colab; first long run should go there”).
+
+For NanoResearch specifically: treat it as the long-running autonomous research loop, with jitral-scientest as the verifier gate, and feed it the same hypothesis/experiment/interval/tok-count format this branch uses so its output is comparable to the prune/merge verdicts.
+
+When Antigravity picks this up, the expected first move is: build or refine the sidecar contract above, verify it runs headless on at least one tier, and then farm parallel gated experiments out to sol / nyx / Colab / Modal / Paperspace while the human keeps orchestrating. MiniMinion is the worker lab; this handoff is the lab notebook + the contract for the uploadable sidecar.
 
 ## Handoff end state
 
