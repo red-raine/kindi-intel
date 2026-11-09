@@ -11,11 +11,11 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch
+import torch; torch.serialization.add_safe_globals([int, float])
 
-from tools.bitnet_qat.model import MiniMinion, adamw_from_model
+from bitnet_qat.model import MiniMinion, adamw_from_model
 
 BUDGETS = [
     ("small-SLM parity budget (BitNet b1.58 Reloaded, 6–48M models)", 1.35e9),
