@@ -393,6 +393,13 @@ proxy to a result.
   evidence (BitNet b1.58, JMLR 2025; "Reloaded", arXiv 2407.09527) also shows parity with fp16 only from
   3B at equal tokens, and HumanEval is an eval set (training on it is contamination). Native ternary is a
   data/compute campaign, not a converter feature; its output already exists as a downloadable GGUF.
+  A minimal research harness exists at `tools/bitnet_qat/` (`MiniMinion`, BitLinear + STE, SwiGLU,
+  RMSNorm-before-BitLinear, per-group weight-decay AdamW) with a smoke test: 58.5M params, 483 tok/s on
+  CPU, loss 10.49 → 8.84 over 20 steps. Token-budget extrapolation at that rate: 1.35B tokens ≈ 32 days,
+  9.9B ≈ 0.65 years, 4T ≈ 263 years — a framework for small GPU experiments (50M class), not a plan for
+  a competitive ternary 0.5B on CPU. A GPU-enabled node (the Arc B-series box `sol`, verified reachable
+  key-only 2026-11-08) changes the constants but not the scaling conclusion below 3B. HumanEval remains
+  eval-only in that harness.
 - **Not** retrieval or graph front-ends as a reliability upgrade for a small model: with **oracle** retrieval, models
   ≤7B failed 85–100% of questions they could not answer alone, and retrieval destroyed 42–100% of previously correct
   answers. It is a prompt-budget cost, not a capability.
