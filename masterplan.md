@@ -378,6 +378,15 @@ proxy to a result.
 - **Not** `madvise(WILLNEED)` as a page-cache warmer: measured 0% in two independent harnesses, slightly negative in one.
 - **Not** KV eviction as a latency play: measured 1.34× decode at TP=1 but prefill **0.58×**, and 0.69× at TP=2; at our
   context sizes the weight stream dominates anyway. Use KV quantisation (Q8_0 is free in quality) for *capacity* only.
+- **Not** CAT-Q's mean-shifted ternary grid, and **not** SCALE-uG residuals: both need a per-group *shift* term
+  or an extra scale the kindi pack format does not have (one fp16 scale per 128-group, no shift). Measured
+  (`tools/awp_ridge/catq_probe.py`, true gate inputs from the C engine, FP32 GGUF weights, 256 inputs × 3
+  experts): absmean 0.51–0.60, lsq 0.43–0.49, gsq 0.43–0.49, threshold scan 0.51–0.60, numpy-scale CAT-Q
+  LM+ST replication **1.08–1.15 — worse than every arm it was measured against**. lsq and gsq already ship and
+  tie each other ~15–18% below absmean; threshold is not the lever (scale is, and we already search it).
+  What *does* transfer from CAT-Q / ScaleQ-1.58 (ICML 2026 oral, arXiv 2606.26650 / 2608.01078) is the
+  calibration-domain finding — quantising against web text collapses reasoning tasks, quantising against the
+  model's own CoT traces does not — which is why P2's functional screen, not PPL, is the gate.
 - **Not** retrieval or graph front-ends as a reliability upgrade for a small model: with **oracle** retrieval, models
   ≤7B failed 85–100% of questions they could not answer alone, and retrieval destroyed 42–100% of previously correct
   answers. It is a prompt-budget cost, not a capability.
