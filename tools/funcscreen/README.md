@@ -46,7 +46,20 @@ python -m tools.funcscreen --selftest
   the result through `Engine`. **It is a lossy 2-bit re-quantisation of a Q4_0 source, not an import** — the manifest
   records `requant_mse` — so the screen's two arms are both damaged by the same quantiser and the comparison is still
   paired, but nothing may be called lossless about it. If both arms floor to ~0/40 the screen has told us the
-  re-quantisation is what broke the model, and that is a result to report, not a failure to hide. Command once a pack exists: the two `--pack` runs, then
+  re-quantisation is what broke the model, and that is a result to report, not a failure to hide.
+
+### The control arm now exists (2026-11-10)
+
+`B:/models/scratch/kindi-qwen3moe-control-absmean` is the full **48-layer, 128-expert x 8-active** control pack built
+from `qwen3moe-control-q4.gguf`: **8.11 GB**, 18,432 pair-coded matrices, `requant_mse` **1.2e-4** over
+30,531,911,680 weights, written in **2,401 s**. The scale scheme is `absmean`, and that is a measured choice rather
+than a default: `lsq` costs 0.62 s per expert matrix (3.2 h for this model) against 0.03 s, and the two arms of a
+screen must share one scheme or their difference is partly the quantiser.
+
+The engine loads it (`kindi.cpu.Engine`, AVX2 tier bit-exact against scalar, 16 threads, 491 s to load 8 GB from
+disk) and greedily decodes two tokens in 0.5 s at ctx 64. What that establishes is plumbing: a real 30B MoE is now a
+pack this engine serves. **The 40 items have not been run on it, and no arm has been packed yet** - so the screen is
+still a capable gate rather than a proven one on these arms. Command once a pack exists: the two `--pack` runs, then
   `--compare`. Until that run exists, every
   lossless claim in this repo is still a likelihood claim, and this screen is a *capable* gate, not yet a
   *proven* one on the arms it was built to reject.
