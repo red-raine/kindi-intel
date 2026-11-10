@@ -39,6 +39,8 @@ Other standing rules:
 | Ternary refit of a float checkpoint costs **+0.021 nats** over the QAT original | `docs/TERNARY-OPTIMIZATION-MATRIX.md` |
 | Prune to **112/128** experts a layer is **lossless within 0.02** (+0.0045, CI −0.0082..+0.0174) for 82.9% of expert bytes, on 1,785 held-out tokens | `docs/EXPERT-PRUNE.md` |
 | Prune to **96** is **not established** (+0.0164, CI −0.0023..+0.0356) | same |
+| Prune to **64** beats merging to **64** at matched bytes: **+0.0902** [+0.0432, +0.1389] vs **+1.0770** [+0.9362, +1.2156], one 1,270-token walk, 7.59 GB vs 7.60 GB of expert weights | `docs/EXPERT-MERGE.md` §P3 |
+| A 64-row router **fitted** to the teacher's routing (KL −0.0412) makes the merged pack **worse**: **+0.0836** [+0.0275, +0.1330] against the pooled rows — routing fidelity is not a likelihood lever; P4 killed | same |
 | Merging 128 → 64 pairs costs **+1.077 nats** at the control's routing fraction; **routing ≤ +0.17**, **arithmetic ≥ +1.08** | `docs/EXPERT-MERGE.md` |
 | 4 **super experts** (L2E92 2,152×, L1E114 927×, L3E82 525×, L1E68 210× their own layer's median output; next largest 42.7×). Routing mass ranks them **27, 27, 38, 92 of 128** — the 112 and 96 plans keep all four, the **64 plan drops L1E68** and 32 drops L1E68 + L2E92 | `tools/expert_merge/superex.py`, `docs/EXPERT-PRUNE.md` |
 | Pruning beats merging at equal bytes on this model class, externally measured | `appendix.md` §C |

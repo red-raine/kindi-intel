@@ -306,7 +306,13 @@ the guard costs and not to argue that it pays. The NLL walk is what decides.
 the plan certified above, so that arm is a reproducibility check as much as a P0 one: NLL 3.6670 → 3.6843,
 **+0.0173, 95% CI −0.0012..+0.0361** - the same verdict as the +0.0164 recorded above, on text that has since moved.
 One of the seven documents was edited after that certification, so this baseline reads 3.6670 where the earlier run read
-3.6742; the two are not the same corpus, and only this run's pairing is quoted. At 64 the guard does **not** rescue the
+3.6742; the two are not the same corpus, and only this run's pairing is quoted.
+
+The 96 arm was walked a second time on the 1,270-token five-document corpus of `docs/EXPERT-MERGE.md`, where it reads
+**+0.0264 [+0.0036, +0.0482]** - resolved worse, against the +0.0173 here whose interval covers zero. Different corpora,
+so the deltas are not comparable; the two agree on the verdict that 96 of 128 does not certify. That run also settles
+whether the guard is doing anything at this budget: a second process without `--protect-json` chose the identical plan
+and read the identical number to four decimals, because 96 > 92 keeps E68 anyway. At 64 the guard does **not** rescue the
 plan: 3.6670 → 3.7584, **+0.0914 [+0.0445, +0.1401]**, rejected across the whole interval.
 
 **The unguarded 64 arm on the same 1,785 tokens is +0.0963 [+0.0505, +0.1443]** (a second process, baseline

@@ -295,17 +295,98 @@ is worth stating because it is the difference between a measurement and a misrea
 depart from the shipped router in directions the log cannot constrain, and on this sample it does. A re-fit is only
 interesting as a correction *to* the pool, not as a replacement for it.
 
-What this is not: an NLL result. The 1,275-token paired walk has **not** been run. That gate needs the fitted rows
-written into the merged pack (`routerfit --emit` writes them: `rows (48, 64, 2048)`, `xm`, `rm`, `gids` at λ = 0.1,
-fitted on all 384 logged tokens at the λ the folds picked), and then a three-arm walk — control, pooled-router merged,
-fitted-router merged — on five documents. Until that runs, the finding is that routing has **headroom**, not that it
-buys nats of NLL: the routing half of the merge is at most +0.17, and 55% of a KL that small is not obviously 0.1 nats
-of likelihood.
+That is a routing result, not a likelihood one. `routerfit --emit` writes the fitted rows (`extra (48, 64, 2048)`, `gids`,
+λ = 0.1, fitted on all 384 logged tokens), and the walk below is what decides whether the headroom is worth anything.
+
+## Does that headroom buy likelihood? (P4, the walk, 1,270 tokens)
+
+The KL result says a re-fit recovers a little over half the pooled router's divergence. It says nothing about
+likelihood, and P4's gate was NLL, so the three-arm paired walk was run: the control pack, the shipped merged pack with
+its pooled router, and the same merged pack carrying the fitted rows. The rows go in **in memory**
+(`moe.Qwen3Moe(router_extra=…)`, `mergepack --against "PACK|ROWS.npz"`), so the 8.9 GB pack is not rewritten and both
+merged arms read the same expert stacks byte for byte. Five documents, same order, both merged arms Q4_0, 1,270 scored
+tokens, paired per token with a moving-block bootstrap:
+
+| arm | router rows | NLL | delta vs control | 95% interval |
+|---|---:|---:|---:|---|
+| control (the source pack) | 128 | 3.4854 | — | — |
+| merged to 64, pooled router (shipped) | 64 | 4.5625 | **+1.0770** | +0.9362..+1.2156 |
+| merged to 64, fitted router | 64 | 4.6460 | **+1.1606** | +1.0132..+1.2880 |
+
+Paired, fitted − pooled: **+0.0836 [+0.0275, +0.1330]** over 1,270 tokens — resolved, and in the wrong direction. **The
+router that halves the teacher's divergence makes the merged pack's likelihood worse.**
+
+The pooled arm here reads +1.0770 against +1.0768 on the earlier 1,275-token walk of the same pack. Same arm, same
+corpus family, a 0.0002 difference in the point estimate: the harness reproduces itself, which is worth stating before
+the new number is trusted.
+
+**The sign is less surprising after the fact.** The fit is regressed on `x_n`, the rows the router sent *before* the
+merge, and its objective is to reproduce the teacher's 128-way mass on the teacher's own activations. A merged stack is
+an arithmetic mean of two parents, and by layer ℓ the residual stream of the merged pack has drifted from the teacher's
+by everything the earlier merges did; a router fitted to recognise teacher activations is asked to route activations it
+never saw. The pooled row has the property the merged stack has — it is the mean of the rows the merge replaced, so row
+and stack share the same averaging. On this evidence the useful correction is not "match the teacher's routing" but
+"re-fit against the merged pack's own activations", which is a short training run on the merged model, not a closed-form
+ridge on a route log.
+
+It also closes the accounting question the attribution section left open. If router fidelity could buy back part of the
+merge's cost, the fitted arm should have moved toward the control. It moved 0.084 nats away. So the router's share is
+not a budget that a better router spends: the cost is the arithmetic, **at least +1.08**, and the routing term
+(<= +0.17, interval covering zero) is the small and ambiguous part of it. `P4` is killed as an NLL lever.
+
+What this does not establish: 64 rows a layer fitted on 384 tokens, one merge partition at one group size, one corpus.
+A fit trained on the merged pack's own activations is a different experiment and is not refuted here. And it is a
+likelihood result only — no functional screen has been run on either arm.
+
+## Same corpus, same control: prune-96 against merge-64 (P3)
+
+`P3` was to judge the merge against the prune budgets rather than only against the control, because these are the two
+ways this pipeline shrinks a pack and the question is which one to ship. All three arms below are paired against the
+**same control tokens** - one baseline, 3.4854, re-walked by each run and identical to four decimals, because the forward
+is deterministic. Same five documents, same 1,270 scored tokens:
+
+| arm | expert bytes | router | NLL | delta vs control | 95% interval |
+|---|---:|---|---:|---:|---|
+| prune to 96 of 128 a layer, four super experts guarded | 11.36 GB of 15.19 GB (74.8%) | 128 rows | 3.5118 | **+0.0264** | +0.0036..+0.0482 |
+| prune to 64 of 128 a layer, four super experts guarded | 7.59 GB of 15.19 GB (50.0%) | 128 rows | 3.5756 | **+0.0902** | +0.0432..+0.1389 |
+| merge to 64 groups, pooled router | 8.9 GB pack (50%) | 64 rows | 4.5625 | **+1.0770** | +0.9362..+1.2156 |
+
+The guard is inert at 96 on this corpus as it was on the 1,785-token one: the same walk run without `--protect-json`
+picks the identical plan (74.8% of the bytes, 0.6% of the mass dropped) and reads the identical +0.0264
+[+0.0036, +0.0482] to four decimals. At this budget the four super experts are kept by the DP regardless, so 96 is a
+budget question and not a protection question - which is exactly what `docs/EXPERT-PRUNE.md` recorded.
+
+Read plainly. At 75% of the expert bytes pruning costs 0.026 nats; the merge at 50% costs 1.08 — a factor of 40. And at
+**matched bytes** the two are not close either: prune 64 of 128 keeps 7.59 GB of expert weights, within 1% of the
+7.60 GB half of the control's 15.19 GB that the merge keeps, and costs **+0.0902 [+0.0432, +0.1389]** where the merge
+costs **+1.0770 [+0.9362, +1.2156]** — a factor of 12 at the same budget. That is the comparison that answers "which do
+you ship", and it is this repository's own measurement of what `appendix.md` §C records from the literature: on this
+model class pruning beats merging at equal bytes.
+
+Why the prune is cheap is not a mystery and is worth stating, because it bounds the claim. A prune keeps the source's
+**128-row router** and masks 64 of 128 stacks out of it; every surviving stack is still addressed by its own id, so the
+routing decision a token makes is the teacher's decision restricted to a smaller catalogue. The merge replaces both the
+stacks and the routing: it averages two parents into one matrix and must invent a row for it, and that is where +0.94 of
+its interval comes from. The two arms are therefore not the same object at the same size, which is the point — at this
+budget the merged model buys nothing the pruned model does not already have.
+
+One caveat keeps the number honest: the guard is **not** inert at 64. Without `--protect-json` that plan drops L1E68 and
+`docs/EXPERT-PRUNE.md` measures the difference at 0.0049 nats, so **+0.0902 is the guarded arm**, and it reproduces the
+documented +0.0965 unguarded / +0.0914 guarded numbers on a different corpus. The verdict does not depend on the guard,
+but which number to quote does.
+
+How prune-96 itself should be read on this corpus: **not lossless within 0.020**, interval excluding zero at +0.0264.
+On the 1,785-token held-out corpus of `docs/EXPERT-PRUNE.md` the same budget read +0.0164 with an interval covering
+zero. Those are two corpora and the deltas are not comparable; what the pair establishes is that 96 of 128 certifies
+on neither: +0.0264 with an interval excluding zero here, +0.0173 with an interval covering zero there. 112 remains the
+certified budget.
 
 ## What this does not establish
 
 - **The attribution is a budget, not two exact fractions.** The router half is +0.1277 with an interval crossing zero;
   the arithmetic half is whatever remains of +1.0768..+1.2045. Read together: routing <= +0.17, arithmetic >= +1.08.
+  The fitted-router walk above tightens this: a router that tracks the teacher *better* than the pooled one makes the
+  pack worse by +0.0836, so there is no routing fidelity on the table that recovers part of the arithmetic cost.
   Stating them as "0.13 routing / 1.08 arithmetic" would over-claim a split this sample cannot resolve.
 - **The source-router arm spends its 4 stacks by truncation.** Its ordering is the source's 128-way one; the mapping
   collapses duplicate groups and then the heaviest 4 stacks are kept, the tail renormalised away. A merged model with a
@@ -392,6 +473,23 @@ python -m tools.expert_merge.mergepack --compare CONTROL.gguf \
     --against MERGED-k4.gguf,MERGED-k4-srcrouter.gguf \
     --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md \
     --docs 5 --tokens 255 --json merge64-route-attribution.json
+
+# P4: fit 64 router rows a layer to the teacher's grouped routing, then walk with them spliced in memory
+# (--no-intercept is what makes the rows writable: the router is `h @ W.T`, so a bias has nowhere to live)
+python -m tools.expert_merge.routerfit --routes routes.npz --groups 64 --no-intercept \
+    --emit routerfit-extra.npz --json routerfit.json
+# a "PATH|EXTRA.npz" arm loads the merged pack and adds x @ extra.T to the router; no pack is rewritten
+python -m tools.expert_merge.mergepack --compare CONTROL.gguf \
+    --against "MERGED-k4.gguf,MERGED-k4.gguf|routerfit-extra.npz" \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md \
+    --docs 5 --tokens 255 --json p4-walk.json
+
+# P3: a prune is a router mask, not a pack, so it is gated by its own walk on the same corpus
+# (--gate computes a paired walk against the unpruned pack; drop --protect-json for the unguarded arm)
+python -m tools.expert_merge.prune --routes routes.npz --pack CONTROL.gguf --keep 96 \
+    --protect-json superex.json --gate \
+    --corpus docs/BENCHMARKS.md,kindi/tp.py,docs/PACK-ZOO.md,docs/TESTING.md,docs/RECIPES.md \
+    --docs 5 --tokens 255 --json p3-prune96.json
 ```
 
 `python -m tools.selftest` runs these suites (`suite:expert_merge`, `suite:expert_perm`, `suite:mergepack`) as part of

@@ -136,8 +136,13 @@ def _mass(routes):
     return np.maximum(m, 0.0)
 
 
-def evaluate(routes, gids, n_groups, log=print):
-    """Leave-one-document-out, one pass; returns folds, the paired token differences and the pooled reference."""
+def evaluate(routes, gids, n_groups, log=print, center=True):
+    """Leave-one-document-out, one pass; returns folds, the paired token differences and the pooled reference.
+
+    `center=False` drops the intercept: the fit then predicts `L_pool + x W^T` with no bias term, which is the form a
+    pack can actually carry (the router is `h @ W.T`, no bias). The intercept is what the emitted rows would have to
+    drop anyway, so the constrained number is the one that applies to a walk.
+    """
     rl = np.asarray(routes["route_logits"], dtype=np.float64)
     xn = routes["xn"]
     doc = np.asarray(routes["doc"]).astype(np.int64)
@@ -162,15 +167,16 @@ def evaluate(routes, gids, n_groups, log=print):
             pooled_by_layer[L] = per_token_kl(Tte, Lpool_te)
             scale = float(np.trace(Xtr.T @ Xtr) / max(1, Xtr.shape[1]))
             resid_tr = np.log(np.maximum(Ttr, 1e-12)) - Lpool_tr
-            xm = Xtr.mean(axis=0)
+            xm = Xtr.mean(axis=0) if center else np.zeros(Xtr.shape[1])
+            rm = resid_tr.mean(axis=0) if center else np.zeros(resid_tr.shape[1])
             Xc = Xtr - xm
             A = Xc.T @ Xc
-            Rm = resid_tr - resid_tr.mean(axis=0)
+            Rm = resid_tr - rm
             Xtc = Xte - xm
             for lam in LAMBDAS:
                 Aw = A + lam * scale * np.eye(A.shape[0])
                 W = np.linalg.solve(Aw, Xc.T @ Rm).T
-                pred = Lpool_te + (Xtc @ W.T) + resid_tr.mean(axis=0)
+                pred = Lpool_te + (Xtc @ W.T) + rm
                 ridge_by_layer[lam][L] = per_token_kl(Tte, pred)
 
         pooled_all = np.concatenate([pooled_by_layer[L] for L in range(n_layers)])
@@ -198,7 +204,7 @@ def evaluate(routes, gids, n_groups, log=print):
                 kl_ridge=float(np.mean([r["kl_ridge"] for r in folds])))
 
 
-def emit_rows(routes, gids, n_groups, lam_rel=0.1):
+def emit_rows(routes, gids, n_groups, lam_rel=0.1, center=True):
     """Fit the rows on the whole log at the chosen lambda, for writing into a merged pack.
 
     Held-out folds exist to price the estimator; the rows a pack would carry are the ones fitted on everything, since
@@ -214,12 +220,22 @@ def emit_rows(routes, gids, n_groups, lam_rel=0.1):
         T = grouped_targets(rl[L], gids, n_groups)
         Lpool = pooled_logits(rl[L], gids, n_groups, mass=mass)
         scale = float(np.trace(X.T @ X) / max(1, X.shape[1]))
-        W, xm, rm = fit_ridge(X, np.log(np.maximum(T, 1e-12)) - Lpool, lam_rel * scale)
-        rows.append(W.astype(np.float32))
-        xm_all.append(xm.astype(np.float32))
-        rm_all.append(rm.astype(np.float32))
-    return dict(rows=np.stack(rows), xm=np.stack(xm_all), rm=np.stack(rm_all), gids=np.asarray(gids, np.int64),
-                lam_rel=float(lam_rel))
+        resid = np.log(np.maximum(T, 1e-12)) - Lpool
+        if center:
+            W, xm, rm = fit_ridge(X, resid, lam_rel * scale)
+            rows.append(W.astype(np.float32))
+            xm_all.append(xm.astype(np.float32))
+            rm_all.append(rm.astype(np.float32))
+        else:
+            # no intercept: a router is `h @ W.T`, so a bias cannot be written, and `extra` is the difference the
+            # pack's own pooled rows need added to them (rows_new = rows_pooled + extra)
+            A = X.T @ X
+            A[np.diag_indices_from(A)] += lam_rel * scale
+            rows.append(np.linalg.solve(A, X.T @ resid).T.astype(np.float32))
+    if center:
+        return dict(rows=np.stack(rows), xm=np.stack(xm_all), rm=np.stack(rm_all), gids=np.asarray(gids, np.int64),
+                    lam_rel=float(lam_rel))
+    return dict(extra=np.stack(rows), gids=np.asarray(gids, np.int64), lam_rel=float(lam_rel))
 
 
 def main(argv):
@@ -250,9 +266,21 @@ def main(argv):
     print("  %s: %d layers, %d tokens, %d experts -> %d groups"
           % (path, ids.shape[0], ids.shape[1], n_experts, n_groups))
 
-    got = evaluate(routes, gids, n_groups)
+    center = "--no-intercept" not in argv
+    if not center:
+        print("  bias-free fit: no intercept, so the emitted rows are the difference the pack's pooled rows add")
+    emit = arg("--emit")
+    if emit and "--emit-only" in argv:
+        lam_rel = float(arg("--lambda", 0.1))
+        pack = emit_rows(routes, gids, n_groups, lam_rel, center=center)
+        np.savez_compressed(emit, **pack)
+        print("  emitted %s: %s %s at lambda %g, fit on all %d tokens"
+              % (emit, "rows" if "rows" in pack else "extra", pack.get("rows", pack.get("extra")).shape, lam_rel,
+                 ids.shape[1]))
+        return 0
+    got = evaluate(routes, gids, n_groups, center=center)
     got.update(dict(routes=path, layers=int(ids.shape[0]), experts=n_experts, groups=n_groups,
-                    corpus_tokens=int(ids.shape[1]), docs=meta.get("docs"), lambdas=list(LAMBDAS)))
+                    corpus_tokens=int(ids.shape[1]), docs=meta.get("docs"), lambdas=list(LAMBDAS), center=center))
     print("  %d paired per-token differences: ridge - pooled KL = %+.4f [%+.4f, %+.4f] %s"
           % (got["tokens"], got["mean_delta"], got["ci_lo"], got["ci_hi"],
              "resolved" if got["resolved"] else "**covers zero**"))
@@ -265,14 +293,18 @@ def main(argv):
     emit = arg("--emit")
     if emit:
         lam_rel = float(arg("--lambda", 0.1))
-        pack = emit_rows(routes, gids, n_groups, lam_rel)
+        pack = emit_rows(routes, gids, n_groups, lam_rel, center=center)
         np.savez_compressed(emit, **pack)
         with open(emit.rsplit(".", 1)[0] + ".json", "w", encoding="utf-8") as f:
             json.dump(dict(routes=path, groups=n_groups, experts=n_experts, layers=int(ids.shape[0]),
-                           corpus_tokens=int(ids.shape[1]), lambda_rel=lam_rel,
-                           note="anchored ridge rows: predict L_pool + ((x - xm) @ W.T) + rm"), f, indent=1)
-        print("  emitted %s: rows %s at lambda %g (fit on all %d tokens) - not yet written into any pack"
-              % (emit, pack["rows"].shape, lam_rel, ids.shape[1]))
+                           corpus_tokens=int(ids.shape[1]), lambda_rel=lam_rel, center=center,
+                           note=("rows: predict ((x - xm) @ W.T) + rm, replacing the pack's rows" if center else
+                                 "extra: add to the pack's pooled rows, rows_new = rows_pooled + extra")), f, indent=1)
+        shaped = pack.get("rows", pack.get("extra"))
+        print("  emitted %s: %s %s at lambda %g (fit on all %d tokens) - %s"
+              % (emit, "rows" if "rows" in pack else "extra", shaped.shape, lam_rel, ids.shape[1],
+                 "not yet written into any pack" if center else
+                 "added in memory by moe.Qwen3Moe(router_extra=...), not written to a pack"))
     return 0
 
 

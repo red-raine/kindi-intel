@@ -396,17 +396,22 @@ def compare_arms(base_pack, arms, docs, max_delta=0.02, block=8, log=print):
     del b
 
     out, per_token = [], {}
-    for path in arms:
-        arm = Qwen3Moe(path, log=lambda *a: None)
+    for spec in arms:
+        # an arm is `PATH` or `PATH|ROUTER.npz`: the second form keeps the pack byte for byte and adds fitted router
+        # rows in memory, which is the only way to walk a router the pack does not carry without rewriting 8.9 GB
+        path, extra = spec if isinstance(spec, tuple) else (spec, None)
+        key = path if not extra else path + "+" + os.path.basename(extra)
+        arm = Qwen3Moe(path, log=lambda *a: None, router_extra=extra)
         ra = nll_moe_batch(arm, docs)
         del arm
         after = ra["per_token"]
-        per_token[path] = after
+        per_token[key] = after
         a_docs = [(n, v, max(1, len(ids) - 1)) for (n, ids), v in zip(docs, ra["per_doc"])]
         for name, nll, ntok in a_docs:
             log("    %-20s %-24s %8d tokens  nll %.4f" % (os.path.basename(path)[:20], name, ntok, nll))
         v = gate(dict(per_token=baseline), [dict(per_token=after)], max_delta=max_delta, block=block)[0]
-        out.append(dict(pack=path, baseline_nll=float(baseline.mean()), merged_nll=float(after.mean()),
+        out.append(dict(pack=key, pack_path=path, router_extra=extra,
+                        baseline_nll=float(baseline.mean()), merged_nll=float(after.mean()),
                         tokens=int(baseline.size), baseline_docs=b_docs, merged_docs=a_docs, gate=v, vs={}))
 
     # each arm against each other arm: the same paired tokens, so this is the difference between two models and not
@@ -774,7 +779,13 @@ def main(argv):
 
     if "--compare" in argv:
         base = _arg(argv, "--compare")
-        arms = [p for p in (_arg(argv, "--against") or "").split(",") if p.strip()]
+        arms = []
+        for p in (_arg(argv, "--against") or "").split(","):
+            p = p.strip()
+            if not p:
+                continue
+            path, _, extra = p.partition("|")
+            arms.append((path, extra or None))
         names = [n for n in (_arg(argv, "--corpus") or "").split(",") if n.strip()]
         if not (base and arms and names):
             print("usage: python -m tools.expert_merge.mergepack --compare BASE.gguf --against A.gguf[,B.gguf] "

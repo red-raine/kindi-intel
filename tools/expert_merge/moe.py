@@ -20,6 +20,7 @@ the price of holding one layer's f32 experts and the batch's logits.
 A plan from `tools.expert_merge.prune` is applied with `set_prune`: the router's logits are masked and the top-k
 renormalised, so the weights are untouched and the two arms of an NLL gate can share one loaded pack.
 """
+import os
 import numpy as np
 
 from .ggufmoe import Moepack
@@ -133,7 +134,7 @@ def per_doc(x, spans, fn):
 
 
 class Qwen3Moe(object):
-    def __init__(self, path, log=print, allow_partial=False):
+    def __init__(self, path, log=print, allow_partial=False, router_extra=None):
         self.pack = Moepack(path)
         p = self.pack
         self.d = p.describe()
@@ -150,6 +151,19 @@ class Qwen3Moe(object):
         self.truncated = self.n_layers < p.n_layer
         self._attn = {}
         self.prune = None                                    # None: every expert available, as the pack shipped
+        # a router correction added to the pack's own rows, in memory: `tools.expert_merge.routerfit` fits a 64-row
+        # map to the teacher's grouped routing and emits the *difference* from the pooled rows, so adding it here
+        # measures the router the pack would carry without rewriting 8.9 GB of stacks to carry it
+        self.router_extra = None
+        if router_extra is not None:
+            z = np.load(router_extra)
+            ex = z["extra"] if "extra" in z.files else z["rows"]
+            if ex.shape[1] != p.n_expert:
+                raise ValueError("router extras score %d experts, the pack has %d" % (ex.shape[1], p.n_expert))
+            if ex.shape[0] < self.n_layers:
+                raise ValueError("router extras cover %d layers, the pack models %d" % (ex.shape[0], self.n_layers))
+            self.router_extra = np.asarray(ex, dtype=np.float64)
+            log("  router: +%d fitted rows a layer from %s" % (p.n_expert, os.path.basename(router_extra)))
 
     def set_prune(self, keep_per_layer):
         """Restrict each layer to a set of experts and leave everything else alone; `None` restores the model.
@@ -206,6 +220,8 @@ class Qwen3Moe(object):
     def route(self, h, il):
         p = self.pack
         logits = h @ self.attn_weights(il)["router"].T
+        if self.router_extra is not None:
+            logits = logits + h @ self.router_extra[il].T
         logits = mask_logits(logits, None if self.prune is None else self.prune[il])
         m = p.router_map
         if m is not None:
