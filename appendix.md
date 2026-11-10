@@ -54,6 +54,29 @@ Grouped by the question it answers. `masterplan.md` §2 says which of these chan
 | [HC-SMoE, arXiv 2410.08589](https://arxiv.org/abs/2410.08589) | Best merge method on multiple-choice, **worst on generative** (creative writing 0.811 → 0.497 at 25%, 0.008 at 50%). [measured] | Why `P2` is a functional screen and not another MC benchmark. |
 | [EEP, arXiv 2407.00945](https://arxiv.org/html/2407.00945) | Router re-mapping + expert merging at a fixed expert budget beats frequency pruning by 5–7 points — on an 8-expert T5 toy. [measured, small scale] | The pro-router-refit counterweight, and why `P4` is worth an hour. |
 
+### C.2 The corpus is part of the result (added 2026-11-10)
+
+The rows above are why `P3` exists, but they do not support the sentence "merging is wrong", and this branch wrote
+that sentence once. What the 2026 record actually says:
+
+| what | the qualification |
+|---|---|
+| REAP (2510.13999) | Its own comparison: expert merging "performs reasonably well on **MC** benchmarks" and loses on **generative** ones, and the main comparisons use **domain-specific calibration**. Calibrating on C4 instead collapses generative accuracy to 0% for several compressed arms - the **calibration corpus** moves the result more than the pruner does. [measured] |
+| REAM (2604.04356) | A **Pareto curve between MC and GEN whose position depends on the calibration mix** (general/math/code). Best merging result is at **25%** reduction, and the algorithm is pseudo-pruning: saliency centroids, **non-uniform groups**, most centroids left as singletons - structurally ~90% pruning. Swapping saliency for raw frequency costs **-8.7** points. [measured] |
+| RAVE (ulam.ai 2026, code public) | Four per-expert states: keep / prune / **absorb into a centroid** / absorb **+ rank-4-8 low-rank residual**. 128 -> 64 on a Qwen3-MoE: parity on hard math, **52%** memory reduction, **86%** of decode speed. Head-to-head on 40 IMO-style proofs at 50%: REAP **0/40** degenerate, RAVE **0/40**, REAM **13/40**. [measured, preprint + code] |
+| HOPE (2609.18916) | A second-order pruning objective of which REAP is the first-order special case (interaction terms dropped). Its advantage is largest at high prune rates and on agentic coding (**+6.1%** at 50%), which is the regime our 64 arm lives in. [measured, preprint] |
+| MoNE (ICLR 2026) | Redundant experts are replaced by lightweight **novices** (unbiased estimates of their outputs), not deleted, and the method reports robustness to the calibration set and sample size. Another absorb-with-something-cheap family. [measured] |
+
+Two consequences for us, and neither is a plan to switch sides:
+
+1. **"Prune vs merge" is the wrong axis.** Every competitive 2026 method is a *per-expert assignment* over a small
+   action set - keep / prune / absorb / absorb+residual - with the split driven by saliency. Our own `P0` guard is the
+   keep-action, `P11` is the absorb-action at a byte-matched slot count, `P13` is the residual.
+2. **Our merge was not the state of the art's merge.** `mergepack`'s partition is size-capped at `ceil(n/k)`, so at
+   128->64 every group is exactly two experts, no singleton survives, and the router is pooled. That is the
+   M-SMoE/HC-SMoE family - the one REAP's 0.541-vs-0.364..0.397 code-generation gap was measured against - not REAM or
+   RAVE. The +1.0770 this branch measured is the cost of *that* merge on *that* corpus, and the write-up now says so.
+
 ## D. Low-bit GGUF: bits, formats, and what "lossless" is worth
 
 | source | what it says | what it implies here |

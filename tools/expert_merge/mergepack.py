@@ -93,6 +93,84 @@ def groups(coc, n_groups, log=None):
     return gids
 
 
+def assign_absorb(coc, n_groups, saliency, cap=None, log=None):
+    """A partition whose sizes vary: the top `n_groups` experts keep a stack, the rest are absorbed into one.
+
+    `groups` caps every group at `ceil(experts / groups)`, so at 128 -> 64 no group can hold more than two experts
+    and the merge is strictly pairwise. That is the M-SMoE/HC-SMoE shape, and it cannot express either of the two
+    heterogeneous rules the 2026 line converged on: REAM's pseudo-pruning (a few centroids absorb many, most
+    centroids stay alone) and RAVE's "centroid absorb" (a cold expert's function is kept as weight inside a
+    neighbour instead of being deleted). This assignment is that shape with the statistic the log actually has:
+    centroid = highest routing mass, absorption = strongest co-activation among the experts that are left.
+
+    The slot count is unchanged - `n_groups` stacks either way - so the pack built from this map is byte-matched
+    against a prune to the same number of experts, which is the comparison that decides whether preserving the tail
+    is worth the damage to the centroid.
+
+    Absorption always assigns **every** expert, so the partition's slot count is fixed by `n_groups` and `cap` only
+    bounds a group's size: `cap * n_groups >= n` is required, and `cap=1` is therefore the identity (`n_groups == n`),
+    not a prune. The arm that degenerates to a prune is a zero-mass absorption, which `merge_matrices` already
+    averages away; this map never deletes an expert.
+    """
+    coc = np.asarray(coc, dtype=np.float64)
+    n = coc.shape[0]
+    n_groups = int(n_groups)
+    s = np.asarray(saliency, dtype=np.float64)
+    if s.shape != (n,):
+        raise SystemExit("mergepack: %d saliency values for %d experts" % (s.size, n))
+    if not 1 <= n_groups <= n:
+        raise SystemExit("mergepack: %d groups from %d experts is not a partition" % (n_groups, n))
+    if cap is None:
+        cap = max(1, int(math.ceil(n / float(n_groups))))
+    cap = int(cap)
+    if cap < 1 or cap * n_groups < n:
+        raise SystemExit("mergepack: a cap of %d over %d groups cannot hold %d experts" % (cap, n_groups, n))
+
+    order = sorted(range(n), key=lambda e: (-float(s[e]), e))
+    centroids = sorted(order[:n_groups])
+    slot = dict((c, i) for i, c in enumerate(centroids))
+    members = [[c] for c in centroids]
+    for e in order[n_groups:]:
+        best = None
+        for c in centroids:
+            k = slot[c]
+            if len(members[k]) >= cap:
+                continue
+            v = float(coc[e, c])
+            if best is None or v > best[0] + 1e-12:
+                best = (v, k)
+        if best is None:                                  # cannot happen while cap * n_groups >= n
+            raise SystemExit("mergepack: no centroid has room for expert %d at cap %d" % (e, cap))
+        members[best[1]].append(e)
+    gids = np.zeros(n, dtype=np.int64)
+    for k, mem in enumerate(members):
+        for e in mem:
+            gids[e] = k
+    if log:
+        sizes = np.bincount(gids, minlength=n_groups)
+        log("  %d experts -> %d groups by absorption (sizes %d-%d, cap %d, %d absorbed)"
+            % (n, n_groups, sizes.min(), sizes.max(), cap, n - len(centroids)))
+    return gids
+
+
+def plan_gids(argv, coc, mass, n_expert, n_groups, log=print):
+    """The map both halves of a merge must agree on.
+
+    `--assign groups` is the capped co-activation agglomeration this tool shipped with; `--assign absorb` is the
+    non-uniform one above. Both halves of the merge (`--pack` and `--router-from`) go through here, because a spliced
+    router carrying a map for a different assignment is a pack whose router disagrees with its stacks - which is what
+    `splice_router` refuses, and cheaper to prevent than to detect.
+    """
+    how = _arg(argv, "--assign", "groups")
+    if how == "groups":
+        return groups(coc + coc.T, n_groups, log=log)
+    if how == "absorb":
+        cap = _arg(argv, "--cap")
+        return assign_absorb(coc + coc.T, n_groups, np.asarray(mass, dtype=np.float64).sum(0),
+                             cap=int(cap) if cap else None, log=log)
+    raise SystemExit("mergepack: --assign %s is not a rule (groups, absorb)" % how)
+
+
 def merge_matrices(mats, weights):
     """The weighted mean of a group's matrices, with the weights normalised inside the group.
 
@@ -604,6 +682,28 @@ def selftest():
         coc[a, b] = coc[b, a] = 9.0
         coc[a, a] = coc[b, b] = 9.0
     coc += np.eye(4)
+
+    # --- the heterogeneous assignment: centroids by saliency, everyone else absorbed
+    sal = np.array([0.5, 4.0, 0.4, 3.0])
+    ga = assign_absorb(coc, 2, sal, cap=2, log=None)
+    check("mergepack: absorption makes the two heaviest experts centroids", ga[1] != ga[3] and len(set(ga.tolist())) == 2,
+          str(ga))
+    check("mergepack: and each absorbs the expert it co-fires with",
+          ga[0] == ga[1] and ga[2] == ga[3] and ga[0] != ga[2], str(ga))
+    ident = assign_absorb(coc, 4, sal, cap=1, log=None)
+    check("mergepack: cap 1 over n groups is the identity, so nothing is silently absorbed",
+          sorted(ident.tolist()) == [0, 1, 2, 3], str(ident))
+    # a group size above ceil(n/k) is the whole point: one centroid absorbs four, the other stays alone
+    wide = np.zeros((6, 6))
+    wide[1:, 1] = wide[1, 1:] = 5.0
+    wide[2, 4] = wide[4, 2] = 1.0
+    gw = assign_absorb(wide, 2, np.array([0.1, 5.0, 4.0, 3.0, 2.0, 1.0]), cap=6, log=None)
+    sizes_w = np.bincount(gw, minlength=2)
+    check("mergepack: the partition is non-uniform (sizes %d and %d)" % (sizes_w.min(), sizes_w.max()),
+          sizes_w.min() == 1 and sizes_w.max() == 5, str(gw))
+    refuses("mergepack: a cap that cannot hold every expert is refused",
+            lambda: assign_absorb(np.ones((6, 6)), 4, np.ones(6), cap=1, log=None))
+
     g = groups(coc, 2, log=None)
     check("mergepack: average linkage finds the two co-activated pairs",
           sorted(np.nonzero(g == g[0])[0].tolist()) == [0, 1] or sorted(np.nonzero(g == g[0])[0].tolist()) == [1, 0],
@@ -833,7 +933,7 @@ def main(argv):
         mass, _count = mass_per_expert(got, n_expert)
         n_groups = int(_arg(argv, "--groups", Moepack(src).n_expert))
         coc = coactivation(got["route_ids"], got["route_wts"], np.arange(got["route_wts"].shape[1]), n_expert)
-        gids = groups(coc + coc.T, n_groups)
+        gids = plan_gids(argv, coc, mass, n_expert, n_groups)
         rep = splice_router(src, router_from, out, gids, mass=mass)
         print("  wrote %s: %.2f GB, %d stacks, the source's %d router rows, %d used"
               % (out, rep["bytes"] / 1e9, rep["groups"], rep["router_rows"], rep["router_used"]))
@@ -847,7 +947,7 @@ def main(argv):
         return 0
     if not (src and routes_path and out):
         print("usage: python -m tools.expert_merge.mergepack --pack SRC.gguf --routes ROUTES.npz --groups 64 "
-              "--out MERGED.gguf [--used N] [--keep-router] [--gate --corpus A,B --docs 2 --tokens 48 "
+              "--out MERGED.gguf [--used N] [--keep-router] [--assign groups|absorb --cap N] [--gate --corpus A,B --docs 2 --tokens 48 "
               "--json out.json]\n"
               "       python -m tools.expert_merge.mergepack --pack MERGED.gguf --router-from SRC.gguf --routes ROUTES.npz "
               "--out MERGED-ROUTER.gguf [--groups 64] [--json out.json]\n"
@@ -865,7 +965,7 @@ def main(argv):
     print("  %s: %d layers, %d experts, %d tokens logged" % (os.path.basename(src), mass.shape[0], n_expert,
                                                              got["route_wts"].shape[1]))
     coc = coactivation(got["route_ids"], got["route_wts"], np.arange(got["route_wts"].shape[1]), n_expert)
-    gids = groups(coc + coc.T, n_groups)
+    gids = plan_gids(argv, coc, mass, n_expert, n_groups)
     exposed = merged_mass(gids[got["route_ids"].astype(np.int64)], got["route_wts"].astype(np.float32))
     print("  a token's two slots land in one group %.1f%% of the time (the share the merge averages)"
           % (100.0 * exposed))

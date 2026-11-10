@@ -26,12 +26,29 @@ Anything that trades 1 for 2 has to say which nats it spent and quote the interv
 | Merge 128 → 64 pairs, both arms Q4_0 | **+1.077 nats** at the control's own routing fraction (4 of 64), +1.3588 at 8 of 64 | `docs/EXPERT-MERGE.md`, 1,275 tokens |
 | …of which **routing** costs | **≤ +0.17**, point +0.128 *in the pooled router's favour*, CI −0.0139..+0.1695 | kept-router arm, `mergepack --keep-router` |
 | …of which **arithmetic** costs | **≥ +1.08** | same |
+| Absorb 32 cold experts into 96 groups (REAM/RAVE shape), same 96 Q4_0 slabs as prune-96 | **+0.2533 [+0.1803, +0.3209]** vs control; **+0.2269 [+0.1549, +0.2937] worse than prune-96** (paired, one process) | `docs/EXPERT-MERGE.md`, 1,270 tokens |
 | Super experts in this pack | 4 experts at **210–2,152× their own layer's median output**: L2E92 (947, 2,152×), L1E114 (283, 927×), L3E82 (179, 525×), L1E68 (64, 210×). Next largest in the pack is 42.7×. **Mass ranks them 27, 27, 38 and 92 of 128** | `tools/expert_merge/superex.py`, `docs/EXPERT-PRUNE.md` |
 | Their fate in our plans | 112 and 96 keep all four; **64 drops L1E68** (mass rank 92, 0.28% of its layer's mass) and 32 drops L1E68 and L2E92. 96 survives only because 96 > 92; the 64 arm's +0.0965 is **not** caused by dropping E68 — keeping it is worth 0.0049 (P0, below) | same |
 
 The merge row is the most important: at 50% expert reduction the merge costs 1.08–1.20 nats, and the router is not
 where the money went. That result is now corroborated externally (§3, REAP), which changes the plan: **merging is not
 this project's compression lever. Pruning is.**
+
+6. **But the axis is wrong: it is a per-expert assignment, not "prune or merge", and our merge arm was one corner of
+   that space.** REAM (arXiv 2604.04356) picks saliency centroids, absorbs the rest into them, and reports that most
+   non-centroid experts end up as singletons - it is "structurally ~90% pruning". RAVE (ulam.ai 2026, code public)
+   gives every expert one of **four** actions (keep / prune / absorb into a centroid / absorb **plus a rank-4-8
+   low-rank residual**) and reports parity at 50% reduction for 52% of the memory and 86% of decode speed. MoNE
+   (ICLR 2026) replaces redundant experts with lightweight *novices* instead of deleting them. Meanwhile REAP - the
+   paper our kill cites - says merging "performs reasonably well on **MC** benchmarks" and loses only on *generative*
+   ones, and REAM's result is an explicit **Pareto curve in the calibration mix** (general/math/code).
+   **Consequence for this branch:** what P3 measured is a **uniform pairwise** merge (`mergepack`'s partition caps a
+   group at `ceil(128/64) = 2`, so every group holds exactly two experts, no singleton survives, no residual exists,
+   and the router is pooled) on **one in-domain generative corpus** (1,270 tokens of this repo's prose). That is the
+   M-SMoE/HC-SMoE shape - the family REAP beats 0.541 to 0.364-0.397 on code - not REAM or RAVE. **The global sentence
+   "merge is killed" is withdrawn.** What stands is narrower and still measured: *uniform pairwise merging at 50%
+   costs 12x a byte-matched prune on this corpus*. Whether the heterogeneous assignment keeps the tail is `P11`;
+   whether merging wins on discriminative work is `P12`; whether a residual closes it is `P13`.
 
 ---
 
@@ -169,6 +186,12 @@ at 8.9 GB, is a 64-way merge better than a 96-expert prune?
 
 *Kill:* if prune-at-96 wins on both NLL and the functional screen, stop merging this model class and say so in
 `docs/EXPERT-MERGE.md`. (On the external evidence, this is the likely outcome.)
+
+*Result (2026-11-10):* the comparison was run and the prune won by 12x at matched bytes, but the kill clause is
+**narrowed rather than discharged**. It was written before the REAM/RAVE structure was in `appendix.md` §C.2: both
+arms here are uniform pairwise merges at the full k/N routing fraction, on one in-domain corpus, and the state of the
+art is a per-expert action set on a corpus-matched calibration mix. `P11` and `P12` are the two tests that clause now
+needs, and `docs/EXPERT-MERGE.md` states the scope instead of the old sentence.
 
 ### P4 — Closed-form router re-fit, to finish the routing attribution — **~2 h**
 
@@ -372,6 +395,77 @@ clipped — measured by this probe, cheaply, at conversion time — followed by 
 The gate is that walk's interval, not this table: a weight error is a proxy, and this file does not get to promote a
 proxy to a result.
 
+### P11 — Heterogeneous per-expert assignment: centroids, singletons, absorption — **~3 h**
+
+*Hypothesis:* the 1.08-nat merge is the cost of averaging **every** pair uniformly, not the cost of merging. A
+byte-matched heterogeneous arm - the top 96 experts by routing mass keep their own stack, the bottom 32 are absorbed
+into their most co-activated centroid instead of deleted - should beat prune-96 (+0.0264) or at worst tie it, because
+it preserves the tail's function at the same slot count.
+
+*Method:* `mergepack --assign absorb --cap 8 --groups 96` (new: `assign_absorb`; `groups` is the old capped
+agglomeration and stays the default). Slot count is the same as prune-96 and every expert slab is written at one type,
+so the two arms have the same expert bytes to the byte - asserted from the pack sizes, not assumed.
+
+*Gate:* the same 1,270-token paired walk against `qwen3moe-control-q4.gguf`, plus a paired arm-against-arm interval
+against prune-96's per-token delta from `p3-prune96-walk.json` (same control, same tokens, so the two deltas are
+comparable by subtraction). P2 still not available: no `qwen3moe` pack writer.
+
+*Cost:* one build (~30 min) + one two-arm walk (~35 min).
+
+*Kill:* if absorb-96 is worse than prune-96 with an interval excluding zero, the tail is not worth preserving through a
+centroid on this pack format, and the merge direction is closed **against the state of the art's structure** rather
+than against a straw man. If it ties, `P13` (a residual) is the only remaining lever and its bytes must be charged.
+
+*Result (2026-11-10, 1,270 tokens):* **absorbed, and killed - absorb-96 is worse than prune-96.** The map was 96
+highest-mass centroids with 32 absorbed, group sizes 1-4, 8% of a token's two slots landing inside one group; the pack
+is 12.95 GB (96 Q4_0 slabs, against the control's 17.03 GB for 128 and merge-64's 8.87 GB for 64), byte-matched
+to `keep=96` because both arms hold the same 96 slabs in the same type. Absorb-96 reads **3.7387**, `+0.2533 [+0.1803,
++0.3209]` against the control and **+0.2269 [+0.1549, +0.2937]** against the prune when both are walked in one process
+against one baseline (prune reproduces its recorded +0.0264). So the heterogeneous structure does not rescue merging
+at this budget: averaging moves the *survivors*' weights, and only 32 absorptions cost 8.6x what deleting 32 experts
+costs. Cost is superlinear in what is absorbed (32 -> 0.253, 64 -> 1.077). Only `P13`'s rank-4-8 residual is untested,
+and its hurdle is +0.2269.
+
+### P12 — Put the corpus back in the claim: out-of-domain and discriminative arms — **~2 h**
+
+*Hypothesis:* our gate corpus is this repository's prose. REAP's own split is generative-vs-MC, and REAM's is a Pareto
+frontier in the calibration mix. If the prune advantage is partly a property of in-domain generative likelihood, an
+out-of-domain corpus or a multiple-choice arm can show the other side - and either outcome is a finding.
+
+*Method:* (a) a second gate corpus that is not this repo (general English, or the math/code mix the literature uses),
+run through the same ladder (112/96/64 + merge-64) and reported as its **own table**, never differenced against the
+1,270-token corpus; (b) a multiple-choice scorer: per item, mean NLL of the correct option minus the mean of the
+wrong ones, paired per item over ~40 items x 3 options, on the same arms. Neither needs generation, so neither is
+blocked on the `qwen3moe` pack writer.
+
+*Gate:* paired per-token walk for (a); per-item bootstrap on the NLL margin and accuracy for (b). The literature's
+claim is directional (prune >= merge on generative, merge >= prune on MC), so a resolved interval either way updates
+the plan.
+
+*Cost:* (a) one walk an arm, ~1.5 h total; (b) ~2,400 scored tokens an arm.
+
+*Kill:* if both corpora and both task types put prune ahead with intervals excluding zero, the verdict is established
+beyond the corpus and `AGENTS.md` can state it for this model class and pack format without a corpus caveat.
+
+### P13 — Rank-4-8 residual experts (RAVE's fourth state), closed-form — **after P11**
+
+*Hypothesis:* absorption without a residual is a lossy average; RAVE adds a rank-4-8 low-rank residual to the centroid
+and reports parity at 50%. The residual is small relative to a slab (a rank-8 map on a 2048->768 SwiGLU expert is
+around 1% of it), so if it closes even a third of the absorb arm's cost, the per-expert assignment wins on bytes too.
+
+*Method:* closed form, no gradients - capture `(x, E_i(x), E_c(x))` on the route log's own tokens, set
+`Y = E_i(x) - E_c(x)`, and fit `A B` by truncated SVD of the least-squares regression of `Y` on `x`; ranks 4 and 8.
+Applied in memory the way `router_extra` is, so no 8 GB pack has to be rewritten to measure it.
+
+*Gate:* the same paired walk, with the residual bytes **charged** against the slab budget (they are not free even if
+small), and the arm reported against both prune-96 and absorb-96.
+
+*Cost:* the capture already exists (`routes`, `superex`); the fit is minutes. In-memory residual support in `moe.py`
+is the work, and that is also the piece a pack format would need.
+
+*Kill:* if the residual does not move the absorb arm outside its interval, stop at `P11`'s answer and do not build the
+pack-format support.
+
 ### P8 — What we will not do (and the evidence)
 
 - **Not** hugepages for weight buffers: ~0.1–0.6% measured on x86, "no noticeable difference" in llama.cpp's own issue.
@@ -458,7 +552,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P0 protect super experts | **measured** | `--protect`/`--protect-json` in `prune`; guard 0.07% of bytes; 96 identical to unguarded (**+0.0173 [−0.0012, +0.0361]**, marginal); 64 guarded **+0.0914** vs unguarded **+0.0963** on the same tokens — the outlier is 5% of that loss, not its cause |
 | P1 saliency + non-uniform budgets | **measured; keep uniform mass** | saliency only nominally ahead with overlapping baseline intervals; entropy rejected at 96 and 80 on 1,778 held-out tokens. P2 not run: no pruned kindi packs converted |
 | P2 functional screen | **built, kill property measured** | `tools/funcscreen`: 40 fixed items (20 code + 20 arithmetic), greedy, outputs stored; bonsai-2b 32/40 vs token-shuffled 6/40, paired delta −0.65 [−0.80, −0.50]. **Control-vs-merge64 kill test blocked at the converter** — measured 2026-11-10: `kindi convert` refuses the arch by name, `expected a qwen35, qwen3, glm5-next, minimax-m3 or Gemma 4 GGUF (found 'qwen3moe')`, so neither arm can become a pack `Engine` serves; the `qwen3moe` writer (expert slabs + router) is the prerequisite |
-| P3 mitigated merge | **measured; killed — prune wins 12x at equal bytes** | one 1,270-token walk, one baseline (3.4854): prune 96 **+0.0264 [+0.0036, +0.0482]** at 74.8% of expert bytes, prune 64 **+0.0902 [+0.0432, +0.1389]** at 7.59 GB, merge 64 **+1.0770 [+0.9362, +1.2156]** at 7.60 GB. Guard inert at 96, worth 0.0049 nats at 64 |
+| P3 mitigated merge | **measured; prune wins 12x at matched bytes - kill narrowed to uniform pairwise merge** | one 1,270-token walk, one baseline (3.4854): prune 96 **+0.0264 [+0.0036, +0.0482]** at 74.8% of expert bytes, prune 64 **+0.0902 [+0.0432, +0.1389]** at 7.59 GB, merge 64 **+1.0770 [+0.9362, +1.2156]** at 7.60 GB. Guard inert at 96, worth 0.0049 nats at 64 |
 | P4 ridge router re-fit | **measured; killed on NLL** | routing: anchored ridge beats pooling by **−0.0412 KL [−0.0428, −0.0396]** on 18,432 token-layer pairs (384 tokens, λ=0.1); unanchored it *loses* (+0.0520), which is why the anchor matters. The walk (1,270 tokens, rows applied in memory): pooled **+1.0770 [+0.9362, +1.2156]**, fitted **+1.1606 [+1.0132, +1.2880]**, paired fitted − pooled **+0.0836 [+0.0275, +0.1330]** — the better router is the worse pack. Reopening it needs a fit against the *merged* pack's own activations, not the teacher's |
 | P5 1.667 bpw packing | **measured; deferred** | GEMV is issue-bound at ~12–13 GB/s vs a 26.0 GB/s DRAM ceiling; `stream_probe` measures disk, not DRAM. Repacking adds instructions and is not a decode speedup on this evidence |
 | P6 pin hot tensors / merged reads | **measured** | resident decode is 0 disk reads and 0–1 faults per 40 tokens; threads 8 vs 16 tie at 10.44/10.36; pinning has nothing to fix |
@@ -466,6 +560,9 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 | P6c cost split (callback/read/memcpy) | **measured: reads dominate** | `tools/paged_cost.py` on the real fixture, 40 tokens: 2.5 misses/token × 1.66 ms read+memcpy per miss; read 1.537 ms, memcpy 0.123 ms, callback 0.0007 ms; callback path also had a threading bug (fetch fired per-thread, 1,280 calls for 10 tokens) — fixed to `#pragma omp single`; tokens bit-identical, paged 114.56 tok/s after. **No overlapped-I/O thread is built**: the split says the read *is* the cost, so hiding it needs a kernel-side iteration register/prefetch, which is not justified while paging is off by default |
 | moe-check failure root-caused | **check fixed, not relaxed** | worst rel 6.03e-04 was **scale-table error in the reference, not the kernel**: `synthpack`'s returned `quantised` dict predates the 8-bit level-table re-encoding of scales, so 4 of 36 tensors differed from the pack's effective weights by ~6e-4 and exactly the trials routing those experts failed (scalar and AVX2 identical). `run()` now re-reads dequantised weights from bcodes/dpm; worst rel **5.82e-07** (the fp32 associativity floor) on the same probes, tolerance 1e-4 unchanged; `--paged` bench passes (byte-identical pcodes, all rows resident tokens); repo gate 107 ok, 0 failed |
 | Ternary-export research (AWP/QAD/SLQ/DeltaPQ) | **measured; PTQ ridge rejected, QAD infeasible here** | `tools/awp_ridge/probe.py` on true gate inputs of the real fixture (256 tokens, 3 experts): naive absmean output error 0.306–0.313; Wanda-flat then ternarise identical 0.306–0.313 (the ternariser already zeroes those); **ridge-project then ternarise 0.557–0.583 — worse on every expert**. True AWP (arXiv 2506.10205) has no covariance inverse at all: PGD with C as preconditioner, and it targets sparsity/INT4, not ternary. QAD/BitDistill (2510.13998) is a GPU training campaign on ≤4B models with task-metric parity, not lossless conversion; not feasible for a 30B MoE on this CPU-only host. SLQ's own floor is 3.3 bits task-lossless. See appendix §F |
+| P11 heterogeneous assignment | **measured; killed — absorption loses to pruning** | `mergepack --assign absorb --cap 8 --groups 96`; byte-matched against prune-96 (+0.0264) on the same 1,270-token corpus; **3.7387 = +0.2533 [+0.1803, +0.3209]** vs control, **+0.2269 [+0.1549, +0.2937]** vs prune-96 (paired, one process, group sizes 1–4); `assign_absorb` and `prune --arm-pack` selftested |
+| P12 corpus / task arms | open | out-of-domain walk and a 40-item x 3-option MC margin, reported as their own tables; no `qwen3moe` writer needed |
+| P13 rank-4-8 residuals | open, after P11 | closed-form SVD fit, in-memory, bytes charged; only if P11 leaves headroom |
 | P7 n-gram speculative decode | open | flag-off prototype, acceptance measured |
 | P9 verifier-gated selection | open | after P2; `--select k` over the 40 prompts, verifier false-accept measured |
 | P10 group rotation before rounding | **measured, parked** | −2.6% weight error mean, +2.1% on experts, sequency exactly inert; no NLL walk run |

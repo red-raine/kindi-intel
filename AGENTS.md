@@ -43,7 +43,10 @@ Other standing rules:
 | A 64-row router **fitted** to the teacher's routing (KL −0.0412) makes the merged pack **worse**: **+0.0836** [+0.0275, +0.1330] against the pooled rows — routing fidelity is not a likelihood lever; P4 killed | same |
 | Merging 128 → 64 pairs costs **+1.077 nats** at the control's routing fraction; **routing ≤ +0.17**, **arithmetic ≥ +1.08** | `docs/EXPERT-MERGE.md` |
 | 4 **super experts** (L2E92 2,152×, L1E114 927×, L3E82 525×, L1E68 210× their own layer's median output; next largest 42.7×). Routing mass ranks them **27, 27, 38, 92 of 128** — the 112 and 96 plans keep all four, the **64 plan drops L1E68** and 32 drops L1E68 + L2E92 | `tools/expert_merge/superex.py`, `docs/EXPERT-PRUNE.md` |
-| Pruning beats merging at equal bytes on this model class, externally measured | `appendix.md` §C |
+| Pruning beats a **uniform pairwise** merge at equal bytes - externally on this model class, and here on 1,270 tokens of this repo's prose (+0.0902 vs +1.0770 at 7.59 vs 7.60 GB). The global "merge is killed" is **withdrawn**: `mergepack --groups 64` caps a group at two experts, so it is M-SMoE shape, not REAM/RAVE | `appendix.md` §C.2, `docs/EXPERT-MERGE.md` |
+| Absorbing the cold tail is **worse than deleting it**: absorb 32 of 128 into 96 groups (group sizes 1–4) costs **+0.2269 [+0.1549, +0.2937]** more than prune-96 on the same 96 Q4_0 slabs, walked in one process against one baseline; only RAVE's rank-4-8 residual (P13) is untested, and it must beat +0.2269 | `docs/EXPERT-MERGE.md`, 1,270 tokens |
+| The 2026 state of the art is a **per-expert assignment** (keep / prune / absorb / absorb+rank-4-8 residual), not a choice between pruning and merging: REAM is ~90% pruning structurally with saliency centroids and singletons; RAVE reaches 52% memory at parity with 86% of decode speed and 0/40 degenerate vs REAM's 13/40 | `appendix.md` §C.2 |
+| The prune/merge ranking is **corpus- and task-dependent in the literature** (REAP: merge "reasonably well" on MC, worse on generative; REAM: a Pareto curve in the calibration mix). Our kill is a generative-likelihood claim on one in-domain corpus | `appendix.md` §C.2, `docs/EXPERT-MERGE.md` |
 | A rotation before ternary rounding is **not** the literature's win here: −2.6% mean weight error, **+1.5–2.1% worse** on expert matrices, and sequency ordering is *exactly* inert at a group-local quantiser — measured on 6 real matrices, no NLL walk | `tools/rotq/probe.py`, `appendix.md` §H |
 | A symbolic/LUT/graph backbone is not supported for *answer quality*; the measured route to better answers is verifier-gated selection over the model's own samples | `appendix.md` §G |
 
@@ -60,6 +63,9 @@ Other standing rules:
 - **P6** pin the small always-hot tensors, read whole expert slabs instead of faulting pages, threads = physical cores.
 - **P4** closed-form (ridge) router re-fit; then **P3** the mitigated merge, judged **against prune-at-96** — and
   expected to lose.
+- **P11** the heterogeneous per-expert assignment (absorb, byte-matched against prune-96), then **P12** the
+  out-of-domain and multiple-choice arms that scope the merge verdict; **P13** rank-4-8 residuals only if P11 leaves
+  headroom.
 - **P9** verifier-gated selection (`astvalid` + `--select k`): the only "better answers" route with end-task numbers, and it
   is P2's checker reused. After P2.
 - **P10** rotation before rounding — **measured and parked**: the probe is one command, the verdict is above, and only an

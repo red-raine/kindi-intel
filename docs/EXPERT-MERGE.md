@@ -381,6 +381,62 @@ zero. Those are two corpora and the deltas are not comparable; what the pair est
 on neither: +0.0264 with an interval excluding zero here, +0.0173 with an interval covering zero there. 112 remains the
 certified budget.
 
+## The heterogeneous arm: absorption at matched slots (P11, 1,270 tokens)
+
+The P3 table tested the merge this tool could express - a uniform pairwise partition, every group exactly two experts.
+The 2026 literature does not merge that way: REAM keeps saliency centroids and lets most of them stay singletons, and
+RAVE's cheapest absorb state folds a cold expert into a nearby centroid. `mergepack --assign absorb` implements that
+shape. What follows is the byte-matched test against the prune P3 preferred.
+
+The map: the 96 highest-mass experts keep their own stack, the 32 coldest are absorbed into the centroid they
+co-activate with most, at most 8 to a group. Group sizes came out **1-4**; 8% of a token's two slots land in one
+group. The slot count is 96, the same as `keep=96`, and every slab is written at Q4_0 like its control - so the two
+arms hold the same expert bytes and differ only in *how* the 32 missing slots were removed. Both walks ran in **one
+process** against one baseline forward (`prune --arm-pack`, new), which is what makes the last column a paired
+interval rather than two comparisons that merely share a control.
+
+| arm | expert slabs | NLL | vs control | arm vs prune-96 |
+|---|---:|---:|---|---|
+| prune to 96/128, four super experts guarded | 96 | 3.5118 | **+0.0264** [+0.0036, +0.0482] | - |
+| absorb 32 of 128 into 96 groups, pooled router | 96 | 3.7387 | **+0.2533** [+0.1803, +0.3209] | **+0.2269** [+0.1549, +0.2937] |
+| merge 128 -> 64 uniform pairs (P3, for scale) | 64 | 4.5625 | +1.0770 [+0.9362, +1.2156] | - |
+
+The baseline reproduces 3.4854 over the same 1,270 tokens to four decimals, and the prune arm reproduces its recorded
++0.0264 [+0.0036, +0.0482] inside this run, so the three arms are one experiment.
+
+Read plainly: **absorbing the cold tail is 0.227 nats worse than deleting it, and the interval excludes zero.** That is
+the opposite of the hypothesis P11 was written on, and it is a sharper result than the P3 kill because it isolates what
+merging does that pruning does not. The damage is not breadth: the arm absorbs only 32 of 128 experts, keeps routing at
+8 of 96, and touches no super expert. It is that averaging moves the **surviving** centroid's weights - the 96 experts
+that pruning would leave untouched are all perturbed - and each absorption also destroys the absorbed expert's
+independent routing identity. The cost is superlinear in what is absorbed: 32 absorbed costs 0.253, 64 costs 1.077.
+
+What this does not close: RAVE's fourth state, a **rank-4-8 residual** on an absorbed centroid, is not implemented
+here - this arm is its rank-0 ablation. `P13` is that fit (closed-form SVD, in-memory, bytes charged) and the number it
+has to beat is +0.2269, not zero. Nor is the centroid set saliency-based (it is routing mass) or the merge sequential
+(REAM recomputes activations layer by layer); both are cheap parameters of the same map and neither is measured.
+
+### The scope of that verdict
+
+The sentence this table used to support - "merging is killed" - is withdrawn as too broad. Three measured reasons and
+one structural one:
+
+- **The merge arm is uniform and pairwise.** `mergepack`'s partition caps a group at `ceil(experts / groups)`, so at
+  128 -> 64 no group can hold more than two experts, every group holds exactly two, no singleton keeps its own stack,
+  no low-rank residual exists, and the router is a pooled average. That is the M-SMoE/HC-SMoE shape. REAM's advantage
+  over those methods comes from *non-uniform* groups (a few centroids absorbing many, most staying singletons) and
+  RAVE's from a fourth action - absorb **with a rank-4-8 residual** - neither of which this tool could express until
+  `--assign absorb` was added. `P11` is that arm at the same slot count.
+- **The gate is one corpus, in-domain, generative.** 1,270 tokens of this repository's own prose and code, scored as
+  teacher-forced NLL. REAP's split is explicit - merging "performs reasonably well on MC" and loses on generative -
+  and REAM's result is a Pareto curve whose position depends on the calibration mix. Neither claim is tested by this
+  corpus, in either direction. That is `P12`.
+- **The routing half is not a lever this branch can pull.** P4 fitted a 64-row router that tracks the teacher's
+  routing better (KL -0.0412) and the pack got *worse* by +0.0836; the arithmetic half is >= +1.08 regardless.
+- **What survives unchanged:** at a matched byte budget on this pack and this corpus, keeping 64 experts and masking
+  the rest costs +0.0902 [+0.0432, +0.1389] where averaging every pair into 64 costs +1.0770 [+0.9362, +1.2156].
+  Pruning is 12x cheaper here. That is a statement about *this* merge on *this* corpus.
+
 ## What this does not establish
 
 - **The attribution is a budget, not two exact fractions.** The router half is +0.1277 with an interval crossing zero;

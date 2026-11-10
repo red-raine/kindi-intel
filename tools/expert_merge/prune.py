@@ -552,7 +552,8 @@ def main(argv):
         print("usage: python -m tools.expert_merge.prune --routes ROUTES.npz --keep N[,N...] "
               "| --frac F[,F...] [--pack MODEL.gguf] [--protect L:E,...] [--protect-json superex.json] "
               "[--saliency superex.json] [--entropy-budgets] "
-              "[--json out.json] [--gate --docs 2 --tokens 96 --max-delta 0.02] [--selftest]")
+              "[--json out.json] [--gate --docs 2 --tokens 96 --max-delta 0.02] "
+              "[--arm-pack OTHER.gguf] [--selftest]")
         return 2
     from .routes import load
 
@@ -646,6 +647,7 @@ def main(argv):
         print("    baseline nll %.4f over %d tokens" % (baseline["nll"], baseline["tokens"]))
 
     tol = float(_arg(argv, "--max-delta", NLL_TOL))
+    plan_tokens = {}
     accepted = []
     payload = {"routes": path, "pack": pack_path, "n_layer": n_layer, "n_expert": n_expert,
                "tokens_logged": int(got["route_wts"].shape[1]),
@@ -659,7 +661,8 @@ def main(argv):
             r = nll_moe_batch(model, docs)
             per_token, scored = [r["per_token"]], r["tokens"]
             model.set_prune(None)
-            v = gate(dict(per_token=baseline["per_token"]), [dict(per_token=np.concatenate(per_token))],
+            plan_tokens[name] = np.concatenate(per_token)
+            v = gate(dict(per_token=baseline["per_token"]), [dict(per_token=plan_tokens[name])],
                      max_delta=tol)[0]
             row["gate"] = dict(v, nll=float(np.concatenate(per_token).mean()),
                                baseline_nll=baseline["nll"], max_delta=tol, docs=[[n, len(i)] for n, i in docs])
@@ -672,6 +675,34 @@ def main(argv):
             print("    nll %.4f -> %.4f (%+.4f, 95%% CI %+.4f..%+.4f) %s (tolerance %+.3f)"
                   % (baseline["nll"], row["gate"]["nll"], v["delta"], v["ci_lo"], v["ci_hi"], verdict, tol))
         payload["plans"].append(row)
+
+    arm_path = _arg(argv, "--arm-pack")
+    if arm_path:
+        # A pack that is not a mask on this model - a merged or absorbed arm - has to be walked on the same tokens
+        # as the plan, because the interesting interval is not "arm vs the source" but "arm vs the prune". One
+        # process, one baseline forward, so both differences share their control token for token.
+        if model is None:
+            raise SystemExit("prune: --arm-pack needs --gate: the arm has to be walked on the gate corpus")
+        from .moe import Qwen3Moe as _Arm
+
+        print("  arm pack: %s" % os.path.basename(arm_path))
+        arm_model = _Arm(arm_path, log=lambda *a: None)
+        ra = nll_moe_batch(arm_model, docs)
+        del arm_model
+        vs = {}
+        for spec_name, tok in plan_tokens.items():
+            # positive = the pack arm is the worse model. The plan's own token vector is the baseline here, so this
+            # is the root comparison the P3 write-up could not make from two runs against a shared control.
+            vs[spec_name] = gate(dict(per_token=tok), [dict(per_token=ra["per_token"])], max_delta=tol)[0]
+        v = gate(dict(per_token=baseline["per_token"]), [dict(per_token=ra["per_token"])], max_delta=tol)[0]
+        row = dict(pack=arm_path, nll=float(ra["per_token"].mean()), gate=v, vs=vs, tokens=int(ra["tokens"]))
+        payload["pack_arms"] = [row]
+        print("    arm nll %.4f over %d tokens, vs baseline %+.4f (95%% CI %+.4f..%+.4f)"
+              % (row["nll"], row["tokens"], v["delta"], v["ci_lo"], v["ci_hi"]))
+        for spec_name, vv in sorted(vs.items()):
+            print("    arm vs %-16s %+.4f (95%% CI %+.4f..%+.4f)%s"
+                  % (spec_name, vv["delta"], vv["ci_lo"], vv["ci_hi"],
+                     "  (resolved)" if vv["ci_lo"] > 0 or vv["ci_hi"] < 0 else "  (covers zero)"))
 
     out = _arg(argv, "--json")
     if out:
