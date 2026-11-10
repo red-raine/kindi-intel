@@ -254,9 +254,18 @@ def convert(gguf_path, out_dir, log=print, paircodes=False, rope_factor=None, ro
             if val:
                 log("kindi convert: %s is a catalog pack (no weights copied), so %s does nothing here" % (arch, flag))
         return archs.catalog(gguf_path, out_dir, log=log, g=g)
+    if arch == "qwen3moe":
+        # The MoE writer, and the one place this converter is knowingly lossy: the source is Q4_0/K-quant and the
+        # engine's pack is ternary, so what comes out is a 2-bit re-quantisation of the file, not the file in a new
+        # layout. Both arms of a comparison are re-quantised the same way, so a paired walk or a paired functional
+        # screen still measures the edit under test; nothing else may be called lossless about it.
+        from . import moeconv
+        log("kindi convert: %s is a MoE source - writing a TERNARY re-quantisation (lossy by construction); "
+            "the manifest records requant_mse" % arch)
+        return moeconv.convert(gguf_path, out_dir, log=log, scheme="lsq", paircodes=paircodes)
     if arch not in ("qwen35", "qwen3"):
-        raise SystemExit("kindi convert: expected a qwen35, qwen3, glm5-next, minimax-m3 or Gemma 4 GGUF (found %r)"
-                         % (arch,))
+        raise SystemExit("kindi convert: expected a qwen35, qwen3, qwen3moe, glm5-next, minimax-m3 or Gemma 4 GGUF "
+                         "(found %r)" % (arch,))
     types = {t[2] for t in g.tensors}
     if not types <= {PTQ1_0, Q1_0, F32, BF16}:
         raise SystemExit("kindi convert: needs a ternary (PTQ1_0) or 1-bit (Q1_0) GGUF - found tensor types %s"
