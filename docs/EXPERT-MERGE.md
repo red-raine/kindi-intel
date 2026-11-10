@@ -416,6 +416,29 @@ here - this arm is its rank-0 ablation. `P13` is that fit (closed-form SVD, in-m
 has to beat is +0.2269, not zero. Nor is the centroid set saliency-based (it is routing mass) or the merge sequential
 (REAM recomputes activations layer by layer); both are cheap parameters of the same map and neither is measured.
 
+### Why a rank-4-8 residual does not rescue it (P13 pre-gate)
+
+RAVE's fourth state stores the loss as `W_e = W_c + U S Vᵀ`. Before paying for a kernel that reads the factors when
+the group runs, `tools/expert_merge/residual.py` asks whether a rank-r factor can represent the deviation at all,
+on the activations the expert actually received (the route log's `x_n`). Over **200 absorbed experts** (12 layers,
+384 tokens, 96 stacks, cap 8):
+
+| rank | function recovered (median) | 95% interval | operator error removed | deviation energy kept |
+|---:|---:|---|---:|---:|
+| 0 | 0.000 | [0.000, 0.000] | 0.000 | 0.000 |
+| 2 | 0.004 | [0.000, 0.009] | 0.012 | 0.012 |
+| 4 | 0.005 | [-0.000, 0.015] | 0.024 | 0.021 |
+| 8 | **0.015** | [0.009, 0.026] | 0.040 | 0.037 |
+
+`function` is `1 − ‖FFN_e(x) − FFN_r(x)‖ / ‖FFN_e(x) − FFN_c(x)‖` with all three matrices rebuilt from centroid plus
+factor; `operator` is the same on each matrix's own input (gate and up see `x`, down sees the hidden activation).
+**The deviation is near-white, not low-rank**: rank 8 recovers 1.5% of the function and 3.7% of the energy, so the
+absorption cost is not a few directions that a residual could keep cheaply.
+
+Two limits, both stated rather than hidden: this is a pre-gate with no NLL delta and only 12 of 48 layers, and the fit
+here is an SVD of the **weight** difference, while RAVE fits a residual to the **activation-weighted** output error
+(SVD of `D·Σx^{1/2}`). The weighted fit is the fair version of their claim and is the only piece still open.
+
 ### The scope of that verdict
 
 The sentence this table used to support - "merging is killed" - is withdrawn as too broad. Three measured reasons and

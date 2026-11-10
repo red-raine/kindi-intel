@@ -435,6 +435,16 @@ argument for trying it is that it is nearly free, not that it is likely. Gate: t
 `--arm-pack`, rank 4 and rank 8 as separate arms, and the verdict is against prune-96's **+0.0264**, not against the
 absorb-96 arm's +0.2533.
 
+*Pre-gate (2026-11-10, `tools/expert_merge/residual.py`):* **rank-4-8 cannot carry it.** Over **200 absorbed experts**
+(12 layers, 384 route-log tokens, 96 stacks, cap 8), a rank-r truncation of `W_e − W_c` restores a median **1.5% of the
+expert's output difference** at r=8, 95% interval [0.9%, 2.6%] (r=4 0.5%, r=2 0.4%, r=0 exactly 0 as the check that
+the statistic reads zero when nothing is restored). The same truncation keeps 3.7% of the deviation's Frobenius energy
+and removes 4.0% of the operator error on the vectors each matrix actually sees. So the deviation the centroid drops is
+**not low-rank - it is close to white** - and 1.5% of a function cannot be worth 0.227 nats of it. This is a pre-gate,
+not an NLL verdict: no delta here is comparable to a gated arm, and it measures 12 of 48 layers. The one fair follow-up
+it does not settle is RAVE's actual fit - a residual to the **activation-weighted** output error (SVD of
+`D · Σx^{1/2}`), not of the weight difference - which is cheap to add and is the only version of the claim still open.
+
 ### P12 — Put the corpus back in the claim: out-of-domain and discriminative arms — **~2 h**
 
 *Hypothesis:* our gate corpus is this repository's prose. REAP's own split is generative-vs-MC, and REAM's is a Pareto

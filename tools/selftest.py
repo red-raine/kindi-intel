@@ -91,6 +91,7 @@ SUITES = [
     ("suite:expert_prune", [sys.executable, "-m", "tools.expert_merge.prune", "--selftest"], "checks passed"),
     ("suite:prunegate", [sys.executable, "-m", "tools.expert_merge.prunegate", "--selftest"], "checks passed"),
     ("suite:mergepack", [sys.executable, "-m", "tools.expert_merge.mergepack", "--selftest"], "checks passed"),
+    ("suite:residual", [sys.executable, "-m", "tools.expert_merge.residual", "--selftest"], "checks passed"),
     ("suite:superex", [sys.executable, "-m", "tools.expert_merge.superex", "--selftest"], "checks passed"),
     ("suite:prefetch_budget", [sys.executable, "-m", "tools.bitnet_gemm.prefetch_budget"], "over-fetch"),
     ("suite:cluster_budget", [sys.executable, "-m", "tools.bitnet_gemm.cluster_budget", "--selftest"],
