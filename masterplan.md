@@ -426,6 +426,15 @@ at this budget: averaging moves the *survivors*' weights, and only 32 absorption
 costs. Cost is superlinear in what is absorbed (32 -> 0.253, 64 -> 1.077). Only `P13`'s rank-4-8 residual is untested,
 and its hurdle is +0.2269.
 
+*What P13 costs, priced before it is built:* a residual is not a pack-format tweak. Every absorbed expert would
+compute `y = W_c x + U S Vᵀ x` at the group it was absorbed into, so the factors have to be read **when the group
+runs**, in `tools/expert_merge/moe.py` for the gate and in `kindi/cpu.py` + `kcpu.c` for anything served — the second
+is the reason this is a separate item and not a flag. Bytes: rank r over a (768 × 2048) expert is r(768 + 2048) values,
+about 1.4% of that expert's fp32 slab at r=4, so a rank-8 residual on 32 absorbed experts is ~1% of the pack — the
+argument for trying it is that it is nearly free, not that it is likely. Gate: the same 1,270-token tri-arm walk with
+`--arm-pack`, rank 4 and rank 8 as separate arms, and the verdict is against prune-96's **+0.0264**, not against the
+absorb-96 arm's +0.2533.
+
 ### P12 — Put the corpus back in the claim: out-of-domain and discriminative arms — **~2 h**
 
 *Hypothesis:* our gate corpus is this repository's prose. REAP's own split is generative-vs-MC, and REAM's is a Pareto
@@ -551,7 +560,7 @@ interval, and the probe that prices it is one command (`tools/rotq/probe.py`).
 |---|---|---|
 | P0 protect super experts | **measured** | `--protect`/`--protect-json` in `prune`; guard 0.07% of bytes; 96 identical to unguarded (**+0.0173 [−0.0012, +0.0361]**, marginal); 64 guarded **+0.0914** vs unguarded **+0.0963** on the same tokens — the outlier is 5% of that loss, not its cause |
 | P1 saliency + non-uniform budgets | **measured; keep uniform mass** | saliency only nominally ahead with overlapping baseline intervals; entropy rejected at 96 and 80 on 1,778 held-out tokens. P2 not run: no pruned kindi packs converted |
-| P2 functional screen | **built, kill property measured** | `tools/funcscreen`: 40 fixed items (20 code + 20 arithmetic), greedy, outputs stored; bonsai-2b 32/40 vs token-shuffled 6/40, paired delta −0.65 [−0.80, −0.50]. **Control-vs-merge64 kill test blocked at the converter** — measured 2026-11-10: `kindi convert` refuses the arch by name, `expected a qwen35, qwen3, glm5-next, minimax-m3 or Gemma 4 GGUF (found 'qwen3moe')`, so neither arm can become a pack `Engine` serves; the `qwen3moe` writer (expert slabs + router) is the prerequisite |
+| P2 functional screen | **built, kill property measured** | `tools/funcscreen`: 40 fixed items (20 code + 20 arithmetic), greedy, outputs stored; bonsai-2b 32/40 vs token-shuffled 6/40, paired delta −0.65 [−0.80, −0.50]. **Control-vs-merge64 kill test blocked at the converter** — measured 2026-11-10: `kindi convert` refuses the arch by name, `expected a qwen35, qwen3, glm5-next, minimax-m3 or Gemma 4 GGUF (found 'qwen3moe')`, so neither arm can become a pack `Engine` serves; **unblocked 2026-11-10**: `kindi/moeconv.py` writes a runnable pack (streamed, engine loads it, every expert decodes to its own weights) — but it is a **ternary re-quantisation of a Q4_0 source**, so the screen's two arms share one lossy quantiser and the comparison stays paired while no lossless claim attaches to either. Remaining work: convert both arms and run the 40 items |
 | P3 mitigated merge | **measured; prune wins 12x at matched bytes - kill narrowed to uniform pairwise merge** | one 1,270-token walk, one baseline (3.4854): prune 96 **+0.0264 [+0.0036, +0.0482]** at 74.8% of expert bytes, prune 64 **+0.0902 [+0.0432, +0.1389]** at 7.59 GB, merge 64 **+1.0770 [+0.9362, +1.2156]** at 7.60 GB. Guard inert at 96, worth 0.0049 nats at 64 |
 | P4 ridge router re-fit | **measured; killed on NLL** | routing: anchored ridge beats pooling by **−0.0412 KL [−0.0428, −0.0396]** on 18,432 token-layer pairs (384 tokens, λ=0.1); unanchored it *loses* (+0.0520), which is why the anchor matters. The walk (1,270 tokens, rows applied in memory): pooled **+1.0770 [+0.9362, +1.2156]**, fitted **+1.1606 [+1.0132, +1.2880]**, paired fitted − pooled **+0.0836 [+0.0275, +0.1330]** — the better router is the worse pack. Reopening it needs a fit against the *merged* pack's own activations, not the teacher's |
 | P5 1.667 bpw packing | **measured; deferred** | GEMV is issue-bound at ~12–13 GB/s vs a 26.0 GB/s DRAM ceiling; `stream_probe` measures disk, not DRAM. Repacking adds instructions and is not a decode speedup on this evidence |

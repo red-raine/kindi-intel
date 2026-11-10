@@ -41,9 +41,12 @@ python -m tools.funcscreen --selftest
 - **The plan's kill test — control vs the 64-way merge (+1.08 nats) — has not been run.** The merge and control
   arms on this host are GGUFs under `B:/models/scratch` (`qwen3moe-control-q4.gguf`,
   `qwen3moe-merged64-k4-q4.gguf`); no converted kindi packs for them exist here, and the engine runs kindi packs.
-  The converter is the blocker, measured 2026-11-10: `kindi convert` refuses the arch by name — `expected a qwen35,
-  qwen3, glm5-next, minimax-m3 or Gemma 4 GGUF (found 'qwen3moe')` — so the kill test waits on the `qwen3moe` writer
-  (expert slabs + router) rather than on a choice of command. Command once a pack exists: the two `--pack` runs, then
+  The converter was the blocker until 2026-11-10, when `kindi/moeconv.py` landed (`kindi convert` now routes
+  `qwen3moe` there): it streams a MoE GGUF layer by layer into the names the CPU layout reads, and its selftest loads
+  the result through `Engine`. **It is a lossy 2-bit re-quantisation of a Q4_0 source, not an import** — the manifest
+  records `requant_mse` — so the screen's two arms are both damaged by the same quantiser and the comparison is still
+  paired, but nothing may be called lossless about it. If both arms floor to ~0/40 the screen has told us the
+  re-quantisation is what broke the model, and that is a result to report, not a failure to hide. Command once a pack exists: the two `--pack` runs, then
   `--compare`. Until that run exists, every
   lossless claim in this repo is still a likelihood claim, and this screen is a *capable* gate, not yet a
   *proven* one on the arms it was built to reject.
